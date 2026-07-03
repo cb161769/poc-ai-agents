@@ -647,8 +647,8 @@
         <div class="stage-num">05</div>
         <div class="stage-card">
           <div class="stage-title">gh copilot suggest → rama</div>
-          <div class="stage-desc">Si APPROVED: Copilot sugiere un comando real (confirmación humana antes de ejecutar). Si modifica archivos, se commitea en una rama nueva de sample-repo/, nunca en main.</div>
-          <div class="stage-io"><b>out</b> copilot_contribution.jsonl</div>
+          <div class="stage-desc">Si APPROVED: Copilot sugiere un comando real (confirmación humana antes de ejecutar). Si modifica archivos, se commitea en una rama nueva de sample-repo/, nunca en main. Cierra dejando un comentario de auditoría en el ticket real de Jira.</div>
+          <div class="stage-io"><b>out</b> copilot_contribution.jsonl · <b>POST</b> /issue/:key/comment</div>
         </div>
       </div>
     </div>
@@ -760,6 +760,7 @@
         <li><span class="n">＋</span><span class="t"><b>check_prereqs.sh</b> — valida los 7 servicios y 3 credenciales antes de arrancar.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Ejecución real, no solo explicación</b> — gh copilot suggest corre de verdad (con confirmación humana) y aplica el cambio en una rama de revisión, nunca en main.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Métrica de colaboración</b> — copilot_contribution.jsonl + report_sprint_metrics.py miden cuánto sugirió y aplicó Copilot, no solo si el pipeline corrió.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Auditoría en el ticket mismo</b> — jira_client.py comment publica el veredicto del firewall y qué hizo Copilot como comentario real en Jira, visible sin acceso a los logs locales.</span></li>
         <li><span class="n warn-note">⚠</span><span class="t"><b>"Pipeline" ≠ CI/CD</b> — run_poc_loop.sh es orquestación manual a demanda. Las ramas <code>copilot/*</code> que crea la etapa 5 no disparan ningún build/test/re-análisis automático; nada las está observando todavía.</span></li>
       </ol>
     </div>

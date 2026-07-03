@@ -45,6 +45,15 @@ log_contribution() {
     >> "${CONTRIBUTION_LOG}"
 }
 
+# Posts an audit comment on the real Jira ticket so anyone reviewing the
+# ticket sees, directly in Jira's own comment history, what the firewall
+# decided and what Copilot did — no need to go dig through local log files.
+post_jira_comment() {
+  local text="$1"
+  python3 "${SCRIPT_DIR}/jira_client.py" comment "${text}" >/dev/null 2>&1 \
+    || echo "(no se pudo dejar el comentario de auditoria en Jira — revisa credenciales)"
+}
+
 command -v jq >/dev/null 2>&1 || fail "jq no esta instalado (requerido para parsear JSON). Instalalo y reintenta."
 command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 
@@ -135,6 +144,7 @@ if [ "${STATUS}" = "REJECTED" ]; then
   echo "🛑 EL AI FIREWALL RECHAZO LA PETICION"
   echo "Razon: ${REASON}"
   echo "gh copilot NO fue invocado."
+  post_jira_comment "🛡️ AI Firewall (automatizado): solicitud RECHAZADA. Motivo: ${REASON}. gh copilot no fue invocado."
   log_contribution "REJECTED" 0 false false ""
   exit 1
 fi
@@ -165,6 +175,7 @@ if [ "${STATUS}" = "APPROVED" ]; then
     echo "  git -C sample-repo init && git -C sample-repo add -A && git -C sample-repo commit -m 'baseline'"
     echo "para poder aplicar sugerencias en una rama de revision. Por ahora, solo se pedira la sugerencia."
     gh copilot suggest -t shell "${SANITIZED}"
+    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot sugirio un cambio, pero sample-repo/ todavia no es un repo git — no se aplico nada a una rama."
     log_contribution "APPROVED" "${REDACTIONS}" true false ""
     exit 0
   fi
@@ -182,10 +193,12 @@ if [ "${STATUS}" = "APPROVED" ]; then
     APPLIED=true
     echo "Cambio aplicado y commiteado en la rama '${BRANCH}' de sample-repo/ — NO en main."
     echo "Revisalo con: git -C sample-repo diff main..${BRANCH}"
+    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de sample-repo/, pendiente de revision humana antes de mergear."
   else
     git -C "${SCRIPT_DIR}/sample-repo" checkout - >/dev/null 2>&1
     git -C "${SCRIPT_DIR}/sample-repo" branch -D "${BRANCH}" >/dev/null 2>&1
     echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
+    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
     BRANCH=""
   fi
 

@@ -86,7 +86,54 @@ def get_ticket() -> dict:
     )
 
 
+def post_audit_comment(ticket_key: str, text: str) -> dict:
+    """Posts a plain-text audit comment on the real Jira ticket, so the
+    firewall's decision and whatever Copilot did are visible directly in
+    Jira's own comment history — not just in the local logs/*.jsonl files.
+    """
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    email = os.environ["JIRA_EMAIL"]
+    token = os.environ["JIRA_API_TOKEN"]
+
+    auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
+
+    body_adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+    }
+
+    resp = httpx.post(
+        f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
+        headers=headers,
+        json={"body": body_adf},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "comment":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "usage: jira_client.py comment \"<texto>\""}), file=sys.stderr)
+            sys.exit(1)
+        ticket_key = os.environ.get("JIRA_TICKET_KEY", "")
+        try:
+            result = post_audit_comment(ticket_key, sys.argv[2])
+        except KeyError as exc:
+            print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
+            sys.exit(1)
+        except httpx.HTTPStatusError as exc:
+            print(
+                json.dumps({"error": "jira_http_error", "status_code": exc.response.status_code, "body": exc.response.text}),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(json.dumps({"comment_id": result.get("id"), "ticket_id": ticket_key}, ensure_ascii=False))
+        return
+
     try:
         ticket = get_ticket()
     except KeyError as exc:
