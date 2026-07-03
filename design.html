@@ -1,0 +1,785 @@
+<title>PoC Firewall — Esquema de Arquitectura</title>
+<style>
+  :root{
+    --bg:#0b0f14;
+    --surface:#121922;
+    --surface-2:#182230;
+    --border:#28323f;
+    --border-soft:#1d2731;
+    --border-strong:#3a4759;
+    --text:#e7edf3;
+    --text-dim:#8b9aab;
+    --text-faint:#5b6b7d;
+    --accent:#5b8cff;
+    --accent-soft:#5b8cff26;
+    --violet:#a685ff;
+    --violet-soft:#a685ff20;
+    --ok:#3fb96a;
+    --ok-soft:#3fb96a1f;
+    --danger:#f0555a;
+    --danger-soft:#f0555a1f;
+    --warn:#e0a63c;
+    --warn-soft:#e0a63c1f;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --cond: "Roboto Condensed", "Arial Narrow", var(--sans);
+  }
+  *{box-sizing:border-box;}
+  @media (prefers-reduced-motion: no-preference){
+    .svc-card, .stage-card, .check-item, .mcp-server, .navbar a{ transition: border-color .15s ease, background-color .15s ease, transform .15s ease; }
+  }
+  html{ scroll-behavior:smooth; }
+  @media (prefers-reduced-motion: reduce){ html{ scroll-behavior:auto; } }
+  body{
+    background:
+      radial-gradient(720px 360px at 12% -8%, #5b8cff14, transparent 60%),
+      radial-gradient(560px 320px at 92% 4%, #a685ff10, transparent 55%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    line-height:1.55;
+    font-size:15px;
+    max-width:1180px;
+    margin:0 auto;
+    padding:0 32px 96px;
+  }
+  ::selection{background:var(--accent-soft);}
+  a{color:var(--accent);}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+
+  /* ---------- Sticky section nav ---------- */
+  .navbar{
+    position:sticky;
+    top:0;
+    z-index:10;
+    display:flex;
+    gap:2px;
+    overflow-x:auto;
+    padding:14px 0;
+    margin:0 0 40px;
+    background:linear-gradient(var(--bg) 82%, transparent);
+    border-bottom:1px solid var(--border-soft);
+  }
+  .navbar a{
+    flex:none;
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.03em;
+    color:var(--text-faint);
+    text-decoration:none;
+    padding:6px 11px;
+    border:1px solid transparent;
+  }
+  .navbar a:hover{ color:var(--text); border-color:var(--border); background:var(--surface); }
+  .hero-block{ padding-top:44px; }
+  section{ scroll-margin-top:64px; }
+
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:12px;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--accent);
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  .eyebrow::before{
+    content:"";
+    width:7px;height:7px;
+    background:var(--accent);
+    display:inline-block;
+    flex:none;
+  }
+  h1{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:clamp(30px,4vw,42px);
+    letter-spacing:-.01em;
+    text-wrap:balance;
+    margin:14px 0 10px;
+  }
+  .lede{
+    color:var(--text-dim);
+    max-width:70ch;
+    font-size:16px;
+  }
+  .lede code{color:var(--text);}
+
+  .stat-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:28px;
+    margin-top:28px;
+    padding-top:24px;
+    border-top:1px solid var(--border-soft);
+  }
+  .stat{
+    display:flex;
+    flex-direction:column;
+    gap:2px;
+  }
+  .stat .num{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:26px;
+    font-variant-numeric:tabular-nums;
+  }
+  .stat .lbl{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+    text-transform:uppercase;
+    letter-spacing:.06em;
+  }
+
+  h2{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:22px;
+    letter-spacing:-.005em;
+    margin:0 0 4px;
+  }
+  .h2-sub{
+    color:var(--text-faint);
+    font-size:13px;
+    font-family:var(--mono);
+    margin:0 0 22px;
+  }
+  section{margin-top:68px;}
+  code, .mono{font-family:var(--mono);}
+
+  /* ---------- Services grid ---------- */
+  .svc-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(230px, 1fr));
+    gap:14px;
+  }
+  .svc-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-left:3px solid var(--svc-color, var(--accent));
+    padding:16px 18px;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+  }
+  .svc-card:hover{
+    background:var(--surface-2);
+    border-color:var(--border-strong);
+    transform:translateY(-1px);
+  }
+  .svc-head{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:8px;
+  }
+  .svc-name{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:15.5px;
+  }
+  .svc-port{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+  }
+  .svc-desc{
+    color:var(--text-dim);
+    font-size:12.5px;
+  }
+  .svc-tag{
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+    border:1px solid var(--border);
+    padding:2px 7px;
+    align-self:flex-start;
+  }
+
+  /* ---------- Pipeline ---------- */
+  .pipeline-scroll{overflow-x:auto; padding-bottom:6px; margin:0 -4px;}
+  .pipeline{
+    display:grid;
+    grid-auto-flow:column;
+    grid-auto-columns:230px;
+    align-items:start;
+    gap:0;
+    min-width:max-content;
+    padding:4px;
+  }
+  .stage{
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .stage-num{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+  }
+  .stage-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-top:3px solid var(--stage-color, var(--accent));
+    padding:16px;
+    min-height:178px;
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+  }
+  .stage-title{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:16px;
+  }
+  .stage-desc{
+    color:var(--text-dim);
+    font-size:12.5px;
+    flex:1;
+  }
+  .stage-io{
+    font-family:var(--mono);
+    font-size:10.5px;
+    color:var(--text-faint);
+    border-top:1px solid var(--border-soft);
+    padding-top:8px;
+  }
+  .stage-io b{color:var(--text-dim); font-weight:600;}
+  .stage-card:hover{ background:var(--surface-2); border-color:var(--border-strong); transform:translateY(-1px); }
+  .connector{
+    height:178px;
+    margin-top:19px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    position:relative;
+  }
+  .connector::before{
+    content:"";
+    height:1px;
+    width:100%;
+    background:linear-gradient(90deg, var(--border), var(--accent), var(--border));
+    opacity:.5;
+  }
+  .connector::after{
+    content:"›";
+    position:absolute;
+    color:var(--accent);
+    font-family:var(--mono);
+    font-size:16px;
+  }
+
+  /* ---------- Context orchestrator (MCP) ---------- */
+  .mcp-wrap{
+    display:grid;
+    grid-template-columns:1fr auto 1.3fr;
+    gap:0;
+    align-items:stretch;
+    border:1px solid var(--border);
+    background:var(--surface);
+  }
+  .mcp-sources{
+    display:flex;
+    flex-direction:column;
+    gap:0;
+  }
+  .mcp-source{
+    padding:16px 18px;
+    border-bottom:1px solid var(--border-soft);
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+  }
+  .mcp-source:last-child{border-bottom:none;}
+  .mcp-source .name{font-family:var(--cond); font-weight:700; font-size:14.5px;}
+  .mcp-source .desc{font-size:12px; color:var(--text-dim);}
+  .mcp-hub{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:0 28px;
+    color:var(--text-faint);
+    font-family:var(--mono);
+    font-size:20px;
+  }
+  .mcp-servers{
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    gap:10px;
+    padding:18px;
+    background:var(--surface-2);
+  }
+  .mcp-server{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    border:1px solid var(--border);
+    background:var(--bg);
+    padding:9px 12px;
+  }
+  .mcp-server .dot{
+    width:8px;height:8px;
+    flex:none;
+    background:var(--mcp-color, var(--accent));
+  }
+  .mcp-server .label{
+    font-family:var(--mono);
+    font-size:12.5px;
+    color:var(--text);
+  }
+  .mcp-server .sub{
+    font-size:11px;
+    color:var(--text-faint);
+    margin-left:auto;
+  }
+  .mcp-server:hover{ border-color:var(--border-strong); background:var(--surface-2); }
+  @media (max-width:820px){ .mcp-wrap{grid-template-columns:1fr;} .mcp-hub{padding:14px 0; transform:rotate(90deg);} }
+
+  /* ---------- Decision flow ---------- */
+  .decision{
+    display:grid;
+    grid-template-columns:220px 1fr;
+    gap:0;
+    border:1px solid var(--border);
+    background:var(--surface);
+  }
+  .decision-row{ display:contents; }
+  .decision-label{
+    padding:20px;
+    border-bottom:1px solid var(--border-soft);
+    background:var(--surface-2);
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    gap:4px;
+  }
+  .decision-label .tag{
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    color:var(--text-faint);
+  }
+  .decision-label .name{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:15px;
+  }
+  .decision-body{
+    padding:18px 22px;
+    border-bottom:1px solid var(--border-soft);
+    display:flex;
+    align-items:center;
+    gap:16px;
+    flex-wrap:wrap;
+  }
+  .branch{ display:flex; align-items:center; gap:10px; font-size:13px; }
+  .branch code{
+    font-size:12px;
+    background:var(--surface-2);
+    padding:2px 6px;
+    border:1px solid var(--border);
+    color:var(--text-dim);
+  }
+  .pill{
+    font-family:var(--mono);
+    font-size:11px;
+    font-weight:600;
+    padding:3px 9px;
+    letter-spacing:.02em;
+    border:1px solid transparent;
+    white-space:nowrap;
+  }
+  .pill.ok{color:var(--ok); background:var(--ok-soft); border-color:#3fb96a44;}
+  .pill.danger{color:var(--danger); background:var(--danger-soft); border-color:#f0555a44;}
+  .pill.warn{color:var(--warn); background:var(--warn-soft); border-color:#e0a63c44;}
+  .arrow-sep{color:var(--text-faint); font-family:var(--mono);}
+
+  /* ---------- Cache strip ---------- */
+  .cache-strip{
+    display:flex;
+    align-items:center;
+    gap:18px;
+    border:1px solid var(--border);
+    background:var(--surface);
+    padding:16px 20px;
+    flex-wrap:wrap;
+  }
+  .cache-strip .chip{
+    font-family:var(--mono);
+    font-size:11.5px;
+    color:var(--text-dim);
+    border:1px solid var(--border);
+    padding:4px 10px;
+  }
+
+  /* ---------- Prereqs checklist ---------- */
+  .checklist{
+    display:grid;
+    grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+    gap:10px;
+  }
+  .check-item{
+    display:flex;
+    align-items:flex-start;
+    gap:10px;
+    border:1px solid var(--border);
+    background:var(--surface);
+    padding:12px 14px;
+    font-size:12.5px;
+    color:var(--text-dim);
+  }
+  .check-item .mark{
+    color:var(--ok);
+    font-family:var(--mono);
+    flex:none;
+  }
+  .check-item:hover{ border-color:var(--border-strong); background:var(--surface-2); }
+
+  /* ---------- Two column: files / gaps ---------- */
+  .cols{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:40px;
+  }
+  @media (max-width:780px){ .cols{grid-template-columns:1fr;} .decision{grid-template-columns:1fr;} }
+
+  .tree{
+    font-family:var(--mono);
+    font-size:12.5px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    padding:18px 20px;
+    white-space:pre;
+    overflow-x:auto;
+    color:var(--text-dim);
+  }
+  .tree .new{color:var(--ok);}
+  .tree .file{color:var(--text);}
+  .tree .dir{color:var(--text-faint);}
+
+  ol.gaps{
+    list-style:none;
+    margin:0; padding:0;
+    display:flex; flex-direction:column; gap:14px;
+  }
+  ol.gaps li{ display:grid; grid-template-columns:26px 1fr; gap:12px; }
+  ol.gaps .n{ font-family:var(--mono); color:var(--accent); font-size:13px; padding-top:1px; }
+  ol.gaps .n.warn-note{ color:var(--warn); }
+  ol.gaps .t{ font-size:13.5px; color:var(--text-dim); }
+  ol.gaps .t b{color:var(--text); font-weight:600;}
+
+  /* ---------- Audit log sample ---------- */
+  .log{
+    font-family:var(--mono);
+    font-size:12px;
+    background:#080b0f;
+    border:1px solid var(--border);
+    padding:16px 18px;
+    overflow-x:auto;
+    color:var(--text-faint);
+  }
+  .log .k{color:#7fa8e8;}
+  .log .s{color:#a3c98a;}
+  .log .ok{color:var(--ok);}
+  .log .danger{color:var(--danger);}
+
+  footer{
+    margin-top:80px;
+    padding-top:22px;
+    border-top:1px solid var(--border-soft);
+    color:var(--text-faint);
+    font-size:12px;
+    font-family:var(--mono);
+  }
+</style>
+
+<nav class="navbar">
+  <a href="#servicios">servicios</a>
+  <a href="#mcp">mcp</a>
+  <a href="#pipeline">pipeline</a>
+  <a href="#firewall">firewall</a>
+  <a href="#cache">cache</a>
+  <a href="#prereqs">prereqs</a>
+  <a href="#estructura">estructura</a>
+  <a href="#auditoria">auditoría</a>
+</nav>
+
+<div class="hero-block">
+  <div class="eyebrow">poc-ai-agents · diseño de arquitectura</div>
+  <h1>Agente autónomo + AI Firewall local — sin mocks, 100% funcional</h1>
+  <p class="lede">
+    Jira Cloud real, SonarQube real escaneando código real, un grafo Neo4j sincronizado desde Azure DevOps real
+    y un índice RAG en Qdrant, todo expuesto a Copilot vía MCP. Ningún paso del pipeline imprime un
+    <code>echo</code> fijo: cada etapa llama a un sistema real y dejar rastro en
+    <code>logs/firewall_audit.jsonl</code>.
+  </p>
+  <div class="stat-row">
+    <div class="stat"><span class="num">7</span><span class="lbl">servicios Docker</span></div>
+    <div class="stat"><span class="num">4</span><span class="lbl">servidores MCP</span></div>
+    <div class="stat"><span class="num">3</span><span class="lbl">sistemas con credenciales reales</span></div>
+    <div class="stat"><span class="num">0</span><span class="lbl">datos simulados</span></div>
+  </div>
+</div>
+
+<section id="servicios">
+  <h2>Servicios Docker</h2>
+  <p class="h2-sub">docker compose up -d --build</p>
+  <div class="svc-grid">
+    <div class="svc-card" style="--svc-color:#5b8cff">
+      <div class="svc-head"><span class="svc-name">neo4j</span><span class="svc-port">:7474 :7687</span></div>
+      <div class="svc-desc">Grafo de dependencias. Healthcheck real vía cypher-shell.</div>
+      <span class="svc-tag">neo4j:5.12.0-community</span>
+    </div>
+    <div class="svc-card" style="--svc-color:#5b8cff">
+      <div class="svc-head"><span class="svc-name">graph-seeder</span><span class="svc-port">efímero</span></div>
+      <div class="svc-desc">Fallback idempotente (MERGE) si aún no sincronizaste desde Azure DevOps.</div>
+      <span class="svc-tag">depends_on: healthy</span>
+    </div>
+    <div class="svc-card" style="--svc-color:#e0a63c">
+      <div class="svc-head"><span class="svc-name">sonarqube</span><span class="svc-port">:9000</span></div>
+      <div class="svc-desc">Servidor real de análisis estático.</div>
+      <span class="svc-tag">sonarqube:10.6-community</span>
+    </div>
+    <div class="svc-card" style="--svc-color:#e0a63c">
+      <div class="svc-head"><span class="svc-name">sonar-scanner</span><span class="svc-port">efímero</span></div>
+      <div class="svc-desc">Rota password admin, genera token, escanea los 3 módulos de sample-repo/.</div>
+      <span class="svc-tag">bootstrap_sonar.sh</span>
+    </div>
+    <div class="svc-card" style="--svc-color:var(--violet)">
+      <div class="svc-head"><span class="svc-name">qdrant</span><span class="svc-port">:6333</span></div>
+      <div class="svc-desc">Vector store para RAG: código, histórico Jira, hallazgos Sonar resueltos.</div>
+      <span class="svc-tag">qdrant/qdrant</span>
+    </div>
+    <div class="svc-card" style="--svc-color:var(--violet)">
+      <div class="svc-head"><span class="svc-name">rag-indexer</span><span class="svc-port">efímero</span></div>
+      <div class="svc-desc">Embeddings locales (MiniLM) → upsert a las 3 colecciones de Qdrant.</div>
+      <span class="svc-tag">index_rag_corpus.py</span>
+    </div>
+    <div class="svc-card" style="--svc-color:#f0555a">
+      <div class="svc-head"><span class="svc-name">ai-firewall</span><span class="svc-port">:8080</span></div>
+      <div class="svc-desc">FastAPI real: ingress jailbreak, egress redacción, auditoría persistente.</div>
+      <span class="svc-tag">firewall_proxy.py</span>
+    </div>
+  </div>
+</section>
+
+<section id="mcp">
+  <h2>Orquestador de contexto: grafo + RAG vía MCP</h2>
+  <p class="h2-sub">registrados en .vscode/mcp.json — Copilot Chat los invoca nativamente, no bash</p>
+  <div class="mcp-wrap">
+    <div class="mcp-sources">
+      <div class="mcp-source">
+        <span class="name">Azure DevOps (real)</span>
+        <span class="desc">Repos y work items de tu organización — puebla el grafo, no un seed fijo.</span>
+      </div>
+      <div class="mcp-source">
+        <span class="name">Jira Cloud (real, OAuth)</span>
+        <span class="desc">Copilot busca y lee otros tickets/comentarios por su cuenta, más allá del que arma el prompt.</span>
+      </div>
+      <div class="mcp-source">
+        <span class="name">sample-repo/ código</span>
+        <span class="desc">Java, TypeScript, Python — embebido para búsqueda semántica.</span>
+      </div>
+      <div class="mcp-source">
+        <span class="name">Histórico Jira + Sonar resuelto</span>
+        <span class="desc">Tickets pasados y vulnerabilidades ya remediadas, vía API real.</span>
+      </div>
+    </div>
+    <div class="mcp-hub">⇉</div>
+    <div class="mcp-servers">
+      <div class="mcp-server" style="--mcp-color:#a685ff"><span class="dot"></span><span class="label">@azure-devops/mcp</span><span class="sub">repos · work items</span></div>
+      <div class="mcp-server" style="--mcp-color:#2d8fd6"><span class="dot"></span><span class="label">atlassian (mcp.atlassian.com)</span><span class="sub">búsqueda Jira · OAuth</span></div>
+      <div class="mcp-server" style="--mcp-color:#5b8cff"><span class="dot"></span><span class="label">mcp-neo4j-cypher</span><span class="sub">read / write cypher</span></div>
+      <div class="mcp-server" style="--mcp-color:#3fb96a"><span class="dot"></span><span class="label">mcp-server-qdrant</span><span class="sub">qdrant-find / qdrant-store</span></div>
+    </div>
+  </div>
+  <p class="h2-sub" style="margin-top:14px; margin-bottom:0;">jira_client.py sigue siendo el que alimenta run_poc_loop.sh (llamada REST determinística) — el MCP atlassian es para exploración interactiva de Copilot Chat, no reemplaza al cliente del pipeline.</p>
+</section>
+
+<section id="pipeline">
+  <h2>Pipeline de run_poc_loop.sh</h2>
+  <p class="h2-sub">sin argumentos — el escenario lo decide el ticket real de Jira. Orquestación a demanda, no CI/CD: nada dispara esto automáticamente cuando aparece un commit nuevo — ver nota en "Estructura del repositorio" más abajo.</p>
+  <div class="pipeline-scroll">
+    <div class="pipeline">
+      <div class="stage" style="--stage-color:#e0a63c">
+        <div class="stage-num">01</div>
+        <div class="stage-card">
+          <div class="stage-title">Ticket Jira real</div>
+          <div class="stage-desc">jira_client.py llama a la REST API v3, resuelve repository_origen desde las labels del ticket.</div>
+          <div class="stage-io"><b>GET</b> /rest/api/3/issue/:key</div>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage" style="--stage-color:#5b8cff">
+        <div class="stage-num">02</div>
+        <div class="stage-card">
+          <div class="stage-title">Grafo Neo4j</div>
+          <div class="stage-desc">cypher-shell real: qué depende del componente afectado, en qué lenguaje.</div>
+          <div class="stage-io"><b>query</b> MATCH ()&lt;-[:DEPENDS_ON]-()</div>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage" style="--stage-color:#e0a63c">
+        <div class="stage-num">03</div>
+        <div class="stage-card">
+          <div class="stage-title">Hallazgos Sonar reales</div>
+          <div class="stage-desc">sonar_client.py consulta /api/issues/search del proyecto real, incluye el hardcoded-credential de AuthService.java.</div>
+          <div class="stage-io"><b>GET</b> /api/issues/search</div>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage" style="--stage-color:#f0555a">
+        <div class="stage-num">04</div>
+        <div class="stage-card">
+          <div class="stage-title">AI Firewall</div>
+          <div class="stage-desc">Prompt compuesto (jira+grafo+sonar) evaluado; ingress + egress deciden APPROVED/REJECTED.</div>
+          <div class="stage-io"><b>POST</b> :8080/evaluate</div>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage" style="--stage-color:#3fb96a">
+        <div class="stage-num">05</div>
+        <div class="stage-card">
+          <div class="stage-title">gh copilot suggest → rama</div>
+          <div class="stage-desc">Si APPROVED: Copilot sugiere un comando real (confirmación humana antes de ejecutar). Si modifica archivos, se commitea en una rama nueva de sample-repo/, nunca en main.</div>
+          <div class="stage-io"><b>out</b> copilot_contribution.jsonl</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="firewall">
+  <h2>Lógica de decisión del firewall</h2>
+  <p class="h2-sub">orden estricto — egress solo corre si ingress pasa</p>
+  <div class="decision">
+    <div class="decision-row">
+      <div class="decision-label">
+        <span class="tag">paso 1</span>
+        <span class="name">Ingress · Jailbreak</span>
+      </div>
+      <div class="decision-body">
+        <div class="branch">texto normalizado contiene <code>rm -rf</code>, <code>drop table</code>, <code>ignore previous instructions</code>…</div>
+        <span class="arrow-sep">⇒</span>
+        <span class="pill danger">403 REJECTED</span>
+        <span class="arrow-sep">— corta el pipeline, gh copilot nunca se invoca</span>
+      </div>
+    </div>
+    <div class="decision-row">
+      <div class="decision-label">
+        <span class="tag">paso 2</span>
+        <span class="name">Egress · Fuga de datos</span>
+      </div>
+      <div class="decision-body">
+        <div class="branch">regex sobre el prompt real: <code>password=</code>, <code>secret_key=</code>, patrón Azure key</div>
+        <span class="arrow-sep">⇒</span>
+        <span class="pill warn">redactions_applied ≥ 1</span>
+        <span class="arrow-sep">reemplazo por <code>[REDACTED_CORPORATE_SECRET]</code></span>
+      </div>
+    </div>
+    <div class="decision-row">
+      <div class="decision-label">
+        <span class="tag">paso 3</span>
+        <span class="name">Veredicto final</span>
+      </div>
+      <div class="decision-body">
+        <span class="pill ok">200 APPROVED</span>
+        <span class="arrow-sep">sanitized_prompt no nulo → gh copilot explain real</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="cache">
+  <h2>Cache local con TTL</h2>
+  <p class="h2-sub">cache_utils.py — evita re-golpear Jira/Sonar en cada corrida</p>
+  <div class="cache-strip">
+    <span class="chip">./cache/&lt;hash&gt;.json</span>
+    <span class="arrow-sep">·</span>
+    <span class="chip">TTL 300s (CACHE_TTL_SECONDS)</span>
+    <span class="arrow-sep">·</span>
+    <span class="chip">"_cache": {"hit": bool, "age_seconds": n}</span>
+    <span class="arrow-sep">·</span>
+    <span class="chip">jira_client.py + sonar_client.py</span>
+  </div>
+</section>
+
+<section id="prereqs">
+  <h2>check_prereqs.sh — antes de correr el pipeline</h2>
+  <p class="h2-sub">falla rápido y claro en vez de un curl críptico a mitad de la demo</p>
+  <div class="checklist">
+    <div class="check-item"><span class="mark">✓</span>Neo4j alcanzable vía cypher-shell</div>
+    <div class="check-item"><span class="mark">✓</span>SonarQube UP + SONAR_TOKEN válido</div>
+    <div class="check-item"><span class="mark">✓</span>Qdrant listo (/readyz)</div>
+    <div class="check-item"><span class="mark">✓</span>Credenciales Jira válidas (/myself)</div>
+    <div class="check-item"><span class="mark">✓</span>JIRA_TICKET_KEY definido</div>
+    <div class="check-item"><span class="mark">✓</span>Credenciales Azure DevOps válidas</div>
+    <div class="check-item"><span class="mark">✓</span>gh copilot disponible</div>
+  </div>
+</section>
+
+<section id="estructura">
+  <h2 style="margin-bottom:22px">Estructura del repositorio</h2>
+  <div class="cols">
+    <div>
+      <div class="tree"><span class="dir">poc-ai-agents/</span>
+├── docker-compose.yml
+├── Dockerfile.firewall · requirements.txt
+├── firewall_proxy.py
+├── jira_client.py · sonar_client.py · cache_utils.py
+├── <span class="dir">sample-repo/</span>
+│   ├── <span class="new">auth-service/</span>  (Java — password hardcodeado real)
+│   ├── <span class="new">frontend/</span>       (TypeScript)
+│   └── <span class="new">data-worker/</span>    (Python)
+├── <span class="dir">seed/</span>seed.cypher      <span class="dir"># fallback</span>
+├── <span class="dir">.vscode/</span><span class="new">mcp.json</span>       <span class="dir"># 4 MCP</span>
+├── <span class="dir">prompts/</span><span class="new">sync_graph_from_azure_devops.md</span>
+├── <span class="dir">scripts/</span>
+│   ├── <span class="new">bootstrap_sonar.sh</span>
+│   ├── <span class="new">index_rag_corpus.py</span>
+│   ├── <span class="new">check_prereqs.sh</span>
+│   └── <span class="new">report_sprint_metrics.py</span>
+├── <span class="dir">cache/</span> · <span class="dir">logs/</span> · <span class="dir">qdrant_storage/</span>  <span class="dir"># runtime</span>
+├── .env.example · .gitignore
+├── run_poc_loop.sh
+└── README.md</div>
+    </div>
+    <div>
+      <ol class="gaps">
+        <li><span class="n">＋</span><span class="t"><b>Jira real</b> — REST API v3, no JSON local; el escenario lo decide el ticket, no un flag.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>SonarQube real</b> — escanea sample-repo/ de verdad; la credencial hardcodeada en AuthService.java es un hallazgo real, no fabricado.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Grafo poblado desde Azure DevOps</b> — vía MCP, no un seed estático (que queda solo como fallback).</span></li>
+        <li><span class="n">＋</span><span class="t"><b>RAG semántico</b> — Qdrant + embeddings locales sobre código e histórico real de Jira/Sonar.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Cache con TTL</b> — transparente sobre qué se sirvió en vivo vs. cacheado.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>check_prereqs.sh</b> — valida los 7 servicios y 3 credenciales antes de arrancar.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Ejecución real, no solo explicación</b> — gh copilot suggest corre de verdad (con confirmación humana) y aplica el cambio en una rama de revisión, nunca en main.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Métrica de colaboración</b> — copilot_contribution.jsonl + report_sprint_metrics.py miden cuánto sugirió y aplicó Copilot, no solo si el pipeline corrió.</span></li>
+        <li><span class="n warn-note">⚠</span><span class="t"><b>"Pipeline" ≠ CI/CD</b> — run_poc_loop.sh es orquestación manual a demanda. Las ramas <code>copilot/*</code> que crea la etapa 5 no disparan ningún build/test/re-análisis automático; nada las está observando todavía.</span></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="auditoria">
+  <h2>Auditoría y métricas de contribución</h2>
+  <p class="h2-sub">logs/firewall_audit.jsonl (decisiones) + logs/copilot_contribution.jsonl (colaboración real)</p>
+  <div class="log">{<span class="k">"ts"</span>: "2026-07-03T14:02:11Z", <span class="k">"ticket_id"</span>: <span class="s">"JIRA-404"</span>, <span class="k">"status"</span>: <span class="ok">"APPROVED"</span>, <span class="k">"redactions_applied"</span>: 2, <span class="k">"reason"</span>: null}
+{<span class="k">"ts"</span>: "2026-07-03T14:03:47Z", <span class="k">"ticket_id"</span>: <span class="s">"JIRA-404"</span>, <span class="k">"status"</span>: <span class="danger">"REJECTED"</span>, <span class="k">"redactions_applied"</span>: 0, <span class="k">"reason"</span>: <span class="s">"jailbreak_pattern_matched"</span>}</div>
+  <p class="h2-sub" style="margin:16px 0 8px;">python3 scripts/report_sprint_metrics.py --since 2026-07-01</p>
+  <div class="log">Corridas totales:            12
+Tickets unicos tocados:      5
+Aprobadas por el firewall:   10
+Rechazadas por el firewall:  2
+Tasa de aprobacion:          83%
+Copilot sugirio un cambio:   10
+Sugerencia aplicada a rama:  7
+Corridas con dato redactado: 3</div>
+</section>
+
+<footer>PLAN.md · README.md — mismo directorio · esquema estático, sin llamadas externas</footer>

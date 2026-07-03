@@ -1,0 +1,36 @@
+{
+  "servers": {
+    "neo4j-cypher": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-neo4j-cypher"],
+      "env": {
+        "NEO4J_URI": "${env:NEO4J_URI}",
+        "NEO4J_USERNAME": "${env:NEO4J_USERNAME}",
+        "NEO4J_PASSWORD": "${env:NEO4J_PASSWORD}"
+      }
+    },
+    "azure-devops": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@azure-devops/mcp", "${env:AZURE_DEVOPS_ORG}"],
+      "env": {
+        "AZURE_DEVOPS_PAT": "${env:AZURE_DEVOPS_PAT}"
+      }
+    },
+    "qdrant-rag": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-qdrant"],
+      "env": {
+        "QDRANT_URL": "${env:QDRANT_URL}",
+        "COLLECTION_NAME": "sample_repo_code",
+        "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2"
+      }
+    },
+    "atlassian": {
+      "type": "sse",
+      "url": "https://mcp.atlassian.com/v1/sse"
+    }
+  }
+}

@@ -1,0 +1,893 @@
+<title>Desarrollo Acelerado con Seguridad Integrada</title>
+<style>
+  :root{
+    --bg:#f5f6f9;
+    --surface:#ffffff;
+    --ink:#161d2b;
+    --ink-dim:#5b6472;
+    --ink-faint:#8991a1;
+    --border:#e1e4ea;
+    --border-strong:#c9cfda;
+    --primary:#2d4a86;
+    --primary-dim:#5872a8;
+    --primary-soft:#2d4a860f;
+    --danger:#b93a3a;
+    --danger-soft:#b93a3a0f;
+    --ok:#1f7a54;
+    --ok-soft:#1f7a540f;
+    --warn:#a9740a;
+    --warn-soft:#a9740a0f;
+    --serif: Georgia, "Iowan Old Style", "Palatino Linotype", ui-serif, "Times New Roman", serif;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-font-smoothing:antialiased; scroll-behavior:smooth;}
+  @media (prefers-reduced-motion: reduce){ html{ scroll-behavior:auto; } }
+  @media (prefers-reduced-motion: no-preference){
+    .flow-card, .risk-card, .compare-step, .lane, .sdlc-card, .compliance .cell, .navbar a{ transition: border-color .15s ease, background-color .15s ease, transform .15s ease; }
+  }
+  body{
+    background:
+      radial-gradient(760px 380px at 14% -6%, #2d4a860c, transparent 62%),
+      var(--bg);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.6;
+    font-size:15.5px;
+    max-width:1140px;
+    margin:0 auto;
+    padding:0 40px 100px;
+  }
+  ::selection{background:var(--primary-soft);}
+  a{color:var(--primary);}
+  :focus-visible{outline:2px solid var(--primary); outline-offset:2px;}
+
+  /* ---------- Sticky section nav ---------- */
+  .navbar{
+    position:sticky;
+    top:0;
+    z-index:10;
+    display:flex;
+    gap:2px;
+    overflow-x:auto;
+    padding:16px 0;
+    margin:0 0 44px;
+    background:linear-gradient(var(--bg) 84%, transparent);
+    border-bottom:1px solid var(--border);
+  }
+  .navbar a{
+    flex:none;
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.03em;
+    color:var(--ink-faint);
+    text-decoration:none;
+    padding:6px 12px;
+    border:1px solid transparent;
+  }
+  .navbar a:hover{ color:var(--ink); border-color:var(--border); background:var(--surface); }
+  .hero-block{ padding-top:48px; }
+  section{ scroll-margin-top:64px; }
+
+  /* ---------- Header ---------- */
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:11.5px;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:8px;
+  }
+  .kicker{
+    font-size:11.5px;
+    color:var(--primary);
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-bottom:0;
+  }
+  .kicker::before{
+    content:"";
+    width:22px; height:1.5px;
+    background:var(--primary);
+    display:inline-block;
+  }
+  h1{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:clamp(32px,4.2vw,46px);
+    letter-spacing:-.01em;
+    text-wrap:balance;
+    margin:18px 0 16px;
+    color:var(--ink);
+  }
+  .lede{
+    font-size:17.5px;
+    color:var(--ink-dim);
+    max-width:68ch;
+  }
+  .lede strong{color:var(--ink); font-weight:600;}
+
+  .exec-summary{
+    margin-top:32px;
+    padding:22px 26px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-left:3px solid var(--primary);
+    display:grid;
+    grid-template-columns:repeat(3, 1fr);
+    gap:26px;
+  }
+  .exec-summary .item .h{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:6px;
+  }
+  .exec-summary .item .v{
+    font-size:14.5px;
+    color:var(--ink);
+  }
+  .exec-summary .item .v code{
+    font-family:var(--mono);
+    font-size:12.5px;
+    background:var(--bg);
+    border:1px solid var(--border);
+    padding:1px 5px;
+  }
+  @media (max-width:760px){ .exec-summary{grid-template-columns:1fr;} }
+
+  h2{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:26px;
+    letter-spacing:-.005em;
+    margin:0 0 6px;
+    color:var(--ink);
+  }
+  .h2-sub{
+    color:var(--ink-faint);
+    font-size:14px;
+    margin:0 0 30px;
+    max-width:60ch;
+  }
+  section{margin-top:76px;}
+
+  /* ---------- Flow diagram ---------- */
+  .flow-scroll{overflow-x:auto; padding:6px 2px 10px;}
+  .flow{
+    display:grid;
+    grid-auto-flow:column;
+    grid-auto-columns:200px;
+    align-items:stretch;
+    gap:0;
+    min-width:max-content;
+  }
+  .flow-node{
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+  }
+  .flow-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    padding:20px 18px;
+    min-height:158px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .flow-title{
+    font-family:var(--serif);
+    font-size:18px;
+    color:var(--ink);
+  }
+  .flow-desc{
+    font-size:12.8px;
+    color:var(--ink-dim);
+    flex:1;
+  }
+  .flow-role{
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    display:flex;
+    align-items:center;
+    gap:7px;
+  }
+  .flow-role::before{
+    content:"";
+    width:7px; height:7px;
+    border-radius:50%;
+    background:var(--node-color, var(--primary));
+    flex:none;
+  }
+  .flow-card:hover{ border-color:var(--border-strong); transform:translateY(-1px); }
+  .flow-connector{
+    height:158px;
+    margin-top:31px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    position:relative;
+  }
+  .flow-connector::before{
+    content:"";
+    height:1px; width:100%;
+    background:var(--border-strong);
+  }
+  .flow-connector::after{
+    content:"→";
+    position:absolute;
+    color:var(--ink-faint);
+    font-size:15px;
+  }
+
+  /* ---------- Security gate (traffic light) ---------- */
+  .gate{
+    border:1px solid var(--border);
+    background:var(--surface);
+    padding:30px 34px;
+    display:grid;
+    grid-template-columns:1.1fr 2fr;
+    gap:36px;
+    align-items:center;
+  }
+  @media (max-width:760px){ .gate{grid-template-columns:1fr;} }
+  .gate-intro .eyebrow{ font-size:10.5px; }
+  .gate-intro h3{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:21px;
+    margin:0 0 10px;
+  }
+  .gate-intro p{
+    font-size:13.5px;
+    color:var(--ink-dim);
+    margin:0;
+  }
+  .gate-lanes{
+    display:flex;
+    flex-direction:column;
+    gap:0;
+    border:1px solid var(--border);
+  }
+  .lane{
+    display:grid;
+    grid-template-columns:120px 1fr;
+    align-items:center;
+    padding:16px 18px;
+    border-bottom:1px solid var(--border);
+    gap:14px;
+  }
+  .lane:last-child{border-bottom:none;}
+  .lane:hover{ background:var(--bg); }
+  .lane-tag{
+    display:flex;
+    align-items:center;
+    gap:9px;
+  }
+  .lane-dot{width:10px; height:10px; border-radius:50%; flex:none; background:var(--dot-color);}
+  .lane-label{font-family:var(--mono); font-size:12px; font-weight:600; color:var(--ink);}
+  .lane-desc{font-size:13px; color:var(--ink-dim);}
+  .lane-desc b{color:var(--ink); font-weight:600;}
+
+  /* ---------- Risk cards ---------- */
+  .risk-grid{
+    display:grid;
+    grid-template-columns:repeat(3, 1fr);
+    gap:1px;
+    background:var(--border);
+    border:1px solid var(--border);
+  }
+  @media (max-width:760px){ .risk-grid{grid-template-columns:1fr;} }
+  .risk-card{
+    background:var(--surface);
+    padding:26px 24px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .risk-card .label{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:var(--risk-color);
+  }
+  .risk-card h3{
+    font-family:var(--serif);
+    font-weight:400;
+    font-size:19px;
+    margin:0;
+    color:var(--ink);
+  }
+  .risk-card p{
+    font-size:13.3px;
+    color:var(--ink-dim);
+    margin:0;
+  }
+  .risk-card:hover{ background:var(--bg); }
+
+  /* ---------- Sprint metrics ---------- */
+  .metrics-grid{
+    display:grid;
+    grid-template-columns:repeat(4, 1fr);
+    gap:1px;
+    background:var(--border);
+    border:1px solid var(--border);
+  }
+  @media (max-width:760px){ .metrics-grid{grid-template-columns:repeat(2, 1fr);} }
+  .metric-cell{
+    background:var(--surface);
+    padding:22px 20px;
+    display:flex;
+    flex-direction:column;
+    gap:4px;
+  }
+  .metric-cell .num{
+    font-family:var(--serif);
+    font-size:32px;
+    color:var(--ink);
+    font-variant-numeric:tabular-nums;
+  }
+  .metric-cell .lbl{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+  }
+  .metrics-source{
+    font-family:var(--mono);
+    font-size:11.5px;
+    color:var(--ink-faint);
+    margin-top:14px;
+  }
+
+  /* ---------- Compliance strip ---------- */
+  .compliance{
+    display:flex;
+    align-items:center;
+    gap:0;
+    background:var(--surface);
+    border:1px solid var(--border);
+    flex-wrap:wrap;
+  }
+  .compliance .cell{
+    padding:20px 26px;
+    flex:1;
+    min-width:200px;
+    border-right:1px solid var(--border);
+  }
+  .compliance .cell:last-child{border-right:none;}
+  .compliance .cell:hover{ background:var(--bg); }
+  .compliance .cell .k{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:6px;
+  }
+  .compliance .cell .v{
+    font-size:14px;
+    color:var(--ink);
+    font-variant-numeric:tabular-nums;
+  }
+
+  /* ---------- SDLC lifecycle ring ---------- */
+  .sdlc-wrap{ display:flex; justify-content:center; padding-bottom:12px; }
+  .sdlc-ring{
+    position:relative;
+    width:680px;
+    height:680px;
+    max-width:100%;
+  }
+  .sdlc-track{
+    position:absolute;
+    inset:130px;
+    border:1px solid var(--border-strong);
+    border-radius:50%;
+  }
+  .sdlc-center{
+    position:absolute;
+    inset:0;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .sdlc-center-inner{
+    width:150px; height:150px;
+    border-radius:50%;
+    background:var(--surface);
+    border:1px solid var(--border-strong);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    text-align:center;
+    gap:2px;
+  }
+  .sdlc-center-inner .t1{ font-family:var(--serif); font-size:16px; color:var(--ink); }
+  .sdlc-center-inner .t2{ font-family:var(--mono); font-size:10px; letter-spacing:.05em; text-transform:uppercase; color:var(--ink-faint); }
+  .sdlc-node{
+    position:absolute;
+    top:50%; left:50%;
+    width:0; height:0;
+    transform: rotate(var(--angle)) translateY(-232px);
+  }
+  .sdlc-content{
+    position:absolute;
+    top:0; left:0;
+    width:158px;
+    transform: translate(-50%,-50%) rotate(calc(-1 * var(--angle)));
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:8px;
+    text-align:center;
+  }
+  .sdlc-marker{
+    width:14px; height:14px;
+    border-radius:50%;
+    background:var(--primary);
+    border:3px solid var(--surface);
+    box-shadow:0 0 0 1px var(--primary);
+  }
+  .sdlc-node.out .sdlc-marker{
+    background:var(--surface);
+    box-shadow:0 0 0 1px var(--border-strong);
+  }
+  .sdlc-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-top:3px solid var(--primary);
+    padding:12px 13px;
+    font-size:12px;
+  }
+  .sdlc-node.out .sdlc-card{
+    border-top:3px dashed var(--border-strong);
+  }
+  .sdlc-card:hover{ border-color:var(--border-strong); }
+  .sdlc-phase{
+    display:block;
+    font-family:var(--serif);
+    font-size:14.5px;
+    color:var(--ink);
+    margin-bottom:5px;
+  }
+  .sdlc-node.out .sdlc-phase{ color:var(--ink-faint); }
+  .sdlc-benefit{ color:var(--ink-dim); line-height:1.45; }
+  .sdlc-node.out .sdlc-benefit{ color:var(--ink-faint); font-style:italic; }
+
+  .sdlc-legend{
+    display:flex;
+    justify-content:center;
+    gap:28px;
+    margin-top:44px;
+    font-size:12.5px;
+    color:var(--ink-dim);
+  }
+  .sdlc-legend .lg-item{ display:flex; align-items:center; gap:8px; }
+  .sdlc-legend .lg-dot{ width:10px; height:10px; border-radius:50%; background:var(--primary); }
+  .sdlc-legend .lg-dot.out{ background:var(--surface); border:1px solid var(--border-strong); }
+
+  /* ---------- SDLC mobile fallback: vertical timeline ---------- */
+  @media (max-width:840px){
+    .sdlc-ring{ width:100%; height:auto; }
+    .sdlc-track{ display:none; }
+    .sdlc-center{ position:static; margin-bottom:24px; }
+    .sdlc-node{
+      position:static;
+      width:auto; height:auto;
+      transform:none;
+      margin-bottom:14px;
+      padding-left:18px;
+      border-left:2px solid var(--border);
+    }
+    .sdlc-node:last-child{ border-left:2px solid transparent; }
+    .sdlc-content{
+      position:static;
+      transform:none;
+      width:auto;
+      flex-direction:row;
+      align-items:flex-start;
+      text-align:left;
+      margin-left:-27px;
+    }
+    .sdlc-marker{ margin-top:4px; }
+    .sdlc-card{ flex:1; }
+  }
+
+  /* ---------- Before / after lanes ---------- */
+  .compare{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:1px;
+    background:var(--border);
+    border:1px solid var(--border);
+  }
+  @media (max-width:760px){ .compare{grid-template-columns:1fr;} }
+  .compare-lane{
+    background:var(--surface);
+    display:flex;
+    flex-direction:column;
+  }
+  .compare-head{
+    padding:18px 24px;
+    border-bottom:1px solid var(--border);
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:10px;
+  }
+  .compare-head .name{
+    font-family:var(--serif);
+    font-size:18px;
+    color:var(--ink);
+  }
+  .compare-head .time{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:.04em;
+    color:var(--lane-color);
+    white-space:nowrap;
+  }
+  .compare-lane.before{ --lane-color:#a9740a; }
+  .compare-lane.after{ --lane-color:#1f7a54; }
+  .compare-steps{
+    display:flex;
+    flex-direction:column;
+  }
+  .compare-step{
+    padding:14px 24px;
+    border-bottom:1px solid var(--border);
+    display:flex;
+    gap:12px;
+    align-items:flex-start;
+    font-size:13.3px;
+    color:var(--ink-dim);
+  }
+  .compare-step:last-child{border-bottom:none;}
+  .compare-step:hover{ background:var(--bg); }
+  .compare-step .bullet{
+    width:6px; height:6px;
+    border-radius:50%;
+    background:var(--lane-color);
+    flex:none;
+    margin-top:7px;
+  }
+  .compare-step b{color:var(--ink); font-weight:600;}
+  .compare-step .risk-note{
+    display:block;
+    margin-top:4px;
+    font-size:12px;
+    color:var(--danger);
+  }
+
+  footer{
+    margin-top:88px;
+    padding-top:22px;
+    border-top:1px solid var(--border);
+    color:var(--ink-faint);
+    font-size:12px;
+    display:flex;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+</style>
+
+<nav class="navbar">
+  <a href="#ciclo">ciclo de vida</a>
+  <a href="#comparacion">antes / después</a>
+  <a href="#flujo">flujo de una historia</a>
+  <a href="#control">control de seguridad</a>
+  <a href="#riesgos">riesgos</a>
+  <a href="#metricas">cuánto colabora</a>
+  <a href="#evidencia">evidencia</a>
+</nav>
+
+<div class="hero-block">
+  <div class="eyebrow kicker">resumen ejecutivo · de autocompletado a copiloto del sprint</div>
+  <h1>Conectar a Copilot con el ciclo ágil completo, no solo con el archivo abierto</h1>
+  <p class="lede">
+    Hoy el equipo usa Copilot como autocompletado y chat dentro del editor, sin visibilidad del ticket,
+    del impacto en otros servicios ni de los hallazgos de seguridad del sprint. Ese contexto lo sigue
+    armando la persona, a mano, historia por historia. Este flujo <strong>conecta a Copilot con ese
+    contexto</strong> automáticamente, con un firewall local para que esa conexión no filtre datos
+    sensibles.
+  </p>
+
+  <div class="exec-summary">
+    <div class="item">
+      <div class="h">Punto de partida</div>
+      <div class="v">Copilot ya aprobado y en uso diario, pero aislado: solo ve el archivo abierto, no el ticket de la historia ni lo que esa historia va a impactar.</div>
+    </div>
+    <div class="item">
+      <div class="h">Qué se acelera</div>
+      <div class="v">El tiempo entre tomar una historia del sprint y tener a Copilot trabajando con el contexto completo — hoy ese armado de contexto es manual y se salta seguido por falta de tiempo.</div>
+    </div>
+    <div class="item">
+      <div class="h">Qué le llega de nuevo a Copilot</div>
+      <div class="v">El ticket de la historia, el impacto real en otros servicios y los hallazgos de seguridad del componente — ya verificados por el firewall antes de que Copilot los vea.</div>
+    </div>
+    <div class="item">
+      <div class="h">Qué hace de nuevo Copilot</div>
+      <div class="v">No solo explica: propone un cambio concreto y, si la persona lo confirma, lo deja aplicado en una rama de revisión — nunca directo en <code>main</code>.</div>
+    </div>
+    <div class="item">
+      <div class="h">Cómo se controla el riesgo</div>
+      <div class="v">Nada se ejecuta a ciegas: cada propuesta pasa antes por el firewall, y cualquier comando que Copilot sugiera pide confirmación humana antes de correr.</div>
+    </div>
+    <div class="item">
+      <div class="h">Qué se puede medir</div>
+      <div class="v">Cada corrida queda registrada — tickets tocados, cuántas veces Copilot propuso algo y cuántas veces se aplicó — agregable por sprint como evidencia de adopción.</div>
+    </div>
+  </div>
+</div>
+
+<section id="ciclo">
+  <h2>Dónde se ubica esta PoC en el ciclo de vida del software</h2>
+  <p class="h2-sub">Un ciclo ágil típico tiene seis etapas que se repiten sprint tras sprint. Esta PoC interviene en las primeras tres — donde hoy se pierde más tiempo en trabajo manual — y deja las otras tres para una siguiente fase.</p>
+  <div class="sdlc-wrap">
+    <div class="sdlc-ring">
+      <div class="sdlc-track"></div>
+      <div class="sdlc-center">
+        <div class="sdlc-center-inner">
+          <span class="t1">Ciclo del<br />sprint</span>
+          <span class="t2">6 etapas</span>
+        </div>
+      </div>
+
+      <div class="sdlc-node" style="--angle:0deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">1 · Planificación</span>
+            <span class="sdlc-benefit">El ticket se lee automáticamente, con el componente afectado ya identificado — sin transcripción manual.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sdlc-node" style="--angle:60deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">2 · Revisión y seguridad</span>
+            <span class="sdlc-benefit">Hallazgos de código y datos sensibles se filtran antes de que Copilot escriba nada, con registro auditable de cada decisión.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sdlc-node" style="--angle:120deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">3 · Desarrollo</span>
+            <span class="sdlc-benefit">Con la historia, el impacto y los hallazgos ya filtrados, Copilot propone el cambio y lo aplica en una rama de revisión.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sdlc-node out" style="--angle:180deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">4 · Integración (CI)</span>
+            <span class="sdlc-benefit">Fuera de esta PoC — cuando Copilot deja un cambio en una rama, nada lo detecta ni dispara automáticamente un build o un nuevo análisis.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sdlc-node out" style="--angle:240deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">5 · Despliegue</span>
+            <span class="sdlc-benefit">Fuera de esta PoC — no hay integración con el proceso de release ni con los ambientes productivos.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sdlc-node out" style="--angle:300deg">
+        <div class="sdlc-content">
+          <div class="sdlc-marker"></div>
+          <div class="sdlc-card">
+            <span class="sdlc-phase">6 · Operación</span>
+            <span class="sdlc-benefit">Fuera de esta PoC — sin monitoreo post-despliegue ni retroalimentación automática hacia el backlog.</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  <div class="sdlc-legend">
+    <span class="lg-item"><i class="lg-dot"></i> Cubierto por esta PoC</span>
+    <span class="lg-item"><i class="lg-dot out"></i> Fuera del alcance actual</span>
+  </div>
+</section>
+
+<section id="comparacion">
+  <h2>Lo que hace Copilot hoy, frente a lo que podría hacer</h2>
+  <p class="h2-sub">Misma herramienta, mismo equipo. La diferencia es cuánto del ciclo ágil de la historia le llega antes de escribir la primera sugerencia.</p>
+  <div class="compare">
+    <div class="compare-lane before">
+      <div class="compare-head">
+        <span class="name">Hoy — Copilot aislado</span>
+        <span class="time">solo ve el editor</span>
+      </div>
+      <div class="compare-steps">
+        <div class="compare-step"><span class="bullet"></span><div>El desarrollador toma la historia del sprint y la lee por su cuenta.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Si quiere saber qué más depende del componente, lo averigua preguntando en el equipo o revisando código a mano.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Los hallazgos de seguridad del sprint casi nunca llegan a esta etapa — se revisan aparte, más tarde, en otro ritual.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Recién con lo que la persona alcanzó a juntar, le pide algo a Copilot dentro del editor.
+          <span class="risk-note">Si copia texto del ticket o de un log, nadie limpia datos sensibles antes de pegarlo.</span>
+        </div></div>
+      </div>
+    </div>
+    <div class="compare-lane after">
+      <div class="compare-head">
+        <span class="name">Con este flujo — Copilot conectado</span>
+        <span class="time">ve el sprint, no solo el archivo</span>
+      </div>
+      <div class="compare-steps">
+        <div class="compare-step"><span class="bullet"></span><div>La historia se toma directo del sistema de gestión de trabajo, sin transcribirla.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>El impacto en otros servicios se calcula al instante, contra el mapa real de dependencias del sprint.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Los hallazgos de seguridad del componente llegan en el mismo paso, no en un ritual aparte.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div><b>El firewall limpia o bloquea</b> lo sensible siempre, antes de que Copilot lo vea.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Copilot recibe la historia completa — ticket, impacto y riesgos — no solo el archivo abierto.</div></div>
+        <div class="compare-step"><span class="bullet"></span><div>Copilot propone el cambio y, si la persona lo confirma, queda aplicado en una rama para revisar — no solo una explicación en el chat.</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="flujo">
+  <h2>El ciclo de una historia, de principio a fin</h2>
+  <p class="h2-sub">Los cinco pasos de la columna derecha de arriba, encadenados automáticamente cada vez que se toma una historia del sprint. El único punto donde algo puede detenerse es el firewall — por diseño, no por olvido.</p>
+  <div class="flow-scroll">
+    <div class="flow">
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#a9740a">
+          <div class="flow-role">origen del trabajo</div>
+          <div class="flow-title">Solicitud</div>
+          <div class="flow-desc">Un ticket real del sistema de gestión de trabajo describe el problema a resolver.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#2d4a86">
+          <div class="flow-role">contexto del negocio</div>
+          <div class="flow-title">Impacto</div>
+          <div class="flow-desc">Se identifica qué otros sistemas y equipos se ven afectados por el cambio antes de tocar nada.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#a9740a">
+          <div class="flow-role">calidad y riesgo</div>
+          <div class="flow-title">Diagnóstico</div>
+          <div class="flow-desc">Un análisis de seguridad del código señala vulnerabilidades ya conocidas, incluidas credenciales expuestas.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#b93a3a">
+          <div class="flow-role">punto de control</div>
+          <div class="flow-title">Firewall de IA</div>
+          <div class="flow-desc">Bloquea manipulaciones y elimina secretos antes de que la información salga de la empresa.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#1f7a54">
+          <div class="flow-role">acción final</div>
+          <div class="flow-title">Copilot propone y aplica</div>
+          <div class="flow-desc">Con el sprint completo como contexto, Copilot propone un cambio; si la persona lo confirma, queda en una rama lista para revisar — no solo una respuesta en el chat.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="control">
+  <h2>Qué decide el portón de seguridad</h2>
+  <p class="h2-sub">El firewall evalúa cada solicitud en dos pasos, en orden estricto: primero descarta manipulaciones, después limpia lo que sí puede pasar.</p>
+  <div class="gate">
+    <div class="gate-intro">
+      <div class="eyebrow">cómo leer esto</div>
+      <h3>Nada pasa sin evaluación</h3>
+      <p>Esta evaluación toma segundos, no reemplaza el trabajo que hoy hace una persona a ojo, lo hace de forma consistente en cada corrida. Si la solicitud intenta manipular al asistente, se rechaza por completo. Si es legítima pero contiene un dato sensible, ese dato se elimina antes de continuar.</p>
+    </div>
+    <div class="gate-lanes">
+      <div class="lane">
+        <div class="lane-tag"><span class="lane-dot" style="--dot-color:#b93a3a"></span><span class="lane-label">Rechazado</span></div>
+        <div class="lane-desc">La solicitud intenta <b>anular las instrucciones del asistente</b> o ejecutar una acción destructiva. Se detiene por completo; el asistente nunca la recibe.</div>
+      </div>
+      <div class="lane">
+        <div class="lane-tag"><span class="lane-dot" style="--dot-color:#a9740a"></span><span class="lane-label">Limpiado</span></div>
+        <div class="lane-desc">La solicitud es legítima pero <b>contiene una contraseña o clave expuesta</b>. Ese dato se elimina y se reemplaza antes de continuar.</div>
+      </div>
+      <div class="lane">
+        <div class="lane-tag"><span class="lane-dot" style="--dot-color:#1f7a54"></span><span class="lane-label">Aprobado</span></div>
+        <div class="lane-desc">La solicitud <b>no contiene riesgo</b>. Pasa al asistente de IA sin cambios.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="riesgos">
+  <h2>Riesgos de conectar a Copilot con más contexto</h2>
+  <p class="h2-sub">Darle a Copilot acceso al ticket, al grafo y a los hallazgos de seguridad abre valor — y abre estas tres exposiciones si se hace sin control.</p>
+  <div class="risk-grid">
+    <div class="risk-card">
+      <span class="label" style="--risk-color:#b93a3a">riesgo</span>
+      <h3>Manipulación del asistente</h3>
+      <p>Una descripción de ticket redactada para hacer que el asistente ignore sus instrucciones y ejecute algo no autorizado.</p>
+    </div>
+    <div class="risk-card">
+      <span class="label" style="--risk-color:#a9740a">riesgo</span>
+      <h3>Fuga de credenciales</h3>
+      <p>Contraseñas o claves de acceso que quedaron escritas en un ticket o en un hallazgo de análisis de código, y que viajarían tal cual a un servicio externo.</p>
+    </div>
+    <div class="risk-card">
+      <span class="label" style="--risk-color:#2d4a86">riesgo</span>
+      <h3>Falta de trazabilidad</h3>
+      <p>Sin este control, no hay forma de responder "¿qué vio el asistente de IA y cuándo" ante una auditoría o un incidente.</p>
+    </div>
+  </div>
+</section>
+
+<section id="metricas">
+  <h2>Cuánto colabora Copilot, no solo si el flujo corrió</h2>
+  <p class="h2-sub">Cada corrida queda registrada aparte del log de seguridad: si Copilot propuso un cambio y si esa propuesta se llegó a aplicar. Números de ejemplo de un sprint corrido con esta PoC.</p>
+  <div class="metrics-grid">
+    <div class="metric-cell">
+      <span class="num">5</span>
+      <span class="lbl">tickets tocados</span>
+    </div>
+    <div class="metric-cell">
+      <span class="num">83%</span>
+      <span class="lbl">aprobados por el firewall</span>
+    </div>
+    <div class="metric-cell">
+      <span class="num">10 / 12</span>
+      <span class="lbl">veces que Copilot propuso algo</span>
+    </div>
+    <div class="metric-cell">
+      <span class="num">7 / 10</span>
+      <span class="lbl">propuestas aplicadas a una rama</span>
+    </div>
+  </div>
+  <p class="metrics-source">python3 scripts/report_sprint_metrics.py --since &lt;inicio del sprint&gt;</p>
+</section>
+
+<section id="evidencia">
+  <h2>Lo que queda como evidencia</h2>
+  <p class="h2-sub">Cada paso por el firewall deja un registro, sin importar si la solicitud fue aprobada o rechazada.</p>
+  <div class="compliance">
+    <div class="cell">
+      <div class="k">Se registra</div>
+      <div class="v">Fecha, ticket de origen, decisión y motivo</div>
+    </div>
+    <div class="cell">
+      <div class="k">No se registra</div>
+      <div class="v">El secreto original en texto claro</div>
+    </div>
+    <div class="cell">
+      <div class="k">Dónde vive</div>
+      <div class="v">Registro local, controlado por la propia empresa</div>
+    </div>
+    <div class="cell">
+      <div class="k">Alcance actual</div>
+      <div class="v">Prueba de concepto — un solo equipo, entorno local</div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,18 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY firewall_proxy.py jira_client.py sonar_client.py cache_utils.py ./
+
+RUN mkdir -p /app/logs /app/cache
+
+EXPOSE 8080
+
+CMD ["uvicorn", "firewall_proxy:app", "--host", "0.0.0.0", "--port", "8080"]

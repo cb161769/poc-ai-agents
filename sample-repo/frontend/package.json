@@ -1,0 +1,11 @@
+{
+  "name": "frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal TS client that depends on AuthService — used only to give SonarQube a real polyglot module to scan.",
+  "main": "src/authClient.ts",
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
