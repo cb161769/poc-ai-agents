@@ -1,18 +1,21 @@
 <title>Desarrollo Acelerado con Seguridad Integrada</title>
 <style>
   :root{
-    --bg:#f5f6f9;
+    --bg:#f7f4ec;
     --surface:#ffffff;
-    --ink:#161d2b;
-    --ink-dim:#5b6472;
-    --ink-faint:#8991a1;
-    --border:#e1e4ea;
-    --border-strong:#c9cfda;
-    --primary:#2d4a86;
-    --primary-dim:#5872a8;
-    --primary-soft:#2d4a860f;
-    --danger:#b93a3a;
-    --danger-soft:#b93a3a0f;
+    --ink:#0c0d10;
+    --ink-dim:#4b4d52;
+    --ink-faint:#87878a;
+    --border:#e6e0d0;
+    --border-strong:#cfc6ac;
+    --primary:#1f4e8c;
+    --primary-dim:#4a76ac;
+    --primary-soft:#1f4e8c0f;
+    --gold:#d9a52c;
+    --gold-dim:#b8891f;
+    --gold-soft:#d9a52c1a;
+    --danger:#b23a3a;
+    --danger-soft:#b23a3a0f;
     --ok:#1f7a54;
     --ok-soft:#1f7a540f;
     --warn:#a9740a;
@@ -29,7 +32,10 @@
   }
   body{
     background:
-      radial-gradient(760px 380px at 14% -6%, #2d4a860c, transparent 62%),
+      radial-gradient(900px 480px at 12% -8%, #1f4e8c10, transparent 60%),
+      radial-gradient(620px 360px at 98% 6%, #d9a52c16, transparent 58%),
+      radial-gradient(140% 140% at 50% 0%, transparent 55%, #0c0d1008 100%),
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='140'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.035 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>"),
       var(--bg);
     color:var(--ink);
     font-family:var(--sans);
@@ -89,8 +95,8 @@
   }
   .kicker::before{
     content:"";
-    width:22px; height:1.5px;
-    background:var(--primary);
+    width:22px; height:2px;
+    background:var(--gold);
     display:inline-block;
   }
   h1{
@@ -114,7 +120,8 @@
     padding:22px 26px;
     background:var(--surface);
     border:1px solid var(--border);
-    border-left:3px solid var(--primary);
+    border-left:3px solid var(--gold);
+    box-shadow:0 14px 34px -22px #0c0d1030;
     display:grid;
     grid-template-columns:repeat(3, 1fr);
     gap:26px;
@@ -232,6 +239,7 @@
   .gate{
     border:1px solid var(--border);
     background:var(--surface);
+    box-shadow:0 14px 34px -22px #0c0d1030;
     padding:30px 34px;
     display:grid;
     grid-template-columns:1.1fr 2fr;
@@ -333,7 +341,7 @@
   .metric-cell .num{
     font-family:var(--serif);
     font-size:32px;
-    color:var(--ink);
+    color:var(--gold-dim);
     font-variant-numeric:tabular-nums;
   }
   .metric-cell .lbl{
@@ -344,8 +352,9 @@
     color:var(--ink-faint);
   }
   .metrics-source{
-    font-family:var(--mono);
-    font-size:11.5px;
+    font-family:var(--sans);
+    font-style:italic;
+    font-size:12.5px;
     color:var(--ink-faint);
     margin-top:14px;
   }
@@ -763,7 +772,7 @@
       </div>
       <div class="flow-connector"></div>
       <div class="flow-node">
-        <div class="flow-card" style="--node-color:#2d4a86">
+        <div class="flow-card" style="--node-color:#1f4e8c">
           <div class="flow-role">contexto del negocio</div>
           <div class="flow-title">Impacto</div>
           <div class="flow-desc">Se identifica qué otros sistemas y equipos se ven afectados por el cambio antes de tocar nada.</div>
@@ -838,7 +847,7 @@
       <p>Contraseñas o claves de acceso que quedaron escritas en un ticket o en un hallazgo de análisis de código, y que viajarían tal cual a un servicio externo.</p>
     </div>
     <div class="risk-card">
-      <span class="label" style="--risk-color:#2d4a86">riesgo</span>
+      <span class="label" style="--risk-color:#1f4e8c">riesgo</span>
       <h3>Falta de trazabilidad</h3>
       <p>Sin este control, no hay forma de responder "¿qué vio el asistente de IA y cuándo" ante una auditoría o un incidente.</p>
     </div>
@@ -866,7 +875,7 @@
       <span class="lbl">propuestas aplicadas a una rama</span>
     </div>
   </div>
-  <p class="metrics-source">python3 scripts/report_sprint_metrics.py --since &lt;inicio del sprint&gt;</p>
+  <p class="metrics-source">Resumen generado a demanda, acotable a cualquier rango de fechas — por ejemplo, un sprint puntual</p>
 </section>
 
 <section id="evidencia">
