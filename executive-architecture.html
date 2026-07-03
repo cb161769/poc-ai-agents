@@ -1,5 +1,6 @@
 <title>Desarrollo Acelerado con Seguridad Integrada</title>
 <style>
+  @page{ size:13in 19in; margin:0.5in; }
   :root{
     --bg:#f7f4ec;
     --surface:#ffffff;
@@ -145,7 +146,7 @@
     border:1px solid var(--border);
     padding:1px 5px;
   }
-  @media (max-width:760px){ .exec-summary{grid-template-columns:1fr;} }
+  @media screen and (max-width:760px){ .exec-summary{grid-template-columns:1fr;} }
 
   h2{
     font-family:var(--serif);
@@ -246,7 +247,7 @@
     gap:36px;
     align-items:center;
   }
-  @media (max-width:760px){ .gate{grid-template-columns:1fr;} }
+  @media screen and (max-width:760px){ .gate{grid-template-columns:1fr;} }
   .gate-intro .eyebrow{ font-size:10.5px; }
   .gate-intro h3{
     font-family:var(--serif);
@@ -293,7 +294,7 @@
     background:var(--border);
     border:1px solid var(--border);
   }
-  @media (max-width:760px){ .risk-grid{grid-template-columns:1fr;} }
+  @media screen and (max-width:760px){ .risk-grid{grid-template-columns:1fr;} }
   .risk-card{
     background:var(--surface);
     padding:26px 24px;
@@ -330,7 +331,7 @@
     background:var(--border);
     border:1px solid var(--border);
   }
-  @media (max-width:760px){ .metrics-grid{grid-template-columns:repeat(2, 1fr);} }
+  @media screen and (max-width:760px){ .metrics-grid{grid-template-columns:repeat(2, 1fr);} }
   .metric-cell{
     background:var(--surface);
     padding:22px 20px;
@@ -488,7 +489,7 @@
   .sdlc-legend .lg-dot.out{ background:var(--surface); border:1px solid var(--border-strong); }
 
   /* ---------- SDLC mobile fallback: vertical timeline ---------- */
-  @media (max-width:840px){
+  @media screen and (max-width:840px){
     .sdlc-ring{ width:100%; height:auto; }
     .sdlc-track{ display:none; }
     .sdlc-center{ position:static; margin-bottom:24px; }
@@ -522,7 +523,7 @@
     background:var(--border);
     border:1px solid var(--border);
   }
-  @media (max-width:760px){ .compare{grid-template-columns:1fr;} }
+  @media screen and (max-width:760px){ .compare{grid-template-columns:1fr;} }
   .compare-lane{
     background:var(--surface);
     display:flex;
@@ -629,7 +630,7 @@
     </div>
     <div class="item">
       <div class="h">Qué hace de nuevo Copilot</div>
-      <div class="v">No solo explica: propone un cambio concreto y, si la persona lo confirma, lo deja aplicado en una rama de revisión — nunca directo en <code>main</code>.</div>
+      <div class="v">Con un repositorio real conectado, el trabajo se le asigna al Copilot coding agent, que lo resuelve de forma autónoma en la nube y abre un pull request — no una sugerencia puntual dentro del editor.</div>
     </div>
     <div class="item">
       <div class="h">Cómo se controla el riesgo</div>
@@ -798,8 +799,8 @@
       <div class="flow-node">
         <div class="flow-card" style="--node-color:#1f7a54">
           <div class="flow-role">acción final</div>
-          <div class="flow-title">Copilot propone y aplica</div>
-          <div class="flow-desc">Con el sprint completo como contexto, Copilot propone un cambio; si la persona lo confirma, queda en una rama lista para revisar, y el resultado se comenta en el propio ticket — no solo una respuesta en el chat.</div>
+          <div class="flow-title">Copilot resuelve</div>
+          <div class="flow-desc">Con el sprint completo como contexto, se le asigna la tarea al Copilot coding agent, que trabaja de forma autónoma y abre un pull request; el resultado queda comentado en el propio ticket.</div>
         </div>
       </div>
     </div>

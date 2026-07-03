@@ -86,6 +86,17 @@ else
   check "gh CLI instalado" "1" "(instala https://cli.github.com)"
 fi
 
+# --- GitHub Copilot coding agent (opcional, agente real en la nube) ---
+if [ -n "${GITHUB_REPO:-}" ]; then
+  if command -v gh >/dev/null 2>&1 && gh repo view "${GITHUB_REPO}" >/dev/null 2>&1; then
+    printf "  %s  %s\n" "${PASS}" "GITHUB_REPO accesible (${GITHUB_REPO}) — run_poc_loop.sh usara el coding agent real"
+  else
+    check "GITHUB_REPO accesible (${GITHUB_REPO})" "1" "(verifica el nombre owner/repo y que gh este autenticado con acceso)"
+  fi
+else
+  printf "  ⚠️  GITHUB_REPO no definido (opcional): sin el, run_poc_loop.sh usa el fallback local (gh copilot suggest), no un agente real\n"
+fi
+
 # --- sample-repo como repo git (para poder aplicar sugerencias, opcional) ---
 if [ -d "${ROOT_DIR}/sample-repo/.git" ]; then
   printf "  %s  %s\n" "${PASS}" "sample-repo/ es un repo git (Copilot puede aplicar cambios en una rama)"

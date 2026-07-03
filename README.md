@@ -67,8 +67,13 @@ Sin esto, `run_poc_loop.sh` solo imprime la sugerencia de Copilot pero no puede 
 
 El escenario (limpio o malicioso) lo decide el **contenido real** del ticket de Jira en `JIRA_TICKET_KEY`, no un flag.
 
-Si el firewall aprueba, la etapa 5/5 invoca `gh copilot suggest` de verdad sobre el prompt saneado. `gh copilot suggest` te pide **confirmación antes de ejecutar cualquier comando** — nunca se ejecuta nada a ciegas. Si aceptás y el comando modifica archivos, el script los commitea en una rama nueva `copilot/<ticket>-<timestamp>` dentro de `sample-repo/`, **nunca en `main`**. Revisá el diff con:
+**Importante — qué es y qué no es "el agente" acá:** las etapas 1-4 son orquestación determinística, no un agente. La etapa 5 tiene dos caminos:
+
+- **Con `GITHUB_REPO` configurado en `.env`** (recomendado si querés un agente de verdad): el script crea un Issue en tu repo real con todo el contexto ya armado y lo asigna al **GitHub Copilot coding agent**, que corre en la nube de GitHub con su propio razonamiento y abre un PR cuando termina. Requiere Copilot coding agent habilitado en el repo (plan Business/Enterprise) y `sample-repo/` empujado ahí (`git remote add origin ...` + `git push`). El agente en la nube **no** tiene acceso a tu Neo4j/Qdrant locales — por eso el impacto del grafo y los hallazgos de Sonar viajan como texto ya calculado dentro del Issue, no se consultan en vivo desde la nube.
+- **Sin `GITHUB_REPO`** (fallback): invoca `gh copilot suggest` sobre el prompt saneado. Pide **confirmación antes de ejecutar cualquier comando** — nunca se ejecuta nada a ciegas. Si aceptás y el comando modifica archivos, el script los commitea en una rama nueva `copilot/<ticket>-<timestamp>` dentro de `sample-repo/`, **nunca en `main`**. Esto es una sugerencia puntual, no un agente autónomo.
+
 ```bash
+# revisar el resultado del camino B (fallback local):
 git -C sample-repo diff main..copilot/<rama-que-te-haya-mostrado-el-script>
 ```
 

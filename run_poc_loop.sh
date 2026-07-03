@@ -162,9 +162,48 @@ if [ "${STATUS}" = "APPROVED" ]; then
   echo "${SANITIZED}"
   echo "-------------------------------------------------------------"
 
+  # --- Camino A: agente real. Si hay un repo real configurado, se crea un
+  # Issue con el contexto ya armado (ticket + impacto de grafo + hallazgos
+  # Sonar, todo pre-computado localmente) y se asigna al GitHub Copilot
+  # coding agent, que corre en la nube de GitHub con su propio loop de
+  # razonamiento y herramientas — no una sugerencia de un solo tiro.
+  if [ -n "${GITHUB_REPO:-}" ]; then
+    echo
+    echo "=================================================================="
+    echo " ETAPA 5/5 — Asignando el ticket a GitHub Copilot coding agent (${GITHUB_REPO})"
+    echo "=================================================================="
+
+    ISSUE_BODY=$(cat <<EOF
+${SANITIZED}
+
+---
+Generado automaticamente por poc-ai-agents desde el ticket Jira ${TICKET_ID}.
+EOF
+)
+
+    ISSUE_URL=$(gh issue create --repo "${GITHUB_REPO}" --title "${SUMMARY}" --body "${ISSUE_BODY}") \
+      || fail "no se pudo crear el issue en ${GITHUB_REPO}. Revisa que el repo exista y tengas permisos."
+
+    echo "Issue creado: ${ISSUE_URL}"
+
+    if gh issue edit "${ISSUE_URL}" --add-assignee "${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}" >/dev/null 2>&1; then
+      echo "Asignado a ${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}. El agente trabaja de forma asincronica en la nube y va a abrir un PR."
+      post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo y asigno ${ISSUE_URL} — el agente trabaja en la nube y va a abrir un PR."
+      log_contribution "APPROVED" "${REDACTIONS}" true true "issue:${ISSUE_URL}"
+    else
+      echo "No se pudo asignar a '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}'. Verifica que el coding agent este habilitado en ${GITHUB_REPO} y que el login del assignee sea correcto."
+      post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${ISSUE_URL} pero no se pudo asignar al coding agent — revisar configuracion del repo."
+      log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${ISSUE_URL}"
+    fi
+    exit 0
+  fi
+
+  # --- Camino B (fallback): sin repo real configurado, se pide una
+  # sugerencia de un solo tiro con gh copilot suggest y se aplica local.
+  # Esto NO es un agente autonomo, es una llamada puntual — ver PLAN.md.
   echo
   echo "=================================================================="
-  echo " ETAPA 5/5 — Copilot sugiere y aplica el cambio (rama de revision)"
+  echo " ETAPA 5/5 — gh copilot suggest (fallback local, sin GITHUB_REPO)"
   echo "=================================================================="
 
   APPLIED=false
@@ -175,7 +214,7 @@ if [ "${STATUS}" = "APPROVED" ]; then
     echo "  git -C sample-repo init && git -C sample-repo add -A && git -C sample-repo commit -m 'baseline'"
     echo "para poder aplicar sugerencias en una rama de revision. Por ahora, solo se pedira la sugerencia."
     gh copilot suggest -t shell "${SANITIZED}"
-    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot sugirio un cambio, pero sample-repo/ todavia no es un repo git — no se aplico nada a una rama."
+    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot sugirio un cambio, pero sample-repo/ todavia no es un repo git — no se aplico nada a una rama."
     log_contribution "APPROVED" "${REDACTIONS}" true false ""
     exit 0
   fi
@@ -193,12 +232,12 @@ if [ "${STATUS}" = "APPROVED" ]; then
     APPLIED=true
     echo "Cambio aplicado y commiteado en la rama '${BRANCH}' de sample-repo/ — NO en main."
     echo "Revisalo con: git -C sample-repo diff main..${BRANCH}"
-    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de sample-repo/, pendiente de revision humana antes de mergear."
+    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de sample-repo/, pendiente de revision humana antes de mergear."
   else
     git -C "${SCRIPT_DIR}/sample-repo" checkout - >/dev/null 2>&1
     git -C "${SCRIPT_DIR}/sample-repo" branch -D "${BRANCH}" >/dev/null 2>&1
     echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
-    post_jira_comment "🤖 Copilot (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
+    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
     BRANCH=""
   fi
 
