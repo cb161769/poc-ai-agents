@@ -97,6 +97,25 @@ else
   printf "  ⚠️  GITHUB_REPO no definido (opcional): sin el, run_poc_loop.sh usa el fallback local (gh copilot suggest), no un agente real\n"
 fi
 
+# --- Agente juez (opcional pero recomendado, con poder de bloqueo) ---
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  curl -sf -H "x-api-key: ${ANTHROPIC_API_KEY}" -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d '{"model":"'"${ANTHROPIC_MODEL:-claude-sonnet-5}"'","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' \
+    https://api.anthropic.com/v1/messages >/dev/null 2>&1
+  check "ANTHROPIC_API_KEY valida (agente juez, backend Anthropic)" "$?"
+elif curl -sf "${OLLAMA_URL:-http://localhost:11434}/api/tags" >/dev/null 2>&1; then
+  printf "  %s  %s\n" "${PASS}" "Ollama local alcanzable (agente juez, backend fallback) — verifica que '${OLLAMA_MODEL:-llama3.1}' este descargado: docker exec poc-ollama ollama pull ${OLLAMA_MODEL:-llama3.1}"
+else
+  printf "  ⚠️  Ni ANTHROPIC_API_KEY ni Ollama local disponibles: el agente juez se omite, ninguna corrida tendra segunda opinion\n"
+fi
+
+if command -v uvx >/dev/null 2>&1; then
+  printf "  %s  %s\n" "${PASS}" "uvx disponible — el juez (si corre) podra conectarse a mcp-neo4j-cypher / mcp-server-qdrant"
+else
+  printf "  ⚠️  uvx no encontrado: el juez (si corre) va a razonar sin herramientas MCP, solo sobre texto (instala uv: https://docs.astral.sh/uv)\n"
+fi
+
 # --- sample-repo como repo git (para poder aplicar sugerencias, opcional) ---
 if [ -d "${ROOT_DIR}/sample-repo/.git" ]; then
   printf "  %s  %s\n" "${PASS}" "sample-repo/ es un repo git (Copilot puede aplicar cambios en una rama)"

@@ -112,6 +112,50 @@ services:
     networks:
       - poc-net
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: poc-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks:
+      - poc-net
+
+  falco:
+    image: falcosecurity/falco:latest
+    container_name: poc-falco
+    privileged: true
+    pid: host
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock
+      - /proc:/host/proc:ro
+      - /etc:/host/etc:ro
+      - /boot:/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - ./falco/custom_rules.yaml:/etc/falco/rules.d/custom_rules.yaml:ro
+      - ./logs:/var/log/falco
+    command:
+      - /usr/bin/falco
+      - --modern-bpf
+      - -o
+      - json_output=true
+      - -o
+      - file_output.enabled=true
+      - -o
+      - file_output.filename=/var/log/falco/falco_alerts.jsonl
+      - -o
+      - file_output.keep_alive=true
+    networks:
+      - poc-net
+
   ai-firewall:
     build:
       context: .
@@ -148,3 +192,4 @@ volumes:
   sonarqube_extensions:
   sonarqube_logs:
   sonar_bootstrap_state:
+  ollama_models:

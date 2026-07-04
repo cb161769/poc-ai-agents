@@ -1,0 +1,54 @@
+# Reglas propias, encima de las reglas por defecto de Falco (que ya cubren
+# lectura de /etc/shadow, escalada de privilegios, etc). Estas apuntan
+# específicamente a los contenedores de esta PoC: el firewall, el testing
+# agent y cualquier proceso que corra código traído por un agente.
+
+- rule: Shell abierto dentro de un contenedor de la PoC
+  desc: >
+    Un shell interactivo (bash/sh/zsh) corriendo dentro de alguno de
+    nuestros contenedores (poc-*) casi nunca es legítimo en runtime — el
+    firewall, el testing agent y el rag-indexer no deberían necesitarlo.
+  condition: >
+    spawned_process and container and
+    container.name startswith "poc-" and
+    proc.name in (bash, sh, zsh, ash)
+  output: >
+    Shell abierto en contenedor de la PoC (container=%container.name
+    comando=%proc.cmdline usuario=%user.name padre=%proc.pname)
+  priority: WARNING
+  tags: [poc, shell, agents]
+
+- rule: Escritura fuera de las rutas esperadas en el ai-firewall
+  desc: >
+    ai-firewall solo debería escribir en /app/logs y /app/cache. Cualquier
+    otra escritura es sospechosa — podría ser un intento de fuga de datos
+    o de persistir algo fuera del alcance documentado.
+  condition: >
+    open_write and container and
+    container.name = "poc-ai-firewall" and
+    not fd.name startswith "/app/logs" and
+    not fd.name startswith "/app/cache"
+  output: >
+    Escritura inesperada en ai-firewall (archivo=%fd.name
+    comando=%proc.cmdline)
+  priority: WARNING
+  tags: [poc, ai-firewall, exfiltration]
+
+- rule: Conexion saliente inesperada desde el testing agent
+  desc: >
+    Los contenedores efimeros de test (maven/node/python levantados por
+    run_module_tests.sh) no deberian necesitar salir a internet salvo para
+    instalar dependencias — una conexion a un destino no esperado durante
+    la corrida de tests es una señal de que el codigo del agente hizo algo
+    fuera del alcance del ticket.
+  condition: >
+    outbound and container and
+    (container.image.repository contains "maven" or
+     container.image.repository contains "node" or
+     container.image.repository contains "python" or
+     container.image.repository contains "playwright")
+  output: >
+    Conexion saliente desde contenedor de testing (container=%container.name
+    destino=%fd.rip:%fd.rport comando=%proc.cmdline)
+  priority: NOTICE
+  tags: [poc, testing-agent, network]

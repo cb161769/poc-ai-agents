@@ -4,8 +4,15 @@
   "private": true,
   "description": "Minimal TS client that depends on AuthService — used only to give SonarQube a real polyglot module to scan.",
   "main": "src/authClient.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
   "dependencies": {},
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@playwright/test": "^1.44.1",
+    "serve": "^14.2.3"
   }
 }
