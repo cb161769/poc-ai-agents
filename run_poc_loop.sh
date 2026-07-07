@@ -308,6 +308,33 @@ echo "(servido desde cache: ${SONAR_CACHE_HIT})"
 
 echo
 echo "=================================================================="
+echo " ETAPA 3.5/5 — Specs reales de Figma (si el ticket trae un link)"
+echo "=================================================================="
+FIGMA_LINK=$(echo "${JIRA_JSON}" | jq -c '.figma_link // empty')
+FIGMA_SPECS_TEXT=""
+if [ -n "${FIGMA_LINK}" ]; then
+  if [ -z "${FIGMA_API_TOKEN:-}" ]; then
+    echo "El ticket trae un link de Figma pero falta FIGMA_API_TOKEN — se omite esa seccion del prompt."
+  else
+    FIGMA_FILE_KEY=$(echo "${FIGMA_LINK}" | jq -r '.file_key')
+    FIGMA_NODE_ID=$(echo "${FIGMA_LINK}" | jq -r '.node_id')
+    if FIGMA_JSON=$(python3 "${SCRIPT_DIR}/figma_client.py" "${FIGMA_FILE_KEY}" "${FIGMA_NODE_ID}" 2>/dev/null); then
+      if [ "$(echo "${FIGMA_JSON}" | jq -r '.found')" = "true" ]; then
+        FIGMA_SPECS_TEXT=$(echo "${FIGMA_JSON}" | jq '.summary')
+        echo "Specs de Figma obtenidas para el nodo ${FIGMA_NODE_ID} del archivo ${FIGMA_FILE_KEY}."
+      else
+        echo "El nodo ${FIGMA_NODE_ID} no se encontro en el archivo ${FIGMA_FILE_KEY} de Figma — se omite esa seccion del prompt."
+      fi
+    else
+      echo "No se pudo consultar Figma (revisa FIGMA_API_TOKEN o conectividad) — se omite esa seccion del prompt."
+    fi
+  fi
+else
+  echo "El ticket no trae un link de Figma — se omite esta etapa."
+fi
+
+echo
+echo "=================================================================="
 echo " ETAPA 4/5 — Composicion del prompt y envio al AI Firewall"
 echo "=================================================================="
 PROMPT=$(cat <<EOF
@@ -321,6 +348,11 @@ ${GRAPH_RESULT}
 ${SONAR_ISSUES}
 EOF
 )
+if [ -n "${FIGMA_SPECS_TEXT}" ]; then
+  PROMPT="${PROMPT}
+--- Specs reales de Figma ---
+${FIGMA_SPECS_TEXT}"
+fi
 
 JIRA_CONTEXT=$(echo "${JIRA_JSON}" | jq '{ticket_id, summary, description, repository_origen}')
 SONAR_ERRORS_ARRAY=$(echo "${SONAR_JSON}" | jq '[.issues[].message]')

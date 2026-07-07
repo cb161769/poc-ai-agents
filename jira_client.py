@@ -17,6 +17,7 @@ generalizes to real backends without editing this file.
 import base64
 import json
 import os
+import re
 import sys
 
 import httpx
@@ -73,6 +74,32 @@ def _adf_has_code_block(node) -> bool:
     if isinstance(node, list):
         return any(_adf_has_code_block(child) for child in node)
     return False
+
+
+_FIGMA_URL_RE = re.compile(r"https?://(?:www\.)?figma\.com/(?:file|design)/([A-Za-z0-9]+)/\S*")
+_FIGMA_NODE_ID_RE = re.compile(r"node-id=([0-9]+-[0-9]+)")
+
+
+def _extract_figma_link(description: str) -> dict | None:
+    """Pulls a Figma file+node reference out of the ticket description, so
+    the automated pipeline (figma_client.py) can pull real specs without a
+    human manually pointing Copilot Chat at a frame first. Requires both a
+    file key AND a node-id in the URL -- a link to the whole file with no
+    specific frame selected isn't actionable for figma_client.py.
+    """
+    if not description:
+        return None
+    url_match = _FIGMA_URL_RE.search(description)
+    if not url_match:
+        return None
+    node_match = _FIGMA_NODE_ID_RE.search(url_match.group(0))
+    if not node_match:
+        return None
+    return {
+        "file_key": url_match.group(1),
+        "node_id": node_match.group(1).replace("-", ":", 1),
+        "url": url_match.group(0),
+    }
 
 
 def _fetch_rovo_attachment_context(jira_url: str, headers: dict, ticket_key: str, attachments: list) -> dict:
@@ -142,15 +169,17 @@ def fetch_ticket_live() -> dict:
     labels = fields.get("labels", []) or []
     repository_origen = next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
     attachment_info = _fetch_rovo_attachment_context(jira_url, headers, ticket_key, fields.get("attachment", []) or [])
+    description_text = _adf_to_text(fields.get("description")).strip()
 
     return {
         "ticket_id": issue.get("key"),
         "summary": fields.get("summary", ""),
-        "description": _adf_to_text(fields.get("description")).strip(),
+        "description": description_text,
         "labels": labels,
         "repository_origen": repository_origen,
         "status": (fields.get("status") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
+        "figma_link": _extract_figma_link(description_text),
         **attachment_info,
     }
 

@@ -130,6 +130,32 @@ def query_sonar(component: str) -> dict:
     return json.loads(_run(["python3", "sonar_client.py", component]))
 
 
+@task(retries=1, retry_delay_seconds=5, name="query-figma")
+def query_figma(figma_link: dict | None) -> dict | None:
+    """Optional: only runs if the ticket's description carried a Figma link
+    (jira_client.py._extract_figma_link) and FIGMA_API_TOKEN is configured.
+    Best-effort like the judge/Falco correlation -- a Figma hiccup never
+    blocks the pipeline, it just means the prompt goes out without that
+    section, same as a ticket with no Figma link at all.
+    """
+    if not figma_link:
+        return None
+    if not os.environ.get("FIGMA_API_TOKEN"):
+        print("El ticket trae un link de Figma pero falta FIGMA_API_TOKEN — se omite esa seccion del prompt.")
+        return None
+
+    result = subprocess.run(
+        ["python3", str(SCRIPT_DIR / "figma_client.py"), figma_link["file_key"], figma_link["node_id"]],
+        capture_output=True,
+        text=True,
+        cwd=SCRIPT_DIR,
+    )
+    if result.returncode != 0:
+        print(f"No se pudo consultar Figma para este ticket, se omite esa seccion del prompt: {result.stderr.strip()}")
+        return None
+    return json.loads(result.stdout)
+
+
 @task(retries=1, name="evaluate-firewall")
 def evaluate_firewall(prompt: str, jira_context: dict, sonar_errors: list) -> dict:
     headers = {"X-Firewall-Key": FIREWALL_API_KEY} if FIREWALL_API_KEY else {}
@@ -290,6 +316,7 @@ def run_pipeline():
     sonar_issues_text = "\n".join(
         f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in sonar_result["issues"]
     )
+    figma_result = query_figma(ticket.get("figma_link"))
 
     prompt = (
         f"{ticket['summary']}\n{ticket['description']}\n"
@@ -297,6 +324,8 @@ def run_pipeline():
         f"--- Grafo de impacto ---\n{graph_result}\n"
         f"--- Hallazgos Sonar (reales) ---\n{sonar_issues_text}"
     )
+    if figma_result and figma_result.get("found"):
+        prompt += f"\n--- Specs reales de Figma ---\n{json.dumps(figma_result['summary'], ensure_ascii=False, indent=2)}"
     jira_context = {
         "ticket_id": ticket["ticket_id"],
         "summary": ticket["summary"],

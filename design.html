@@ -654,11 +654,20 @@
         </div>
       </div>
       <div class="connector"></div>
+      <div class="stage" style="--stage-color:#a06cd5">
+        <div class="stage-num">03b</div>
+        <div class="stage-card">
+          <div class="stage-title">Specs de Figma (opcional)</div>
+          <div class="stage-desc">Solo si el ticket trae un link real de Figma: figma_client.py consulta la REST API real (FIGMA_API_TOKEN) del nodo indicado, sin necesitar Figma Desktop abierto. Sin link o sin token, se omite.</div>
+          <div class="stage-io"><b>GET</b> api.figma.com/v1/files/:key/nodes</div>
+        </div>
+      </div>
+      <div class="connector"></div>
       <div class="stage" style="--stage-color:#f0555a">
         <div class="stage-num">04</div>
         <div class="stage-card">
           <div class="stage-title">AI Firewall</div>
-          <div class="stage-desc">Prompt compuesto (jira+grafo+sonar) evaluado; ingress + egress deciden APPROVED/REJECTED. Auth opcional: header X-Firewall-Key (FIREWALL_API_KEY), 401 sin él.</div>
+          <div class="stage-desc">Prompt compuesto (jira+grafo+sonar+figma) evaluado; ingress + egress deciden APPROVED/REJECTED. Auth opcional: header X-Firewall-Key (FIREWALL_API_KEY), 401 sin él.</div>
           <div class="stage-io"><b>POST</b> :8080/evaluate</div>
         </div>
       </div>
@@ -824,7 +833,8 @@
         <li><span class="n">＋</span><span class="t"><b>Testing agent determinístico</b> — mvn/npm/pytest reales en contenedor descartable sobre el repo real detectado, gate duro antes del juez (sample-repo/ trae JUnit, Vitest y pytest como ejemplo de referencia).</span></li>
         <li><span class="n">＋</span><span class="t"><b>Testing de UI real</b> — Playwright renderiza una pantalla de login real (public/index.html) en un navegador headless, no solo mockea la lógica en memoria como los tests unitarios.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Monitoreo a nivel de sistema (Falco)</b> — eBPF en tiempo real sobre los contenedores poc-*, complementario al firewall/juez semántico. Requiere privileged: true; en Windows/Docker Desktop depende del soporte de eBPF de la VM WSL2. scripts/check_falco_alerts.py correlaciona las alertas con la ventana de cada corrida (comentario en Jira + webhook opcional), en vez de dejarlas solo en el archivo.</span></li>
-        <li><span class="n">＋</span><span class="t"><b>Figma MCP real</b> — Copilot trae medidas/colores/tokens del archivo abierto en Figma Desktop al construir UI, en vez de inventar valores.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Figma MCP real (interactiva)</b> — Copilot trae medidas/colores/tokens del archivo abierto en Figma Desktop al construir UI, en vez de inventar valores. Un humano decide qué frame.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Figma REST API real (automatizada)</b> — figma_client.py: si el ticket trae un link de Figma y hay FIGMA_API_TOKEN, el pipeline suma specs reales del nodo indicado al prompt compuesto, sin necesitar Figma Desktop abierto ni intervención humana.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Evals de precisión</b> — matriz de confusión del juez contra casos etiquetados a mano (evals/run_judge_evals.py); precisión-proxy del coding agent = % de cambios aplicados que pasan el test suite real.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Orquestación real (Prefect)</b> — orchestration.py reemplaza el bash lineal por un flujo con reintentos por paso, estado persistido y UI en :4200, sobre los mismos building blocks.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Testing agent multi-stack</b> — auto-detección por archivo de proyecto en vez de una lista fija de componentes; agregar un backend en .NET/NestJS/Angular/Ionic/Expo/React Native/Go/Ruby/Rust no requiere tocar el script.</span></li>
