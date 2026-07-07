@@ -6,4 +6,5 @@ node_modules/
 *.class
 __pycache__/
 .venv/
+scripts/component_dirs.env
 PLAN.md

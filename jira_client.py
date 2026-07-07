@@ -6,9 +6,13 @@ a single JSON object on stdout so the bash orchestrator can consume it with
 `jq`.
 
 repository_origen is resolved from the ticket's labels: the first label that
-matches a known node name in the dependency graph (AuthService, Frontend,
-DataWorker) is used. This lets a real Jira ticket drive the graph impact
-query without inventing a custom field.
+matches a known node name in the dependency graph is used. This lets a real
+Jira ticket drive the graph impact query without inventing a custom field.
+
+Known components are NOT hardcoded to the three sample-repo/ modules — set
+JIRA_KNOWN_COMPONENTS in .env as a comma-separated list matching your real
+service names (however many languages/frameworks they're in) so this
+generalizes to real backends without editing this file.
 """
 import base64
 import json
@@ -22,7 +26,12 @@ from cache_utils import cached_call
 
 load_dotenv()
 
-KNOWN_REPOS = {"AuthService", "Frontend", "DataWorker"}
+_DEFAULT_KNOWN_REPOS = "AuthService,Frontend,DataWorker"
+KNOWN_REPOS = {
+    name.strip()
+    for name in os.environ.get("JIRA_KNOWN_COMPONENTS", _DEFAULT_KNOWN_REPOS).split(",")
+    if name.strip()
+}
 
 # How Rovo identifies itself as a comment author in your instance — adjust
 # if your org's Rovo integration shows up under a different display name.

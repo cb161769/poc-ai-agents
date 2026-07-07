@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # End-to-end orchestrator: real Jira ticket -> real Neo4j graph impact ->
 # real SonarQube findings -> AI Firewall -> real gh copilot suggest, applied
-# on a review branch. The scenario (clean vs. malicious) is decided by the
-# real content of the Jira ticket in JIRA_TICKET_KEY, not by a flag: edit
-# the ticket in Jira to break the flow, then re-run this script.
+# on a review branch OF YOUR REAL REPO. The scenario (clean vs. malicious)
+# is decided by the real content of the Jira ticket in JIRA_TICKET_KEY, not
+# by a flag: edit the ticket in Jira to break the flow, then re-run this
+# script.
+#
+# IMPORTANT: this operates on whatever git repo you are standing in when you
+# invoke it (cd to your real project first) — it does NOT use sample-repo/
+# by default. sample-repo/ stays in this project only as a reference of what
+# project file each stack needs for scripts/run_module_tests.sh to
+# auto-detect it.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,11 +33,24 @@ fail() {
   exit 1
 }
 
+# Detects the real repo you're standing in (the cwd you ran this script
+# from, not SCRIPT_DIR where the tool itself lives) and refuses to continue
+# if it's dirty — the pipeline is about to create a branch and commit to it,
+# and we don't want to sweep up your in-progress work into Copilot's branch.
+TARGET_REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || fail "No estas parado dentro de un repositorio git. cd a tu proyecto real (el que corresponde al ticket) antes de correr run_poc_loop.sh — ya no se usa sample-repo/ por defecto."
+
+if [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
+  fail "El repo en ${TARGET_REPO_DIR} tiene cambios sin commitear. Hace commit o 'git stash' antes de correr esto — el pipeline va a crear una rama nueva y no queremos mezclar tu trabajo en progreso con lo que haga Copilot."
+fi
+
+echo "Repo objetivo detectado: ${TARGET_REPO_DIR}"
+
 # Appends one line to logs/copilot_contribution.jsonl so
 # scripts/report_sprint_metrics.py can measure how much Copilot actually
 # collaborated on this sprint (not just whether the firewall let it through).
 log_contribution() {
-  local status="$1" redactions="$2" suggested="$3" applied="$4" branch="$5"
+  local status="$1" redactions="$2" suggested="$3" applied="$4" branch="$5" tests_passed="${6:-null}"
   mkdir -p "${SCRIPT_DIR}/logs"
   jq -n \
     --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -41,7 +61,8 @@ log_contribution() {
     --argjson copilot_suggested "${suggested}" \
     --argjson copilot_applied "${applied}" \
     --arg branch "${branch}" \
-    '{ts:$ts, ticket_id:$ticket_id, component:$component, firewall_status:$firewall_status, redactions_applied:$redactions_applied, copilot_suggested:$copilot_suggested, copilot_applied:$copilot_applied, branch:$branch}' \
+    --argjson tests_passed "${tests_passed}" \
+    '{ts:$ts, ticket_id:$ticket_id, component:$component, firewall_status:$firewall_status, redactions_applied:$redactions_applied, copilot_suggested:$copilot_suggested, copilot_applied:$copilot_applied, branch:$branch, tests_passed:$tests_passed}' \
     >> "${CONTRIBUTION_LOG}"
 }
 
@@ -78,11 +99,6 @@ run_judge() {
   echo " ETAPA 7 — Agente juez (segunda opinion independiente, con poder de bloqueo)"
   echo "=================================================================="
 
-  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "ANTHROPIC_API_KEY no definido en .env — se omite el juez para esta corrida."
-    return
-  fi
-
   local judge_payload verdict_json verdict reasoning
   judge_payload=$(jq -n \
     --argjson ticket "${JIRA_CONTEXT}" \
@@ -95,7 +111,7 @@ run_judge() {
     '{ticket: $ticket, firewall: {status: $status, reason: $reason, redactions_applied: $redactions}, change_source: $change_source, change_description: $change_description, test_summary: $test_summary}')
 
   if ! verdict_json=$(echo "${judge_payload}" | python3 "${SCRIPT_DIR}/judge_agent.py" 2>/dev/null); then
-    echo "El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY / conectividad). Continua sin veredicto."
+    echo "El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad). Continua sin veredicto."
     return
   fi
 
@@ -105,7 +121,15 @@ run_judge() {
   echo "Veredicto del juez: ${verdict}"
   echo "Razonamiento: ${reasoning}"
 
-  if [ "${verdict}" = "FLAGGED" ]; then
+  if [ "${verdict}" = "FLAGGED" ] && [ "${change_source}" = "firewall_rejected" ]; then
+    # El juez audita un rechazo, nunca lo revierte: el firewall sigue siendo
+    # la ultima palabra en seguridad. Esto es solo una alerta de posible
+    # falso positivo para revision humana, no un desbloqueo.
+    echo
+    echo "⚠️  EL JUEZ SOSPECHA QUE EL RECHAZO DEL FIREWALL FUE UN FALSO POSITIVO"
+    post_jira_comment "🧑‍⚖️ Agente juez (automatizado): el rechazo del firewall podria ser incorrecto — ${reasoning} La solicitud SIGUE RECHAZADA (el juez no puede revertir al firewall); revision humana recomendada."
+
+  elif [ "${verdict}" = "FLAGGED" ]; then
     echo
     echo "🚫 EL JUEZ MARCO ESTA CORRIDA COMO PROBLEMATICA — ${location_label}"
 
@@ -115,7 +139,7 @@ run_judge() {
       || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
 
     if [ -n "${branch}" ]; then
-      git -C "${SCRIPT_DIR}/sample-repo" commit --allow-empty -m "BLOCKED BY JUDGE: ${reasoning}" >/dev/null 2>&1
+      git -C "${TARGET_REPO_DIR}" commit --allow-empty -m "BLOCKED BY JUDGE: ${reasoning}" >/dev/null 2>&1
       echo "Rama '${branch}' marcada como bloqueada en su propio historial de git — no la mergees sin revision."
     fi
 
@@ -124,6 +148,8 @@ run_judge() {
       gh issue comment "${issue_url}" --body "🧑‍⚖️ Agente juez: FLAGGED. ${reasoning}. Se retiro la asignacion al coding agent hasta revision humana." >/dev/null 2>&1 || true
       echo "Se intento retirar la asignacion del coding agent en ${issue_url} (mejor esfuerzo)."
     fi
+  elif [ "${change_source}" = "firewall_rejected" ]; then
+    post_jira_comment "🧑‍⚖️ Agente juez (automatizado): OK, el rechazo del firewall fue correcto. ${reasoning}"
   else
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): OK. ${reasoning}"
   fi
@@ -150,7 +176,7 @@ run_tests_gate() {
     return 0
   fi
 
-  if TEST_OUTPUT=$("${SCRIPT_DIR}/scripts/run_module_tests.sh" "${component}" 2>&1); then
+  if TEST_OUTPUT=$("${SCRIPT_DIR}/scripts/run_module_tests.sh" "${TARGET_REPO_DIR}" 2>&1); then
     TEST_PASSED=true
     echo "${TEST_OUTPUT}"
     return 0
@@ -167,7 +193,7 @@ run_tests_gate() {
     || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
 
   if [ -n "${branch}" ]; then
-    git -C "${SCRIPT_DIR}/sample-repo" commit --allow-empty -m "BLOCKED BY TESTS: el test suite real fallo" >/dev/null 2>&1
+    git -C "${TARGET_REPO_DIR}" commit --allow-empty -m "BLOCKED BY TESTS: el test suite real fallo" >/dev/null 2>&1
     echo "Rama '${branch}' marcada como bloqueada en su propio historial de git — no la mergees sin revision."
   fi
 
@@ -294,6 +320,7 @@ if [ "${STATUS}" = "REJECTED" ]; then
   echo "gh copilot NO fue invocado."
   post_jira_comment "🛡️ AI Firewall (automatizado): solicitud RECHAZADA. Motivo: ${REASON}. gh copilot no fue invocado."
   log_contribution "REJECTED" 0 false false ""
+  run_judge "firewall_rejected" "${REASON}" "solicitud rechazada por el firewall"
   exit 1
 fi
 
@@ -364,43 +391,35 @@ EOF
   APPLIED=false
   BRANCH=""
 
-  if [ ! -d "${SCRIPT_DIR}/sample-repo/.git" ]; then
-    echo "sample-repo/ no es un repositorio git todavia. Corre:"
-    echo "  git -C sample-repo init && git -C sample-repo add -A && git -C sample-repo commit -m 'baseline'"
-    echo "para poder aplicar sugerencias en una rama de revision. Por ahora, solo se pedira la sugerencia."
-    gh copilot suggest -t shell "${SANITIZED}"
-    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot sugirio un cambio, pero sample-repo/ todavia no es un repo git — no se aplico nada a una rama."
-    log_contribution "APPROVED" "${REDACTIONS}" true false ""
-    run_judge "issue_only" "${SANITIZED}" "sugerencia sin aplicar (sample-repo/ no es repo git)"
-    exit 0
-  fi
-
+  BASE_BRANCH=$(git -C "${TARGET_REPO_DIR}" rev-parse --abbrev-ref HEAD)
   BRANCH="copilot/${TICKET_ID}-$(date +%s)"
-  git -C "${SCRIPT_DIR}/sample-repo" checkout -b "${BRANCH}" >/dev/null
+  git -C "${TARGET_REPO_DIR}" checkout -b "${BRANCH}" >/dev/null
 
-  echo "Copilot va a sugerir un comando para resolver ${TICKET_ID}. Se te pedira confirmar antes de ejecutar nada."
+  echo "Copilot va a sugerir un comando para resolver ${TICKET_ID} en ${TARGET_REPO_DIR}. Se te pedira confirmar antes de ejecutar nada."
   gh copilot suggest -t shell "${SANITIZED}"
   SUGGEST_EXIT=$?
 
-  if [ "${SUGGEST_EXIT}" -eq 0 ] && [ -n "$(git -C "${SCRIPT_DIR}/sample-repo" status --porcelain)" ]; then
-    git -C "${SCRIPT_DIR}/sample-repo" add -A
-    git -C "${SCRIPT_DIR}/sample-repo" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null
+  if [ "${SUGGEST_EXIT}" -eq 0 ] && [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
+    git -C "${TARGET_REPO_DIR}" add -A
+    git -C "${TARGET_REPO_DIR}" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null
     APPLIED=true
-    echo "Cambio aplicado y commiteado en la rama '${BRANCH}' de sample-repo/ — NO en main."
-    echo "Revisalo con: git -C sample-repo diff main..${BRANCH}"
-    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de sample-repo/, pendiente de revision humana antes de mergear."
-    DIFF_TEXT=$(git -C "${SCRIPT_DIR}/sample-repo" diff main.."${BRANCH}")
-    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}"
-    if run_tests_gate "${REPO_ORIGEN}" "${BRANCH}"; then
-      run_judge "local_diff" "${DIFF_TEXT}" "rama '${BRANCH}' de sample-repo/" "${BRANCH}" "" "${TEST_OUTPUT}"
+    echo "Cambio aplicado y commiteado en la rama '${BRANCH}' de ${TARGET_REPO_DIR} — NO en '${BASE_BRANCH}'."
+    echo "Revisalo con: git -C \"${TARGET_REPO_DIR}\" diff ${BASE_BRANCH}..${BRANCH}"
+    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de tu repo, pendiente de revision humana antes de mergear."
+    DIFF_TEXT=$(git -C "${TARGET_REPO_DIR}" diff "${BASE_BRANCH}..${BRANCH}")
+    run_tests_gate "${REPO_ORIGEN}" "${BRANCH}"
+    TESTS_GATE_RESULT=$?
+    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}" "${TEST_PASSED}"
+    if [ "${TESTS_GATE_RESULT}" -eq 0 ]; then
+      run_judge "local_diff" "${DIFF_TEXT}" "rama '${BRANCH}' de ${TARGET_REPO_DIR}" "${BRANCH}" "" "${TEST_OUTPUT}"
     fi
   else
-    git -C "${SCRIPT_DIR}/sample-repo" checkout - >/dev/null 2>&1
-    git -C "${SCRIPT_DIR}/sample-repo" branch -D "${BRANCH}" >/dev/null 2>&1
+    git -C "${TARGET_REPO_DIR}" checkout "${BASE_BRANCH}" >/dev/null 2>&1
+    git -C "${TARGET_REPO_DIR}" branch -D "${BRANCH}" >/dev/null 2>&1
     echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
     post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
     BRANCH=""
-    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}"
+    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}" "null"
     run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"
   fi
   exit 0

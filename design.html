@@ -520,8 +520,8 @@
     <code>logs/firewall_audit.jsonl</code>.
   </p>
   <div class="stat-row">
-    <div class="stat"><span class="num">9</span><span class="lbl">servicios Docker</span></div>
-    <div class="stat"><span class="num">4</span><span class="lbl">servidores MCP</span></div>
+    <div class="stat"><span class="num">10</span><span class="lbl">servicios Docker</span></div>
+    <div class="stat"><span class="num">5</span><span class="lbl">servidores MCP</span></div>
     <div class="stat"><span class="num">3</span><span class="lbl">sistemas con credenciales reales</span></div>
     <div class="stat"><span class="num">0</span><span class="lbl">datos simulados</span></div>
   </div>
@@ -576,6 +576,11 @@
       <div class="svc-desc">Monitoreo en tiempo real (eBPF) de los demás contenedores: shells inesperados, escrituras fuera de ruta, red rara. Semántico no — a nivel de sistema operativo.</div>
       <span class="svc-tag">falco/custom_rules.yaml</span>
     </div>
+    <div class="svc-card" style="--svc-color:#5b8cff">
+      <div class="svc-head"><span class="svc-name">prefect-server</span><span class="svc-port">:4200</span></div>
+      <div class="svc-desc">UI + API de Prefect. orchestration.py (host) le reporta cada corrida — reintentos por paso, estado persistido, grafo visual en vez de texto de terminal.</div>
+      <span class="svc-tag">orchestration.py</span>
+    </div>
   </div>
 </section>
 
@@ -600,6 +605,10 @@
         <span class="name">Histórico Jira + Sonar resuelto</span>
         <span class="desc">Tickets pasados y vulnerabilidades ya remediadas, vía API real.</span>
       </div>
+      <div class="mcp-source">
+        <span class="name">Figma (real, local)</span>
+        <span class="desc">Medidas/colores/tokens del archivo abierto en Figma Desktop, para construir UI fiel al diseño.</span>
+      </div>
     </div>
     <div class="mcp-hub">⇉</div>
     <div class="mcp-servers">
@@ -607,9 +616,10 @@
       <div class="mcp-server" style="--mcp-color:#2d8fd6"><span class="dot"></span><span class="label">atlassian (mcp.atlassian.com)</span><span class="sub">búsqueda Jira · OAuth</span></div>
       <div class="mcp-server" style="--mcp-color:#5b8cff"><span class="dot"></span><span class="label">mcp-neo4j-cypher</span><span class="sub">read / write cypher</span></div>
       <div class="mcp-server" style="--mcp-color:#3fb96a"><span class="dot"></span><span class="label">mcp-server-qdrant</span><span class="sub">qdrant-find / qdrant-store</span></div>
+      <div class="mcp-server" style="--mcp-color:#e0a63c"><span class="dot"></span><span class="label">figma-dev-mode (local)</span><span class="sub">127.0.0.1:3845/sse</span></div>
     </div>
   </div>
-  <p class="h2-sub" style="margin-top:14px; margin-bottom:0;">jira_client.py sigue siendo el que alimenta run_poc_loop.sh (llamada REST determinística) — el MCP atlassian es para exploración interactiva de Copilot Chat, no reemplaza al cliente del pipeline.</p>
+  <p class="h2-sub" style="margin-top:14px; margin-bottom:0;">jira_client.py sigue siendo el que alimenta run_poc_loop.sh (llamada REST determinística) — el MCP atlassian es para exploración interactiva de Copilot Chat, no reemplaza al cliente del pipeline. figma-dev-mode corre local desde Figma Desktop, sin token.</p>
 </section>
 
 <section id="pipeline">
@@ -666,7 +676,7 @@
         <div class="stage-num">05b</div>
         <div class="stage-card">
           <div class="stage-title">Fallback: gh copilot suggest</div>
-          <div class="stage-desc">Sin GITHUB_REPO: sugerencia de un solo tiro, no un agente. Confirmación humana antes de ejecutar; si aplica, commitea en una rama de sample-repo/, nunca en main.</div>
+          <div class="stage-desc">Sin GITHUB_REPO: sugerencia de un solo tiro, no un agente. Confirmación humana antes de ejecutar; si aplica, commitea en una rama nueva del repo real detectado (donde el usuario está parado), nunca en la rama base original.</div>
           <div class="stage-io"><b>out</b> copilot_contribution.jsonl · <b>POST</b> /issue/:key/comment</div>
         </div>
       </div>
@@ -675,8 +685,8 @@
         <div class="stage-num">06</div>
         <div class="stage-card">
           <div class="stage-title">Testing agent (gate real)</div>
-          <div class="stage-desc">Solo camino 05b con diff aplicado: corre el test suite real del módulo en un contenedor descartable. Determinístico, no un LLM. Frontend corre Vitest (lógica) + Playwright (UI real: renderiza public/index.html en navegador headless). Si falla: bloquea ahí mismo, el juez ni se llama.</div>
-          <div class="stage-io"><b>run</b> run_module_tests.sh</div>
+          <div class="stage-desc">Solo camino 05b con diff aplicado: auto-detecta el stack por archivo de proyecto (pom.xml/*.csproj/go.mod/Gemfile/Cargo.toml/package.json) y corre el test suite real en contenedor descartable — cubre .NET, NestJS, Angular, Ionic, Expo, React Native, Go, Ruby, Rust, Java, Python sin tocar el script. Determinístico, no un LLM. Si falla: bloquea ahí mismo, el juez ni se llama.</div>
+          <div class="stage-io"><b>run</b> run_module_tests.sh (auto-detección)</div>
         </div>
       </div>
       <div class="connector"></div>
@@ -684,7 +694,7 @@
         <div class="stage-num">07</div>
         <div class="stage-card">
           <div class="stage-title">Agente juez (Claude + MCP real)</div>
-          <div class="stage-desc">Corre en tu máquina (a diferencia del coding agent en la nube), así que se conecta de verdad a mcp-neo4j-cypher y mcp-server-qdrant para VERIFICAR el impacto y el histórico, no solo confiar en el texto. Ve tambien el resultado del testing agent. Si FLAGGED: comenta fuerte, transiciona el ticket a bloqueado, marca la rama con un commit BLOCKED BY JUDGE, y retira la asignación del coding agent si corresponde.</div>
+          <div class="stage-desc">Corre en tu máquina (a diferencia del coding agent en la nube), así que se conecta de verdad a mcp-neo4j-cypher y mcp-server-qdrant para VERIFICAR el impacto y el histórico, no solo confiar en el texto. Ve tambien el resultado del testing agent. Audita tanto APPROVED como REJECTED, pero su poder es asimétrico: sobre APPROVED puede bloquear (comenta, transiciona, marca la rama); sobre REJECTED solo puede alertar — nunca revierte el rechazo del firewall. Backend Anthropic → Ollama local (ambos alcanzables desde run_poc_loop.sh y orchestration.py) → se omite sin frenar la corrida.</div>
           <div class="stage-io"><b>tools</b> neo4j-cypher · qdrant-rag <b>· out</b> judge_verdicts.jsonl</div>
         </div>
       </div>
@@ -705,7 +715,7 @@
         <div class="branch">texto normalizado contiene <code>rm -rf</code>, <code>drop table</code>, <code>ignore previous instructions</code>…</div>
         <span class="arrow-sep">⇒</span>
         <span class="pill danger">403 REJECTED</span>
-        <span class="arrow-sep">— corta el pipeline, gh copilot nunca se invoca</span>
+        <span class="arrow-sep">— gh copilot nunca se invoca; el juez SÍ audita este rechazo, pero solo para alertar si fue un falso positivo — nunca lo revierte</span>
       </div>
     </div>
     <div class="decision-row">
@@ -771,18 +781,26 @@
 ├── firewall_proxy.py
 ├── jira_client.py · sonar_client.py · cache_utils.py
 ├── <span class="new">judge_agent.py</span>
-├── <span class="dir">sample-repo/</span>
-│   ├── <span class="new">auth-service/</span>  (Java — password hardcodeado real)
-│   ├── <span class="new">frontend/</span>       (TypeScript)
-│   └── <span class="new">data-worker/</span>    (Python)
+├── <span class="new">orchestration.py</span>       <span class="dir"># Prefect, alternativa a run_poc_loop.sh</span>
+├── <span class="dir">sample-repo/</span>       <span class="dir"># referencia opcional, NO usado por defecto</span>
+│   ├── <span class="new">auth-service/</span>  (Java — password hardcodeado real, JUnit)
+│   ├── <span class="new">frontend/</span>       (TypeScript — Vitest + Playwright + login.html)
+│   └── <span class="new">data-worker/</span>    (Python — pytest)
 ├── <span class="dir">seed/</span>seed.cypher      <span class="dir"># fallback</span>
-├── <span class="dir">.vscode/</span><span class="new">mcp.json</span>       <span class="dir"># 4 MCP</span>
-├── <span class="dir">prompts/</span><span class="new">sync_graph_from_azure_devops.md</span>
+├── <span class="dir">falco/</span>custom_rules.yaml
+├── <span class="dir">evals/</span>
+│   ├── <span class="new">judge_eval_cases.jsonl</span>
+│   └── <span class="new">run_judge_evals.py</span>
+├── <span class="dir">.vscode/</span><span class="new">mcp.json</span>       <span class="dir"># 5 MCP</span>
+├── <span class="dir">prompts/</span>
+│   ├── <span class="new">sync_graph_from_azure_devops.md</span>
+│   └── <span class="new">build_ui_from_figma.md</span>
 ├── <span class="dir">scripts/</span>
 │   ├── <span class="new">bootstrap_sonar.sh</span>
 │   ├── <span class="new">index_rag_corpus.py</span>
 │   ├── <span class="new">check_prereqs.sh</span>
-│   └── <span class="new">report_sprint_metrics.py</span>
+│   ├── <span class="new">report_sprint_metrics.py</span>
+│   └── <span class="new">run_module_tests.sh</span>       <span class="dir"># recibe la ruta del repo real, auto-detección multi-stack</span>
 ├── <span class="dir">cache/</span> · <span class="dir">logs/</span> · <span class="dir">qdrant_storage/</span>  <span class="dir"># runtime</span>
 ├── .env.example · .gitignore
 ├── run_poc_loop.sh
@@ -795,16 +813,22 @@
         <li><span class="n">＋</span><span class="t"><b>Grafo poblado desde Azure DevOps</b> — vía MCP, no un seed estático (que queda solo como fallback).</span></li>
         <li><span class="n">＋</span><span class="t"><b>RAG semántico</b> — Qdrant + embeddings locales sobre código e histórico real de Jira/Sonar.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Cache con TTL</b> — transparente sobre qué se sirvió en vivo vs. cacheado.</span></li>
-        <li><span class="n">＋</span><span class="t"><b>check_prereqs.sh</b> — valida los 8 servicios y 3 credenciales antes de arrancar.</span></li>
-        <li><span class="n">＋</span><span class="t"><b>Ejecución real, no solo explicación</b> — gh copilot suggest corre de verdad (con confirmación humana) y aplica el cambio en una rama de revisión, nunca en main.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>check_prereqs.sh</b> — valida los servicios y credenciales antes de arrancar.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Ejecución real, no solo explicación</b> — gh copilot suggest corre de verdad (con confirmación humana) y aplica el cambio en una rama de revisión, nunca en la rama base original.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Repo objetivo: el real, no uno de ejemplo</b> — el pipeline opera sobre el repositorio git donde el usuario está parado al invocarlo (git rev-parse --show-toplevel), y se niega a arrancar si hay cambios sin commitear. sample-repo/ queda solo como referencia opcional.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Métrica de colaboración</b> — copilot_contribution.jsonl + report_sprint_metrics.py miden cuánto sugirió y aplicó Copilot, no solo si el pipeline corrió.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Auditoría en el ticket mismo</b> — jira_client.py comment publica el veredicto del firewall y qué hizo Copilot como comentario real en Jira, visible sin acceso a los logs locales.</span></li>
         <li><span class="n warn-note">⚠</span><span class="t"><b>"Pipeline" ≠ CI/CD</b> — run_poc_loop.sh es orquestación manual a demanda. Las ramas <code>copilot/*</code> que crea el fallback local no disparan ningún build/test/re-análisis automático; nada las está observando todavía.</span></li>
         <li><span class="n warn-note">⚠</span><span class="t"><b>"Pipeline" ≠ agente</b> — las etapas 1-4 son orquestación determinística, sin razonamiento propio. Solo la etapa 5a (GitHub Copilot coding agent) es un agente real; el fallback 5b es una sugerencia de un solo tiro, sin loop ni acceso a los MCP.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Agente juez con MCP real y poder de bloqueo</b> — Claude (modelo distinto al que actuó) corre local y usa mcp-neo4j-cypher/mcp-server-qdrant de verdad para verificar el contexto, no solo confiar en el texto; si FLAGGED, transiciona el ticket a bloqueado y marca la rama/issue, no solo comenta.</span></li>
-        <li><span class="n">＋</span><span class="t"><b>Testing agent determinístico</b> — mvn/npm/pytest reales en contenedor descartable, gate duro antes del juez (JUnit, Vitest y pytest agregados a los 3 módulos de sample-repo/).</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Testing agent determinístico</b> — mvn/npm/pytest reales en contenedor descartable sobre el repo real detectado, gate duro antes del juez (sample-repo/ trae JUnit, Vitest y pytest como ejemplo de referencia).</span></li>
         <li><span class="n">＋</span><span class="t"><b>Testing de UI real</b> — Playwright renderiza una pantalla de login real (public/index.html) en un navegador headless, no solo mockea la lógica en memoria como los tests unitarios.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Monitoreo a nivel de sistema (Falco)</b> — eBPF en tiempo real sobre los contenedores poc-*, complementario al firewall/juez semántico. Requiere privileged: true; en Windows/Docker Desktop depende del soporte de eBPF de la VM WSL2.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Figma MCP real</b> — Copilot trae medidas/colores/tokens del archivo abierto en Figma Desktop al construir UI, en vez de inventar valores.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Evals de precisión</b> — matriz de confusión del juez contra casos etiquetados a mano (evals/run_judge_evals.py); precisión-proxy del coding agent = % de cambios aplicados que pasan el test suite real.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Orquestación real (Prefect)</b> — orchestration.py reemplaza el bash lineal por un flujo con reintentos por paso, estado persistido y UI en :4200, sobre los mismos building blocks.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Testing agent multi-stack</b> — auto-detección por archivo de proyecto en vez de una lista fija de componentes; agregar un backend en .NET/NestJS/Angular/Ionic/Expo/React Native/Go/Ruby/Rust no requiere tocar el script.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>JIRA_KNOWN_COMPONENTS configurable</b> — el set de componentes reconocidos por jira_client.py ya no está hardcodeado a los 3 módulos de ejemplo.</span></li>
       </ol>
     </div>
   </div>

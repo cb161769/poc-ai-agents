@@ -611,8 +611,8 @@
     Hoy el equipo usa Copilot como autocompletado y chat dentro del editor, sin visibilidad del ticket,
     del impacto en otros servicios ni de los hallazgos de seguridad del sprint. Ese contexto lo sigue
     armando la persona, a mano, historia por historia. Este flujo <strong>conecta a Copilot con ese
-    contexto</strong> automáticamente, con un firewall local para que esa conexión no filtre datos
-    sensibles.
+    contexto</strong> automáticamente, y antes de dar nada por resuelto lo pasa por un firewall, por
+    tests reales y por un segundo revisor independiente.
   </p>
 
   <div class="exec-summary">
@@ -633,8 +633,20 @@
       <div class="v">Con un repositorio real conectado, el trabajo se le asigna al Copilot coding agent, que lo resuelve de forma autónoma en la nube y abre un pull request — no una sugerencia puntual dentro del editor.</div>
     </div>
     <div class="item">
-      <div class="h">Cómo se controla el riesgo</div>
+      <div class="h">Cómo se controla el riesgo de entrada</div>
       <div class="v">Nada se ejecuta a ciegas: cada propuesta pasa antes por el firewall, y cualquier comando que Copilot sugiera pide confirmación humana antes de correr.</div>
+    </div>
+    <div class="item">
+      <div class="h">Cómo se valida que funciona</div>
+      <div class="v">Antes de que nadie confíe en el cambio, corren los tests reales del componente — incluida la pantalla, no solo la lógica — en un entorno descartable. Si fallan, se bloquea ahí mismo.</div>
+    </div>
+    <div class="item">
+      <div class="h">Quién revisa al que revisó</div>
+      <div class="v">Un segundo modelo, independiente del que hizo el trabajo, audita la decisión del firewall y el cambio final — y puede consultar el mapa de dependencias por su cuenta para verificar, no solo confiar en lo que le contaron.</div>
+    </div>
+    <div class="item">
+      <div class="h">Qué pasa a nivel de infraestructura</div>
+      <div class="v">Un monitor en tiempo real vigila lo que hacen los componentes automatizados en la máquina — shells inesperados, escrituras fuera de lugar — como una capa aparte de la revisión de contenido.</div>
     </div>
     <div class="item">
       <div class="h">Qué se puede medir</div>
@@ -681,7 +693,7 @@
           <div class="sdlc-marker"></div>
           <div class="sdlc-card">
             <span class="sdlc-phase">3 · Desarrollo</span>
-            <span class="sdlc-benefit">Con la historia, el impacto y los hallazgos ya filtrados, Copilot propone el cambio, lo aplica en una rama de revisión y deja un comentario auditable en el propio ticket.</span>
+            <span class="sdlc-benefit">Con la historia, el impacto y los hallazgos ya filtrados, Copilot propone el cambio y lo aplica en una rama de revisión. Antes de que nadie confíe en él, corren los tests reales del componente — si fallan, se bloquea ahí mismo y deja un comentario auditable en el propio ticket.</span>
           </div>
         </div>
       </div>
@@ -691,7 +703,7 @@
           <div class="sdlc-marker"></div>
           <div class="sdlc-card">
             <span class="sdlc-phase">4 · Integración (CI)</span>
-            <span class="sdlc-benefit">Fuera de esta PoC — cuando Copilot deja un cambio en una rama, nada lo detecta ni dispara automáticamente un build o un nuevo análisis.</span>
+            <span class="sdlc-benefit">Fuera de esta PoC — el build y los tests corren dentro del mismo flujo (etapa 3), pero no hay un pipeline de integración continua real disparado por el control de versiones ante cualquier cambio.</span>
           </div>
         </div>
       </div>
@@ -761,7 +773,7 @@
 
 <section id="flujo">
   <h2>El ciclo de una historia, de principio a fin</h2>
-  <p class="h2-sub">Los cinco pasos de la columna derecha de arriba, encadenados automáticamente cada vez que se toma una historia del sprint. El único punto donde algo puede detenerse es el firewall — por diseño, no por olvido.</p>
+  <p class="h2-sub">Los pasos de la columna derecha de arriba, encadenados automáticamente cada vez que se toma una historia del sprint. Hay dos puntos donde algo puede detenerse — el firewall y la validación final — y ambos son por diseño, no por olvido.</p>
   <div class="flow-scroll">
     <div class="flow">
       <div class="flow-node">
@@ -798,9 +810,17 @@
       <div class="flow-connector"></div>
       <div class="flow-node">
         <div class="flow-card" style="--node-color:#1f7a54">
-          <div class="flow-role">acción final</div>
+          <div class="flow-role">propuesta de solución</div>
           <div class="flow-title">Copilot resuelve</div>
-          <div class="flow-desc">Con el sprint completo como contexto, se le asigna la tarea al Copilot coding agent, que trabaja de forma autónoma y abre un pull request; el resultado queda comentado en el propio ticket.</div>
+          <div class="flow-desc">Con el sprint completo como contexto, se le asigna la tarea al Copilot coding agent, que trabaja de forma autónoma y abre un pull request.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#a9740a">
+          <div class="flow-role">antes de confiar</div>
+          <div class="flow-title">Se valida y se audita</div>
+          <div class="flow-desc">Corren los tests reales del componente en un entorno descartable, y un segundo revisor independiente audita la decisión completa. Si algo falla, se bloquea ahí — recién entonces queda comentado en el ticket.</div>
         </div>
       </div>
     </div>

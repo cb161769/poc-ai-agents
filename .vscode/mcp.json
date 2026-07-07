@@ -31,6 +31,10 @@
     "atlassian": {
       "type": "sse",
       "url": "https://mcp.atlassian.com/v1/sse"
+    },
+    "figma-dev-mode": {
+      "type": "sse",
+      "url": "http://127.0.0.1:3845/sse"
     }
   }
 }

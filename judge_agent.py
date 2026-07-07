@@ -245,9 +245,28 @@ def _ollama_response_to_blocks(message: dict) -> tuple:
     return blocks, stop_reason
 
 
+# Precios aproximados por millon de tokens (USD) — solo para tener una
+# estimacion de costo en los evals/logs, no son precios contractuales.
+# Ajustar si cambian o si se usa otro modelo.
+ANTHROPIC_PRICING_PER_MILLION = {
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0},
+    "claude-opus-4-8": {"input": 15.0, "output": 75.0},
+    "claude-haiku-4-5-20251001": {"input": 0.8, "output": 4.0},
+}
+
+
+def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    pricing = ANTHROPIC_PRICING_PER_MILLION.get(model)
+    if not pricing:
+        return 0.0
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+
 async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: list, tools: list) -> tuple:
-    """Returns (content_blocks, stop_reason) normalized to the Anthropic
-    content-block shape regardless of which backend answered.
+    """Returns (content_blocks, stop_reason, usage) normalized to the
+    Anthropic content-block shape regardless of which backend answered.
+    usage = {"input_tokens": int, "output_tokens": int} (0s for Ollama,
+    which is free/local so cost tracking doesn't apply the same way).
     """
     if backend == "anthropic":
         request_body = {
@@ -271,7 +290,12 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["content"], data.get("stop_reason", "end_turn")
+        usage = data.get("usage", {})
+        return (
+            data["content"],
+            data.get("stop_reason", "end_turn"),
+            {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0)},
+        )
 
     if backend == "ollama":
         ollama_messages = [{"role": "system", "content": JUDGE_SYSTEM_PROMPT}] + _messages_to_ollama(messages)
@@ -281,7 +305,10 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
 
         resp = await client.post(f"{OLLAMA_URL}/api/chat", json=request_body, timeout=120.0)
         resp.raise_for_status()
-        return _ollama_response_to_blocks(resp.json().get("message", {}))
+        data = resp.json()
+        blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}))
+        usage = {"input_tokens": data.get("prompt_eval_count", 0), "output_tokens": data.get("eval_count", 0)}
+        return blocks, stop_reason, usage
 
     raise RuntimeError("ni ANTHROPIC_API_KEY ni un Ollama local disponible — el juez no puede correr")
 
@@ -289,6 +316,24 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
 async def judge_with_tools(payload: dict) -> dict:
     backend = _select_backend()
     print(f"(juez: usando backend '{backend}')", file=sys.stderr)
+
+    start_time = time.monotonic()
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    def _finalize(verdict: dict) -> dict:
+        verdict["_meta"] = {
+            "backend": backend,
+            "latency_seconds": round(time.monotonic() - start_time, 2),
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "estimated_cost_usd": (
+                round(_estimate_cost_usd(ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6)
+                if backend == "anthropic"
+                else 0.0
+            ),
+        }
+        return verdict
 
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack)
@@ -305,12 +350,14 @@ async def judge_with_tools(payload: dict) -> dict:
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason = await _call_model_turn(client, backend, messages, tools)
+                content, stop_reason, usage = await _call_model_turn(client, backend, messages, tools)
+                total_input_tokens += usage.get("input_tokens", 0)
+                total_output_tokens += usage.get("output_tokens", 0)
                 messages.append({"role": "assistant", "content": content})
 
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
-                    return _extract_json(final_text)
+                    return _finalize(_extract_json(final_text))
 
                 tool_results = []
                 for block in content:
@@ -328,8 +375,18 @@ async def judge_with_tools(payload: dict) -> dict:
 
 
 def log_verdict(ticket_id: str, verdict: dict):
+    """Flattens _meta (backend/latency/tokens/cost) into the top level of
+    the log entry so evals/run_judge_evals.py and report_sprint_metrics.py
+    can aggregate them with plain jq, no nested-field gymnastics.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "ticket_id": ticket_id, **verdict}
+    meta = verdict.pop("_meta", {})
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ticket_id": ticket_id,
+        **verdict,
+        **meta,
+    }
     with VERDICT_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
@@ -342,7 +399,7 @@ def main():
     except KeyError as exc:
         print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
         sys.exit(1)
-    except (httpx.HTTPStatusError, json.JSONDecodeError, RuntimeError) as exc:
+    except (httpx.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
         print(json.dumps({"error": "judge_call_failed", "detail": str(exc)}), file=sys.stderr)
         sys.exit(1)
 
