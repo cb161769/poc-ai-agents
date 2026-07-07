@@ -5,14 +5,19 @@ environment (see .env.example), calls the real Jira REST API v3, and prints
 a single JSON object on stdout so the bash orchestrator can consume it with
 `jq`.
 
-repository_origen is resolved from the ticket's labels: the first label that
-matches a known node name in the dependency graph is used. This lets a real
-Jira ticket drive the graph impact query without inventing a custom field.
+repository_origen is resolved primarily from the ticket's native Jira
+**Components** field (Settings > Components in your Jira project) -- the
+field Jira actually has for "which part of the system does this affect".
+If no Component matches, falls back to labels (the original heuristic),
+for tickets/projects that only use labels. Either way, the match has to
+land in a known node name in the dependency graph.
 
-Known components are NOT hardcoded to the three sample-repo/ modules — set
-JIRA_KNOWN_COMPONENTS in .env as a comma-separated list matching your real
-service names (however many languages/frameworks they're in) so this
-generalizes to real backends without editing this file.
+Known components are NOT hardcoded to the three sample-repo/ modules.
+run_poc_loop.sh/orchestration.py derive this set from the real Neo4j graph
+at the start of each run (whatever node names already exist there) and
+export it as JIRA_KNOWN_COMPONENTS before invoking this script -- so it
+stays in sync with the graph automatically. JIRA_KNOWN_COMPONENTS in .env
+is only the fallback for when Neo4j isn't reachable yet.
 """
 import base64
 import json
@@ -159,7 +164,7 @@ def fetch_ticket_live() -> dict:
     resp = httpx.get(
         f"{jira_url}/rest/api/3/issue/{ticket_key}",
         headers=headers,
-        params={"fields": "summary,description,labels,status,attachment"},
+        params={"fields": "summary,description,labels,status,attachment,components"},
         timeout=15.0,
     )
     resp.raise_for_status()
@@ -167,7 +172,13 @@ def fetch_ticket_live() -> dict:
 
     fields = issue.get("fields", {})
     labels = fields.get("labels", []) or []
-    repository_origen = next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
+    components = [c.get("name") for c in (fields.get("components") or []) if c.get("name")]
+    # Prefer the native Components field (what it's actually for); fall back
+    # to labels for tickets/projects that only use those.
+    repository_origen = (
+        next((c for c in components if c in KNOWN_REPOS), None)
+        or next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
+    )
     attachment_info = _fetch_rovo_attachment_context(jira_url, headers, ticket_key, fields.get("attachment", []) or [])
     description_text = _adf_to_text(fields.get("description")).strip()
 
@@ -176,6 +187,7 @@ def fetch_ticket_live() -> dict:
         "summary": fields.get("summary", ""),
         "description": description_text,
         "labels": labels,
+        "components": components,
         "repository_origen": repository_origen,
         "status": (fields.get("status") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
@@ -320,9 +332,10 @@ def main():
         print(
             json.dumps(
                 {
-                    "error": "no_matching_label",
-                    "detail": f"El ticket {ticket.get('ticket_id')} no tiene ninguna etiqueta en {sorted(KNOWN_REPOS)}. "
-                    "Agrega una etiqueta (label) con el nombre exacto del nodo del grafo afectado.",
+                    "error": "no_matching_component_or_label",
+                    "detail": f"El ticket {ticket.get('ticket_id')} no tiene ningun Component ni etiqueta en {sorted(KNOWN_REPOS)}. "
+                    "Asigna el campo Components de Jira (recomendado, Settings > Components de tu proyecto) o una "
+                    "etiqueta (label) con el nombre exacto del nodo del grafo afectado.",
                 }
             ),
             file=sys.stderr,

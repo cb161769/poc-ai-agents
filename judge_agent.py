@@ -39,6 +39,7 @@ If the local MCP servers aren't reachable (uvx missing, Neo4j/Qdrant down),
 the judge falls back to reasoning over the text it was given, same as before.
 """
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -50,6 +51,8 @@ import httpx
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+from firewall_proxy import _redact
 
 load_dotenv()
 
@@ -374,10 +377,35 @@ async def judge_with_tools(payload: dict) -> dict:
     raise RuntimeError("el juez agoto los turnos de herramientas sin dar un veredicto final")
 
 
-def log_verdict(ticket_id: str, verdict: dict):
+def _redact_payload_for_logging(payload: dict) -> dict:
+    """payload["ticket"]["description"] and payload["change_description"]
+    never went through the firewall's egress redaction (that only redacts
+    the composed prompt before it reaches the coding agent, not the raw
+    ticket or the diff Copilot ends up producing) -- they already reach the
+    judge unredacted via the API call. Persisting them to disk for the
+    review/promote-to-evals workflow is a NEW exposure that call didn't
+    have, so apply the same redaction firewall_proxy already uses before
+    writing anything to judge_verdicts.jsonl.
+    """
+    redacted = copy.deepcopy(payload)
+    description = (redacted.get("ticket") or {}).get("description")
+    if description:
+        redacted["ticket"]["description"], _ = _redact(description)
+    change_description = redacted.get("change_description")
+    if change_description:
+        redacted["change_description"], _ = _redact(change_description)
+    return redacted
+
+
+def log_verdict(ticket_id: str, verdict: dict, payload: dict):
     """Flattens _meta (backend/latency/tokens/cost) into the top level of
     the log entry so evals/run_judge_evals.py and report_sprint_metrics.py
     can aggregate them with plain jq, no nested-field gymnastics.
+
+    Also persists the (redacted) input payload -- scripts/review_judge_verdicts.py
+    and scripts/promote_reviews_to_evals.py need it to turn a real run into a
+    new evals/judge_eval_cases.jsonl case once a human confirms or corrects
+    the verdict.
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     meta = verdict.pop("_meta", {})
@@ -386,6 +414,7 @@ def log_verdict(ticket_id: str, verdict: dict):
         "ticket_id": ticket_id,
         **verdict,
         **meta,
+        "payload": _redact_payload_for_logging(payload),
     }
     with VERDICT_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -403,7 +432,7 @@ def main():
         print(json.dumps({"error": "judge_call_failed", "detail": str(exc)}), file=sys.stderr)
         sys.exit(1)
 
-    log_verdict(payload["ticket"].get("ticket_id", "UNKNOWN"), verdict)
+    log_verdict(payload["ticket"].get("ticket_id", "UNKNOWN"), verdict, payload)
     print(json.dumps(verdict, ensure_ascii=False))
 
 

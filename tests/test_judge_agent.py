@@ -9,6 +9,7 @@ from judge_agent import (
     _extract_json,
     _messages_to_ollama,
     _ollama_response_to_blocks,
+    _redact_payload_for_logging,
 )
 
 
@@ -104,3 +105,40 @@ def test_estimate_cost_usd_known_model(input_tokens, output_tokens, expected):
 
 def test_estimate_cost_usd_unknown_model_is_zero():
     assert _estimate_cost_usd("some-model-not-in-the-pricing-table", 1000, 1000) == 0.0
+
+
+def test_redact_payload_for_logging_redacts_ticket_description_and_diff():
+    payload = {
+        "ticket": {"ticket_id": "T-1", "description": "la conexion usa password=Sup3rS3cr3t!"},
+        "firewall": {"status": "APPROVED", "reason": None, "redactions_applied": 0},
+        "change_source": "local_diff",
+        "change_description": "+    private static final String DB_PASSWORD = \"password=OtroSecreto123!\";",
+        "test_summary": "3 tests, 3 passed",
+    }
+
+    redacted = _redact_payload_for_logging(payload)
+
+    assert "Sup3rS3cr3t" not in redacted["ticket"]["description"]
+    assert "OtroSecreto123" not in redacted["change_description"]
+    assert "[REDACTED_CORPORATE_SECRET]" in redacted["ticket"]["description"]
+    assert "[REDACTED_CORPORATE_SECRET]" in redacted["change_description"]
+
+    # El payload original no se muta -- log_verdict() no debe alterar lo que
+    # ya se le mando al modelo.
+    assert "Sup3rS3cr3t" in payload["ticket"]["description"]
+    assert "OtroSecreto123" in payload["change_description"]
+
+
+def test_redact_payload_for_logging_leaves_clean_text_untouched():
+    payload = {
+        "ticket": {"ticket_id": "T-2", "description": "el boton no muestra el spinner de carga"},
+        "firewall": {"status": "APPROVED", "reason": None, "redactions_applied": 0},
+        "change_source": "issue_only",
+        "change_description": "Agregar spinner al boton de login",
+        "test_summary": "sin cambios aplicados",
+    }
+
+    redacted = _redact_payload_for_logging(payload)
+
+    assert redacted["ticket"]["description"] == payload["ticket"]["description"]
+    assert redacted["change_description"] == payload["change_description"]

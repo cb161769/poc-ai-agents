@@ -25,6 +25,8 @@ cp .env.example .env
 # edita .env con tus valores reales de Jira y Azure DevOps
 ```
 
+**Sobre `repository_origen`** (qué componente afecta el ticket): el pipeline primero mira el campo nativo **Components** del ticket de Jira (Settings → Components de tu proyecto), con fallback a labels si no hay match ahí. El set de componentes válidos se deriva automáticamente de los nombres de nodo reales en Neo4j en cada corrida — `JIRA_KNOWN_COMPONENTS` en `.env` es solo el fallback para cuando Neo4j todavía no está levantado.
+
 ## 2. Levantar la infraestructura
 
 ```bash
@@ -192,6 +194,18 @@ python3 evals/run_judge_evals.py
 Corre cada caso contra `judge_agent.judge_with_tools()` de verdad (mismo código que usa `run_poc_loop.sh`/`orchestration.py`), imprime una matriz de confusión (tratando `FLAGGED` como la clase positiva — el error grave es un falso negativo: algo que debía bloquearse y el juez dejó pasar) y el costo/latencia total. Falla (`exit 1`) si hay algún falso negativo. Resultados acumulados en `logs/eval_judge_runs.jsonl`.
 
 **Precisión del coding agent (proxy)** — no hay forma automática de saber "¿resolvió el ticket correctamente?" sin un humano, pero sí hay un piso medible: ¿pasó los tests reales que se supone que tiene que pasar? Eso ya lo agrega `report_sprint_metrics.py` (§8), leyendo el campo `tests_passed` que ahora graba `run_poc_loop.sh` en `copilot_contribution.jsonl` cada vez que el testing agent corre.
+
+## 12.1. Mejora continua del juez (curación humana de evals, no reentrenamiento)
+
+`evals/judge_eval_cases.jsonl` empezó como 7 casos fijos escritos a mano — esto lo hace crecer con corridas reales, sin tocar pesos de ningún modelo (nada acá hace fine-tuning; es curación de un dataset por un humano):
+
+```bash
+python3 scripts/review_judge_verdicts.py    # 1. revisa corridas reales pendientes, vos confirmas o corregís el veredicto del juez
+python3 scripts/promote_reviews_to_evals.py # 2. las revisiones (acuerdos Y correcciones) se suman como casos nuevos a judge_eval_cases.jsonl
+python3 evals/run_judge_evals.py            # 3. ya corre con los casos nuevos incluidos, sin tocar este script
+```
+
+`judge_agent.py` ahora persiste el `payload` de cada corrida junto al veredicto en `logs/judge_verdicts.jsonl` (antes solo se guardaba el resultado) — redactado con el mismo `firewall_proxy._redact()` que usa el firewall, porque ni la descripción cruda del ticket ni el diff real que aplica Copilot pasan por esa redacción antes de llegar al juez. `logs/judge_reviews.jsonl` guarda las revisiones humanas (`human_agreed`, `human_expected_verdict`, nota opcional) — ambos archivos están en `.gitignore` igual que el resto de `logs/*.jsonl`.
 
 ## 13. Orquestación real con Prefect (alternativa a run_poc_loop.sh)
 

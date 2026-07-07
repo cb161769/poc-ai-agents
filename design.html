@@ -841,6 +841,8 @@
         <li><span class="n">＋</span><span class="t"><b>JIRA_KNOWN_COMPONENTS configurable</b> — el set de componentes reconocidos por jira_client.py ya no está hardcodeado a los 3 módulos de ejemplo.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Tests unitarios de la herramienta</b> — tests/ (pytest) cubre firewall_proxy.py, jira_client.py, sonar_client.py, cache_utils.py y judge_agent.py con lógica pura/determinista, sin pegarle a servicios reales.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Gate de Docker alineado entre bash y Prefect</b> — orchestration.py omite el testing agent con gracia si Docker no está en el host, igual que run_poc_loop.sh, en vez de fallar la corrida entera.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>repository_origen resuelto de forma inteligente</b> — prioriza el campo nativo Components de Jira (fallback a labels), y el set de componentes conocidos se deriva de los nombres de nodo reales en Neo4j en cada corrida, no de una lista estática en .env.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Mejora continua del juez (curación humana)</b> — review_judge_verdicts.py + promote_reviews_to_evals.py convierten corridas reales confirmadas/corregidas por un humano en casos nuevos de judge_eval_cases.jsonl. Sin reentrenar ningún modelo — es curación de dataset.</span></li>
       </ol>
     </div>
   </div>

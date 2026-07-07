@@ -89,6 +89,34 @@ def check_dirty_tree(target_repo_dir: str):
         )
 
 
+@task(retries=1, retry_delay_seconds=5, name="discover-known-components")
+def discover_known_components():
+    """Best-effort: derive the known-components set from whatever node
+    names already exist in the real Neo4j graph, instead of relying only on
+    the static JIRA_KNOWN_COMPONENTS list in .env staying in sync with it.
+    Mutates os.environ so the fetch_jira_ticket() subprocess (python3
+    jira_client.py) inherits it. If Neo4j isn't reachable, this leaves
+    JIRA_KNOWN_COMPONENTS as whatever was already in the environment.
+    """
+    neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
+    neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
+    try:
+        output = _run(
+            [
+                "cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass,
+                "--format", "plain", "MATCH (n) RETURN DISTINCT n.name AS name",
+            ]
+        )
+    except RuntimeError:
+        return
+
+    names = [line.strip().strip('"') for line in output.splitlines()[1:] if line.strip()]
+    if names:
+        os.environ["JIRA_KNOWN_COMPONENTS"] = ",".join(names)
+        print(f"Componentes conocidos derivados del grafo Neo4j: {os.environ['JIRA_KNOWN_COMPONENTS']}")
+
+
 @task(retries=2, retry_delay_seconds=5, name="fetch-jira-ticket")
 def fetch_jira_ticket() -> dict:
     return json.loads(_run(["python3", "jira_client.py"]))
@@ -303,6 +331,8 @@ def run_pipeline():
     target_repo_dir = detect_target_repo()
     check_dirty_tree(target_repo_dir)
     logger.info(f"Repo objetivo detectado: {target_repo_dir}")
+
+    discover_known_components()
 
     ticket = fetch_jira_ticket()
     component = ticket["repository_origen"]

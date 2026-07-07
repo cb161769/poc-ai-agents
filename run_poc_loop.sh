@@ -233,6 +233,19 @@ check_falco_correlation() {
 command -v jq >/dev/null 2>&1 || fail "jq no esta instalado (requerido para parsear JSON). Instalalo y reintenta."
 command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 
+# Deriva JIRA_KNOWN_COMPONENTS de los nombres de nodo que ya existen en el
+# grafo real de Neo4j, en vez de depender de que la lista estatica de .env
+# se mantenga sincronizada a mano. Best-effort: si Neo4j no esta disponible
+# o el grafo esta vacio, se deja lo que ya haya en .env sin tocar nada.
+if command -v cypher-shell >/dev/null 2>&1; then
+  DISCOVERED_COMPONENTS=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain \
+    "MATCH (n) RETURN DISTINCT n.name AS name" 2>/dev/null | tail -n +2 | tr -d '"' | paste -sd, -)
+  if [ -n "${DISCOVERED_COMPONENTS}" ]; then
+    export JIRA_KNOWN_COMPONENTS="${DISCOVERED_COMPONENTS}"
+    echo "Componentes conocidos derivados del grafo Neo4j: ${JIRA_KNOWN_COMPONENTS}"
+  fi
+fi
+
 echo "=================================================================="
 echo " ETAPA 1/5 — Lectura del ticket Jira real"
 echo "=================================================================="
