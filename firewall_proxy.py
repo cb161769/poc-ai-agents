@@ -12,14 +12,22 @@ Sonar findings) and runs it through two strict gates:
 
 Every call (approved or rejected) is appended as one JSON line to
 logs/firewall_audit.jsonl, without ever writing the raw secret to disk.
+
+Auth: if FIREWALL_API_KEY is set in the environment, /evaluate requires a
+matching X-Firewall-Key header (401 otherwise) -- so this can't be hit by
+anything that didn't go through the orchestrator. If the variable is unset,
+the firewall stays open (with a startup warning) so the local demo keeps
+working for anyone who hasn't configured it yet.
 """
 import json
+import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -28,6 +36,20 @@ app = FastAPI(title="AI Firewall PoC")
 LOG_DIR = Path("/app/logs") if Path("/app").exists() else Path("./logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 AUDIT_LOG = LOG_DIR / "firewall_audit.jsonl"
+
+FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
+if not FIREWALL_API_KEY:
+    print(
+        "AVISO: FIREWALL_API_KEY no esta seteada -- /evaluate acepta pedidos sin autenticar. "
+        "Setea FIREWALL_API_KEY en .env para requerir el header X-Firewall-Key.",
+        file=sys.stderr,
+    )
+
+
+def require_api_key(x_firewall_key: Optional[str] = Header(default=None)):
+    if FIREWALL_API_KEY and x_firewall_key != FIREWALL_API_KEY:
+        raise HTTPException(status_code=401, detail="missing_or_invalid_x_firewall_key")
+
 
 JAILBREAK_PATTERNS = [
     r"ignore previous instructions",
@@ -95,7 +117,7 @@ def _audit(ticket_id: str, status: str, reason: Optional[str], redactions_applie
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-@app.post("/evaluate", response_model=EvaluateResponse)
+@app.post("/evaluate", response_model=EvaluateResponse, dependencies=[Depends(require_api_key)])
 def evaluate(req: EvaluateRequest):
     ticket_id = req.jira_context.get("ticket_id", "UNKNOWN")
 

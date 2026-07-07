@@ -52,6 +52,24 @@ else
   check "SONAR_TOKEN definido en .env" "1" "(falta variable)"
 fi
 
+# --- AI Firewall ---
+curl -sf "${FIREWALL_URL:-http://localhost:8080}/health" >/dev/null 2>&1
+check "AI Firewall alcanzable en ${FIREWALL_URL:-http://localhost:8080}" "$?"
+
+if [ -n "${FIREWALL_API_KEY:-}" ]; then
+  # Best-effort: confirma que /evaluate realmente exige el header sin la key,
+  # no solo que la variable este definida en .env.
+  UNAUTH_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${FIREWALL_URL:-http://localhost:8080}/evaluate" \
+    -H "Content-Type: application/json" -d '{"prompt":"","jira_context":{},"sonar_errors":[]}' 2>/dev/null)
+  if [ "${UNAUTH_CODE}" = "401" ]; then
+    printf "  %s  %s\n" "${PASS}" "FIREWALL_API_KEY exigida por /evaluate (pedido sin header -> 401)"
+  else
+    printf "  ⚠️  /evaluate no devolvio 401 sin header (devolvio %s) — verifica que ai-firewall se haya reconstruido con la key nueva\n" "${UNAUTH_CODE:-sin respuesta}"
+  fi
+else
+  printf "  ⚠️  FIREWALL_API_KEY no definida (opcional): /evaluate queda abierto, cualquiera que llegue a FIREWALL_URL puede pegarle directo\n"
+fi
+
 # --- Qdrant ---
 curl -sf "${QDRANT_URL:-http://localhost:6333}/readyz" >/dev/null 2>&1
 check "Qdrant listo en ${QDRANT_URL:-http://localhost:6333}" "$?"
@@ -116,11 +134,19 @@ else
   printf "  ⚠️  uvx no encontrado: el juez (si corre) va a razonar sin herramientas MCP, solo sobre texto (instala uv: https://docs.astral.sh/uv)\n"
 fi
 
-# --- sample-repo como repo git (para poder aplicar sugerencias, opcional) ---
-if [ -d "${ROOT_DIR}/sample-repo/.git" ]; then
-  printf "  %s  %s\n" "${PASS}" "sample-repo/ es un repo git (Copilot puede aplicar cambios en una rama)"
+# --- Repo objetivo real (donde estas parado, no sample-repo/) ---
+# run_poc_loop.sh/orchestration.py operan sobre el repo git en el que el
+# usuario esta parado al invocarlos, no sobre una carpeta fija — el mismo
+# chequeo que hace el pipeline antes de crear una rama.
+if TARGET_REPO_DIR_CHECK="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  printf "  %s  %s\n" "${PASS}" "Parado dentro de un repo git real (${TARGET_REPO_DIR_CHECK})"
+  if [ -z "$(git -C "${TARGET_REPO_DIR_CHECK}" status --porcelain)" ]; then
+    printf "  %s  %s\n" "${PASS}" "Working tree limpio (sin cambios sin commitear)"
+  else
+    check "Working tree limpio (sin cambios sin commitear)" "1" "(hace commit o 'git stash' antes de correr run_poc_loop.sh)"
+  fi
 else
-  printf "  ⚠️  sample-repo/ NO es un repo git todavia (opcional): git -C sample-repo init && git -C sample-repo add -A && git -C sample-repo commit -m baseline\n"
+  check "Parado dentro de un repo git real" "1" "(cd a tu proyecto real antes de correr check_prereqs.sh/run_poc_loop.sh — ya no se usa sample-repo/ por defecto)"
 fi
 
 echo "=========================================="

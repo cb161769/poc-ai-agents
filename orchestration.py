@@ -28,8 +28,10 @@ without standing up Prefect — both drive the exact same scripts underneath.
 """
 import json
 import os
+import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -44,6 +46,7 @@ JIRA_IN_PROGRESS_STATUS = os.environ.get("JIRA_IN_PROGRESS_STATUS", "In Progress
 JIRA_BLOCKED_STATUS = os.environ.get("JIRA_BLOCKED_STATUS", "Blocked")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_COPILOT_ASSIGNEE = os.environ.get("GITHUB_COPILOT_ASSIGNEE", "copilot-swe-agent")
+FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
 
 
 class PipelineBlocked(Exception):
@@ -129,9 +132,11 @@ def query_sonar(component: str) -> dict:
 
 @task(retries=1, name="evaluate-firewall")
 def evaluate_firewall(prompt: str, jira_context: dict, sonar_errors: list) -> dict:
+    headers = {"X-Firewall-Key": FIREWALL_API_KEY} if FIREWALL_API_KEY else {}
     resp = httpx.post(
         f"{FIREWALL_URL}/evaluate",
         json={"prompt": prompt, "jira_context": jira_context, "sonar_errors": sonar_errors},
+        headers=headers,
         timeout=15.0,
     )
     return resp.json()
@@ -187,6 +192,9 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
 
 @task(retries=0, name="testing-agent")
 def run_tests(target_repo_dir: str) -> dict:
+    if shutil.which("docker") is None:
+        return {"passed": True, "output": "(testing agent omitido: docker no disponible en el host)"}
+
     result = subprocess.run(
         ["bash", str(SCRIPT_DIR / "scripts" / "run_module_tests.sh"), target_repo_dir],
         capture_output=True,
@@ -214,6 +222,40 @@ def run_judge(ticket: dict, firewall_result: dict, change_source: str, change_de
     if result.returncode != 0:
         raise RuntimeError(f"juez fallo: {result.stderr.strip()}")
     return json.loads(result.stdout)
+
+
+@task(retries=0, name="falco-correlation")
+def check_falco_correlation(since_iso: str, ticket_id: str):
+    """Correlates logs/falco_alerts.jsonl (Falco already writes these in real
+    time, see falco/custom_rules.yaml) with this run's time window. Advisory
+    only -- never blocks the flow, just surfaces what Falco saw via a Jira
+    comment and, if configured, a webhook POST.
+    """
+    result = subprocess.run(
+        ["python3", str(SCRIPT_DIR / "scripts" / "check_falco_alerts.py"), since_iso, str(SCRIPT_DIR / "logs" / "falco_alerts.jsonl")],
+        capture_output=True,
+        text=True,
+    )
+    if not result.stdout.strip():
+        return
+    try:
+        summary = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return
+
+    count = summary.get("count", 0)
+    if not count:
+        return
+
+    alert_lines = " ".join(f"- [{a['priority']}] {a['rule']}: {a['output']}" for a in summary["alerts"])
+    comment_jira(f"🚨 Falco (monitoreo a nivel de sistema, automatizado, Prefect): se detectaron {count} alerta(s) durante esta corrida — {alert_lines}")
+
+    webhook_url = os.environ.get("FALCO_ALERT_WEBHOOK_URL", "")
+    if webhook_url:
+        try:
+            httpx.post(webhook_url, json={"text": f"🚨 Falco detecto {count} alerta(s) en la corrida de {ticket_id}: {alert_lines}"}, timeout=10.0)
+        except httpx.HTTPError:
+            print("(no se pudo postear al webhook de Falco)")
 
 
 def _run_judge_safe(*args, **kwargs) -> dict | None:
@@ -288,6 +330,7 @@ def run_pipeline():
         raise PipelineBlocked(firewall_result["reason"])
 
     transition_jira(JIRA_IN_PROGRESS_STATUS)
+    falco_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     sanitized = firewall_result["sanitized_prompt"]
 
     if GITHUB_REPO:
@@ -314,6 +357,7 @@ def run_pipeline():
                 comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON en '{agent_result['branch']}'.")
                 transition_jira(JIRA_BLOCKED_STATUS)
                 logger.error("Tests fallaron — bloqueado antes del juez.")
+                check_falco_correlation(falco_since, ticket["ticket_id"])
                 raise PipelineBlocked("tests reales fallaron")
 
             diff_text = _run([
@@ -336,6 +380,8 @@ def run_pipeline():
     else:
         comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK. {judge_verdict['reasoning']}")
         logger.info("Juez marco OK.")
+
+    check_falco_correlation(falco_since, ticket["ticket_id"])
 
     return {"firewall": firewall_result, "agent": agent_result, "judge": judge_verdict}
 

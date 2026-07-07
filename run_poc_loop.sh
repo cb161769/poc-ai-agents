@@ -200,6 +200,36 @@ run_tests_gate() {
   return 1
 }
 
+# Correlaciona logs/falco_alerts.jsonl (que Falco ya viene escribiendo en
+# tiempo real, ver falco/custom_rules.yaml) con la ventana de esta corrida
+# del pipeline. Puramente informativo: nunca bloquea la corrida, solo la
+# deja en evidencia en Jira y, si esta configurado, en un webhook.
+check_falco_correlation() {
+  local since="$1"
+  local result count
+  result=$(python3 "${SCRIPT_DIR}/scripts/check_falco_alerts.py" "${since}" "${SCRIPT_DIR}/logs/falco_alerts.jsonl" 2>/dev/null)
+  count=$(echo "${result}" | jq -r '.count // 0' 2>/dev/null)
+
+  if [ -z "${count}" ] || [ "${count}" = "0" ]; then
+    return 0
+  fi
+
+  echo
+  echo "🚨 Falco registro ${count} alerta(s) durante esta corrida:"
+  echo "${result}" | jq -r '.alerts[] | "  [\(.priority)] \(.rule): \(.output)"'
+
+  local summary
+  summary=$(echo "${result}" | jq -r '.alerts[] | "- [\(.priority)] \(.rule): \(.output)"' | tr '\n' ' ')
+  post_jira_comment "🚨 Falco (monitoreo a nivel de sistema, automatizado): se detectaron ${count} alerta(s) durante esta corrida — ${summary}"
+
+  if [ -n "${FALCO_ALERT_WEBHOOK_URL:-}" ]; then
+    curl -s -X POST "${FALCO_ALERT_WEBHOOK_URL}" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -n --arg text "🚨 Falco detecto ${count} alerta(s) en la corrida de ${TICKET_ID:-UNKNOWN}: ${summary}" '{text: $text}')" \
+      >/dev/null 2>&1 || echo "(no se pudo postear al webhook de Falco)"
+  fi
+}
+
 command -v jq >/dev/null 2>&1 || fail "jq no esta instalado (requerido para parsear JSON). Instalalo y reintenta."
 command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 
@@ -301,8 +331,14 @@ PAYLOAD=$(jq -n \
   --argjson sonar_errors "${SONAR_ERRORS_ARRAY}" \
   '{prompt: $prompt, jira_context: $jira_context, sonar_errors: $sonar_errors}')
 
+FIREWALL_AUTH_HEADER=()
+if [ -n "${FIREWALL_API_KEY:-}" ]; then
+  FIREWALL_AUTH_HEADER=(-H "X-Firewall-Key: ${FIREWALL_API_KEY}")
+fi
+
 RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "${FIREWALL_URL}/evaluate" \
   -H "Content-Type: application/json" \
+  "${FIREWALL_AUTH_HEADER[@]}" \
   -d "${PAYLOAD}")
 
 HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
@@ -341,6 +377,8 @@ if [ "${STATUS}" = "APPROVED" ]; then
   echo "Moviendo el ticket ${TICKET_ID} a '${JIRA_IN_PROGRESS_STATUS:-In Progress}'..."
   transition_jira_ticket
 
+  FALCO_SINCE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
   # --- Camino A: agente real. Si hay un repo real configurado, se crea un
   # Issue con el contexto ya armado (ticket + impacto de grafo + hallazgos
   # Sonar, todo pre-computado localmente) y se asigna al GitHub Copilot
@@ -377,6 +415,7 @@ EOF
       post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${ISSUE_URL} pero no se pudo asignar al coding agent — revisar configuracion del repo."
       log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${ISSUE_URL}"
     fi
+    check_falco_correlation "${FALCO_SINCE_TS}"
     exit 0
   fi
 
@@ -422,6 +461,7 @@ EOF
     log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}" "null"
     run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"
   fi
+  check_falco_correlation "${FALCO_SINCE_TS}"
   exit 0
 fi
 

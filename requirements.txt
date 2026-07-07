@@ -7,3 +7,4 @@ sentence-transformers==3.0.1
 python-dotenv==1.0.1
 mcp==1.2.1
 prefect~=2.19
+pytest==8.2.2

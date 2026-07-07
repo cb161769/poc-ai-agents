@@ -40,6 +40,8 @@ docker compose logs sonar-scanner | grep SONAR_TOKEN
 docker compose restart ai-firewall
 ```
 
+Opcional pero recomendado: seteá `FIREWALL_API_KEY` en `.env` antes de levantar `ai-firewall` para que `/evaluate` exija el header `X-Firewall-Key` (401 sin él) — sin esto, cualquiera que llegue a `FIREWALL_URL` puede pegarle al firewall directo, sin pasar por Jira. `run_poc_loop.sh`/`orchestration.py` mandan el header automáticamente si la variable está seteada.
+
 ## 3. Sincronizar el grafo desde Azure DevOps real (opcional pero recomendado)
 
 Abre VS Code en este directorio (ya trae `.vscode/mcp.json`), confirma que los cinco MCP (`neo4j-cypher`, `azure-devops`, `qdrant-rag`, `atlassian`, `figma-dev-mode`) arrancan, y pega el contenido de [prompts/sync_graph_from_azure_devops.md](prompts/sync_graph_from_azure_devops.md) en Copilot Chat. Si no lo haces, el grafo usa el seed estático de `seed/seed.cypher`.
@@ -99,6 +101,15 @@ Edita el ticket real en Jira (no un archivo local) y agrega a la descripción, p
 
 Vuelve a correr `./run_poc_loop.sh` después de guardar el cambio en Jira (si corriste hace menos de `CACHE_TTL_SECONDS`, el ticket puede venir de cache — bórralo con `rm -rf cache/` para forzar una lectura en vivo).
 
+## 7.1. Tests del código propio (no del repo objetivo)
+
+`scripts/run_module_tests.sh` (§9) testea el repo *objetivo* del usuario. Esto es distinto: tests unitarios de la herramienta misma (`firewall_proxy.py`, `jira_client.py`, `sonar_client.py`, `cache_utils.py`, `judge_agent.py`) — funciones puras y deterministas, sin pegarle a Jira/Sonar/Neo4j reales (se mockea con `unittest.mock` donde hace falta).
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
+```
+
 ## 8. Auditoría y métricas de colaboración
 
 ```bash
@@ -141,6 +152,8 @@ cat logs/falco_alerts.jsonl       # alertas persistidas
 ```
 
 **En Windows/Docker Desktop**: Falco necesita que el kernel de la VM WSL2 soporte su probe moderno de eBPF (`--modern-bpf`) — si el contenedor no arranca o no genera eventos, es una limitación de correr Falco fuera de un host Linux nativo, no de esta PoC. Si te da problemas, podés comentar el servicio `falco` en `docker-compose.yml` sin afectar al resto del pipeline.
+
+**Las alertas se correlacionan con cada corrida, no quedan solo en el archivo**: al final de cada corrida (`run_poc_loop.sh`/`orchestration.py`), `scripts/check_falco_alerts.py` filtra `logs/falco_alerts.jsonl` por la ventana de tiempo de esa corrida (desde que el firewall aprobó hasta el final). Si encuentra algo, lo deja como comentario en el ticket de Jira y, si seteaste `FALCO_ALERT_WEBHOOK_URL` (formato compatible con un incoming webhook de Slack), también lo postea ahí. Es puramente informativo — nunca bloquea la corrida por su cuenta, a diferencia del testing agent o el juez.
 
 ## 11. Agente juez (segunda opinión, con acceso real a MCP y poder de bloqueo)
 
