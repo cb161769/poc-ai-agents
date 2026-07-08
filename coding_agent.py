@@ -1,0 +1,534 @@
+"""Real local coding agent -- Camino B1 of run_poc_loop.sh/orchestration.py.
+
+Unlike `gh copilot suggest` (Camino B2, a one-shot suggestion with no memory
+or reasoning loop), this is an actual multi-turn agent: it reads/writes
+files, lists directories, greps the codebase, runs shell commands, and can
+query the same MCP tools the judge has (Neo4j-cypher, Qdrant-rag) -- all
+confined to the target repo it was handed, already checked out on a fresh
+branch by the caller (never the base branch).
+
+Every write_file/run_shell_command call requires human confirmation before
+it happens (printed + input() prompt) -- this agent has real reasoning but
+never acts unsupervised, same safety spirit gh copilot suggest already had.
+
+Uses the same dual backend as judge_agent.py (agent_loop.py): Anthropic API
+first, local Ollama as a free/offline fallback. The caller (run_poc_loop.sh/
+orchestration.py) only invokes this when a backend is actually reachable --
+falls back to gh copilot suggest otherwise.
+
+Reads its payload from a JSON FILE passed as the first CLI argument (not
+stdin -- stdin has to stay free for the interactive confirmations). All
+narration and confirmation prompts go to stderr; stdout carries ONLY the
+final JSON result, so the caller can capture stdout for the structured
+result while the user still sees (and answers) confirmations live on the
+terminal.
+
+Usage: python3 coding_agent.py <payload.json>
+  payload.json: {"ticket_id": "...", "sanitized_prompt": "...", "target_repo_dir": "..."}
+
+Prints to stdout: {"status": "done"|"blocked", "summary": "...",
+  "files_changed": [...], "_meta": {backend, latency_seconds, tokens, cost}}
+Every call is appended to logs/coding_agent_runs.jsonl.
+"""
+import asyncio
+import difflib
+import json
+import os
+import subprocess
+import sys
+import time
+from contextlib import AsyncExitStack
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+from mcp import StdioServerParameters
+
+from agent_loop import (
+    ANTHROPIC_MODEL,
+    _call_mcp_tool,
+    _call_model_turn,
+    _connect_mcp_servers,
+    _estimate_cost_usd,
+    _final_text_with_json_retry,
+    _mcp_tools_to_anthropic_format,
+    _select_backend,
+)
+
+load_dotenv()
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
+
+MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "15"))
+
+# Limites defensivos de las tools locales: un archivo/salida/listado gigante
+# no debe reventar el contexto del modelo ni colgar el loop.
+_MAX_READ_BYTES = 200_000
+_MAX_GREP_FILE_BYTES = 2_000_000
+_MAX_GREP_FILES_SCANNED = 5_000
+_MAX_LIST_ENTRIES = 500
+_MAX_SHELL_OUTPUT_CHARS = 10_000
+
+# Variables de entorno que nunca deben llegar a un comando de shell que
+# corre el agente -- el proceso de coding_agent.py las tiene cargadas
+# (load_dotenv()) para hablarle a Jira/Sonar/Figma/etc, pero un comando
+# como "env" o un script de debug no deberia poder filtrarlas.
+_SENSITIVE_ENV_VARS = {
+    "ANTHROPIC_API_KEY",
+    "JIRA_API_TOKEN",
+    "AZURE_DEVOPS_PAT",
+    "SONAR_TOKEN",
+    "SONAR_NEW_ADMIN_PASSWORD",
+    "FIGMA_API_TOKEN",
+    "FIREWALL_API_KEY",
+    "NEO4J_PASSWORD",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+}
+
+
+def _sanitized_subprocess_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in _SENSITIVE_ENV_VARS}
+
+VERIFY_BEFORE_DONE_MESSAGE = (
+    "Antes de terminar, corré un comando de verificacion real (tests, build, o lint del proyecto) "
+    "con run_shell_command y contame el resultado en el summary."
+)
+
+CODING_AGENT_SYSTEM_PROMPT = """Sos un agente de codigo real, trabajando sobre un repositorio git real que \
+ya esta parado en una rama nueva (nunca la rama base) creada especificamente para este cambio.
+
+Tenes herramientas reales: leer archivos, listar directorios, buscar texto/patrones en el codigo, \
+escribir archivos, y correr comandos de shell -- todas confinadas a este repo, nunca fuera de el. \
+Tambien tenes acceso al grafo de dependencias (Neo4j) y a codigo/historico indexado (Qdrant) si estan \
+disponibles, para verificar el impacto real de tu cambio antes de aplicarlo.
+
+REGLA OBLIGATORIA: no podes usar write_file ni run_shell_command hasta haber usado al menos una vez \
+read_file, list_directory, o grep_search en esta corrida -- si lo intentas antes, la herramienta va a \
+rechazar el llamado y vas a perder un turno. Investiga primero, siempre.
+
+Cada escritura de archivo y cada comando de shell tambien requieren confirmacion humana antes de \
+ejecutarse -- si el usuario rechaza uno, no insistas con el mismo cambio, ajusta tu plan.
+
+Hace el cambio MAS CHICO Y SEGURO que resuelva el ticket. No inventes archivos ni asumas estructura que \
+no verificaste -- si justificas un cambio citando el codigo existente, citalo con ruta:linea real, no de memoria.
+
+Antes de declararte "done", corré algo que verifique tu cambio de verdad con run_shell_command (los tests \
+del proyecto si existen, o al menos una compilacion/lint) -- terminar sin haber corrido nada es aceptable \
+solo si genuinamente no hay como verificar (explicalo en el summary si es el caso).
+
+Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
+objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \
+"summary": "que hiciste, que verificaste, o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...]}"""
+
+MCP_SERVERS = {
+    "neo4j-cypher": StdioServerParameters(
+        command="uvx",
+        args=["mcp-neo4j-cypher"],
+        env={
+            "NEO4J_URI": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
+            "NEO4J_USERNAME": os.environ.get("NEO4J_USERNAME", "neo4j"),
+            "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", "test_password_local"),
+        },
+    ),
+    "qdrant-rag": StdioServerParameters(
+        command="uvx",
+        args=["mcp-server-qdrant"],
+        env={
+            "QDRANT_URL": os.environ.get("QDRANT_URL", "http://localhost:6333"),
+            "COLLECTION_NAME": "sample_repo_code",
+            "EMBEDDING_MODEL": "sentence-transformers/all-MiniLM-L6-v2",
+        },
+    ),
+}
+
+_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+
+
+def _safe_path(target_repo_dir: str, relative_path: str) -> Path:
+    """Resolves relative_path against target_repo_dir and REJECTS any
+    attempt to escape the repo root (../.. traversal, absolute paths
+    outside the repo) -- the model's tool calls are untrusted input.
+    """
+    root = Path(target_repo_dir).resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise ValueError(f"ruta fuera del repo objetivo, rechazada: {relative_path}")
+    return candidate
+
+
+def _is_inside_git_dir(full_path: Path, target_repo_dir: str) -> bool:
+    """write_file nunca debe poder tocar .git/ -- un hook, el config, o los
+    refs modificados por el modelo podrian comprometer el repo entero, no
+    solo el cambio que se supone que esta haciendo.
+    """
+    git_dir = (Path(target_repo_dir).resolve() / ".git").resolve()
+    try:
+        full_path.relative_to(git_dir)
+        return True
+    except ValueError:
+        return False
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... (truncado, {len(text) - limit} caracteres omitidos)"
+
+
+def tool_read_file(target_repo_dir: str, path: str) -> str:
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not full_path.exists():
+        return f"error: no existe {path}"
+    if not full_path.is_file():
+        return f"error: {path} no es un archivo"
+    try:
+        size = full_path.stat().st_size
+    except OSError as exc:
+        return f"error leyendo {path}: {exc}"
+    if size > _MAX_READ_BYTES:
+        return (
+            f"error: {path} es demasiado grande ({size} bytes, limite {_MAX_READ_BYTES}) -- "
+            "usa grep_search para buscar partes especificas en vez de leerlo entero"
+        )
+    try:
+        return full_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"error leyendo {path}: {exc}"
+
+
+def tool_list_directory(target_repo_dir: str, path: str = ".") -> str:
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not full_path.is_dir():
+        return f"error: {path} no es un directorio"
+    entries = sorted(p.name + ("/" if p.is_dir() else "") for p in full_path.iterdir() if p.name not in _SKIP_DIRS)
+    if not entries:
+        return "(directorio vacio)"
+    if len(entries) > _MAX_LIST_ENTRIES:
+        shown = entries[:_MAX_LIST_ENTRIES]
+        return "\n".join(shown) + f"\n... ({len(entries) - _MAX_LIST_ENTRIES} entradas mas, omitidas)"
+    return "\n".join(entries)
+
+
+def tool_grep_search(target_repo_dir: str, pattern: str, path: str = ".") -> str:
+    import re
+
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    try:
+        regex = re.compile(pattern)
+    except re.error as exc:
+        return f"error: patron invalido: {exc}"
+
+    matches = []
+    files_scanned = 0
+    for file_path in full_path.rglob("*"):
+        if not file_path.is_file() or any(part in _SKIP_DIRS for part in file_path.parts):
+            continue
+        try:
+            if file_path.stat().st_size > _MAX_GREP_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+
+        files_scanned += 1
+        if files_scanned > _MAX_GREP_FILES_SCANNED:
+            matches.append(f"... (se alcanzo el limite de {_MAX_GREP_FILES_SCANNED} archivos escaneados, resultado parcial)")
+            break
+
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                rel = file_path.relative_to(Path(target_repo_dir).resolve())
+                matches.append(f"{rel}:{lineno}: {line.strip()}")
+                if len(matches) >= 200:
+                    return "\n".join(matches) + "\n... (resultado truncado a 200 lineas)"
+    return "\n".join(matches) if matches else "(sin resultados)"
+
+
+def _confirm(prompt_text: str) -> bool:
+    print(prompt_text, file=sys.stderr)
+    answer = input().strip().lower()
+    return answer == "s"
+
+
+def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if _is_inside_git_dir(full_path, target_repo_dir):
+        return f"error: no se puede escribir dentro de .git/ ({path})"
+
+    if full_path.exists() and full_path.is_file():
+        try:
+            old_content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            old_content = ""
+        diff_lines = list(
+            difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=f"{path} (actual)",
+                tofile=f"{path} (nuevo)",
+            )
+        )
+        print(f"\nEl agente quiere modificar '{path}':", file=sys.stderr)
+        print("---", file=sys.stderr)
+        print("".join(diff_lines) if diff_lines else "(sin cambios de contenido)", file=sys.stderr)
+        print("---", file=sys.stderr)
+    else:
+        print(f"\nEl agente quiere crear '{path}':", file=sys.stderr)
+        print("---", file=sys.stderr)
+        print(content, file=sys.stderr)
+        print("---", file=sys.stderr)
+
+    if not _confirm("¿Aplicar este cambio? [s/n]: "):
+        return "el usuario rechazo este cambio, no se escribio nada"
+
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(content, encoding="utf-8")
+    return f"escrito ok: {path}"
+
+
+def tool_run_shell_command(target_repo_dir: str, command: str) -> str:
+    print(f"\nEl agente quiere correr en {target_repo_dir}:", file=sys.stderr)
+    print(f"  $ {command}", file=sys.stderr)
+    if not _confirm("¿Ejecutar este comando? [s/n]: "):
+        return "el usuario rechazo ejecutar este comando"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=target_repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_sanitized_subprocess_env(),
+        )
+        stdout = _truncate(result.stdout, _MAX_SHELL_OUTPUT_CHARS)
+        stderr = _truncate(result.stderr, _MAX_SHELL_OUTPUT_CHARS)
+        return f"exit_code={result.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    except subprocess.TimeoutExpired:
+        return "error: el comando supero el timeout de 120s"
+
+
+LOCAL_TOOLS = {
+    "read_file": {
+        "description": "Lee el contenido de un archivo dentro del repo objetivo.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "fn": tool_read_file,
+    },
+    "list_directory": {
+        "description": "Lista archivos y subdirectorios de una carpeta del repo objetivo.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []},
+        "fn": tool_list_directory,
+    },
+    "grep_search": {
+        "description": "Busca un patron (regex) en los archivos del repo objetivo, devuelve archivo:linea: contenido.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+            "required": ["pattern"],
+        },
+        "fn": tool_grep_search,
+    },
+    "write_file": {
+        "description": "Escribe (crea o sobreescribe) un archivo del repo objetivo. Requiere confirmacion humana.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["path", "content"],
+        },
+        "fn": tool_write_file,
+    },
+    "run_shell_command": {
+        "description": "Corre un comando de shell dentro del repo objetivo (tests, build, etc). Requiere confirmacion humana.",
+        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        "fn": tool_run_shell_command,
+    },
+}
+
+
+def _local_tools_to_anthropic_format() -> list:
+    return [
+        {"name": name, "description": spec["description"], "input_schema": spec["input_schema"]}
+        for name, spec in LOCAL_TOOLS.items()
+    ]
+
+
+def _build_user_prompt(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> str:
+    root_listing = tool_list_directory(target_repo_dir, ".")
+    return f"""Ticket: {ticket_id}
+Repo objetivo: {target_repo_dir}
+
+--- Contenido de la raiz del repo (ya listado, no hace falta pedirlo) ---
+{root_listing}
+
+{sanitized_prompt}"""
+
+
+async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
+    backend = _select_backend()
+    print(f"(coding agent: usando backend '{backend}')", file=sys.stderr)
+    if backend == "none":
+        return {"status": "blocked", "summary": "ni ANTHROPIC_API_KEY ni Ollama disponibles", "files_changed": [], "_meta": {}}
+
+    start_time = time.monotonic()
+    total_input_tokens = 0
+    total_output_tokens = 0
+    has_investigated = False
+    has_run_verification = False
+    verification_nudge_given = False
+
+    def _finalize(result: dict) -> dict:
+        result["self_verified"] = has_run_verification
+        result["_meta"] = {
+            "backend": backend,
+            "latency_seconds": round(time.monotonic() - start_time, 2),
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "estimated_cost_usd": (
+                round(_estimate_cost_usd(ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6)
+                if backend == "anthropic"
+                else 0.0
+            ),
+        }
+        return result
+
+    async with AsyncExitStack() as stack:
+        sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="coding agent")
+
+        tools = list(_local_tools_to_anthropic_format())
+        for name, session in sessions.items():
+            try:
+                listed = await session.list_tools()
+                tools.extend(_mcp_tools_to_anthropic_format(name, listed.tools))
+            except Exception as exc:
+                print(f"(coding agent: no se pudieron listar tools de '{name}': {exc})", file=sys.stderr)
+
+        messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
+
+        async with httpx.AsyncClient() as client:
+            for _ in range(MAX_TOOL_TURNS):
+                content, stop_reason, usage = await _call_model_turn(
+                    client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT
+                )
+                total_input_tokens += usage.get("input_tokens", 0)
+                total_output_tokens += usage.get("output_tokens", 0)
+                messages.append({"role": "assistant", "content": content})
+
+                if stop_reason != "tool_use":
+                    final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
+                    try:
+                        result = _extract_json(final_text)
+                    except json.JSONDecodeError:
+                        # Un solo reintento acotado antes de degradar a blocked.
+                        retry_text, retry_usage = await _final_text_with_json_retry(
+                            client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT
+                        )
+                        total_input_tokens += retry_usage.get("input_tokens", 0)
+                        total_output_tokens += retry_usage.get("output_tokens", 0)
+                        try:
+                            result = _extract_json(retry_text)
+                        except json.JSONDecodeError:
+                            return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
+
+                    if result.get("status") == "done" and not has_run_verification and not verification_nudge_given:
+                        # Un solo empujon -- si en el turno extra tampoco
+                        # verifica, se acepta igual (self_verified queda en
+                        # false, trazado en el log), no se bloquea infinito.
+                        verification_nudge_given = True
+                        messages.append({"role": "user", "content": VERIFY_BEFORE_DONE_MESSAGE})
+                        continue
+
+                    return _finalize(result)
+
+                tool_results = []
+                for block in content:
+                    if block.get("type") != "tool_use":
+                        continue
+                    name = block["name"]
+                    tool_input = block.get("input", {})
+                    try:
+                        if name in ("write_file", "run_shell_command") and not has_investigated:
+                            output = (
+                                "Todavia no investigaste el repo. Usa read_file, list_directory, o "
+                                "grep_search antes de escribir o ejecutar algo."
+                            )
+                        elif name in LOCAL_TOOLS:
+                            output = LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input)
+                            if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
+                                has_investigated = True
+                            if name == "run_shell_command":
+                                has_run_verification = True
+                        else:
+                            output = await _call_mcp_tool(sessions, name, tool_input)
+                    except Exception as exc:
+                        output = f"error llamando a la herramienta: {exc}"
+                    tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
+                messages.append({"role": "user", "content": tool_results})
+
+    return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
+
+
+def _extract_json(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
+def log_run(ticket_id: str, result: dict):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    meta = result.pop("_meta", {})
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ticket_id": ticket_id,
+        **result,
+        **meta,
+    }
+    with RUN_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "usage: coding_agent.py <payload.json>"}), file=sys.stderr)
+        sys.exit(1)
+
+    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    ticket_id = payload["ticket_id"]
+
+    try:
+        result = asyncio.run(run_coding_agent(ticket_id, payload["sanitized_prompt"], payload["target_repo_dir"]))
+    except KeyError as exc:
+        print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
+        sys.exit(1)
+    except (httpx.HTTPError, RuntimeError) as exc:
+        print(json.dumps({"error": "coding_agent_call_failed", "detail": str(exc)}), file=sys.stderr)
+        sys.exit(1)
+
+    log_run(ticket_id, dict(result))
+    print(json.dumps(result, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

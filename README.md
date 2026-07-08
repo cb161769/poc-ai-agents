@@ -72,13 +72,27 @@ El pipeline se niega a arrancar si no estás dentro de un repo git, o si el work
 ./scripts/check_prereqs.sh
 ```
 
+## 5.1. Smoke test end-to-end (opcional, recomendado tras cualquier cambio)
+
+`check_prereqs.sh` valida que los servicios estén arriba; esto va un paso más allá y corre el pipeline real de punta a punta, sin mocks:
+
+```bash
+./scripts/smoke_test.sh
+```
+
+Crea un **ticket Jira real y descartable** (etiquetado `smoke-test`, cerrado automáticamente al final), un **repo git temporal** limpio, y corre el `run_poc_loop.sh` real contra ambos — validando en serio la lectura de Jira, la consulta al grafo, los hallazgos de Sonar y la evaluación del firewall (con su comentario y transición reales en el ticket).
+
+**Qué NO cubre, a propósito**: la etapa 5 (coding agent) queda afuera — `gh copilot suggest` es una TUI interactiva que no se puede automatizar sin volverse frágil o mockear (algo que este proyecto evita), y el coding agent en la nube necesita un repo GitHub real y abre el PR de forma asíncrona. El ticket sintético se cierra automáticamente al terminar; si querés validar también la etapa 5, corré `./run_poc_loop.sh` a mano (sin `SMOKE_TEST_MODE`) con un ticket real propio.
+
 ## 6. Correr el flujo completo
 
 ```bash
-./run_poc_loop.sh
+./run_poc_loop.sh                # usa JIRA_TICKET_KEY de .env
+./run_poc_loop.sh JIRA-123       # o cualquier ticket real, pasado como argumento
+# equivalente con orchestration.py: python3 orchestration.py [JIRA-123]
 ```
 
-El escenario (limpio o malicioso) lo decide el **contenido real** del ticket de Jira en `JIRA_TICKET_KEY`, no un flag.
+El escenario (limpio o malicioso) lo decide el **contenido real** del ticket de Jira, no un flag — y no estás atado a un solo ticket fijo en `.env`: pasale cualquier ticket que le compartas a Copilot como primer argumento.
 
 **La detección del bug sigue siendo tuya**: nada acá monitorea microservicios en runtime. El script chequea si la descripción trae un bloque de código real (campo estructurado del ADF de Jira, no un regex adivinando palabras) — si pegaste el log como texto plano en vez de bloque de código, no cuenta como evidencia, y el script comenta en el ticket pidiéndolo bien formateado, mencionando el microservicio exacto — sin frenar la corrida.
 
@@ -86,15 +100,31 @@ Si el bug tiene un video/imagen adjunto y tu instancia tiene **Rovo** activo, el
 
 Apenas el firewall aprueba, el ticket se mueve automáticamente al estado que definas en `JIRA_IN_PROGRESS_STATUS` (default `"In Progress"`) — si tu workflow usa otro nombre, ajustalo en `.env`; si el nombre no matchea ninguna transición disponible, el script avisa pero sigue.
 
-**Importante — qué es y qué no es "el agente" acá:** las etapas 1-4 son orquestación determinística, no un agente. La etapa 5 tiene dos caminos:
+**Importante — qué es y qué no es "el agente" acá:** las etapas 1-4 son orquestación determinística, no un agente. La etapa 5 tiene tres caminos posibles:
 
-- **Con `GITHUB_REPO` configurado en `.env`** (recomendado si querés un agente de verdad): el script crea un Issue en tu repo real con todo el contexto ya armado y lo asigna al **GitHub Copilot coding agent**, que corre en la nube de GitHub con su propio razonamiento y abre un PR cuando termina. Requiere Copilot coding agent habilitado en ese repo (plan Business/Enterprise) y que ya tenga un remote real (`git push`). El agente en la nube **no** tiene acceso a tu Neo4j/Qdrant locales — por eso el impacto del grafo y los hallazgos de Sonar viajan como texto ya calculado dentro del Issue, no se consultan en vivo desde la nube.
-- **Sin `GITHUB_REPO`** (fallback): invoca `gh copilot suggest` sobre el prompt saneado. Pide **confirmación antes de ejecutar cualquier comando** — nunca se ejecuta nada a ciegas. Si aceptás y el comando modifica archivos, el script los commitea en una rama nueva `copilot/<ticket>-<timestamp>` dentro del repo real detectado en el paso 4, **nunca en la rama que tenías checked out**. Esto es una sugerencia puntual, no un agente autónomo.
+- **A — Con `GITHUB_REPO` configurado en `.env`**: el script crea un Issue en tu repo real con todo el contexto ya armado y lo asigna al **GitHub Copilot coding agent**, que corre en la nube de GitHub con su propio razonamiento y abre un PR cuando termina. Requiere Copilot coding agent habilitado en ese repo (plan Business/Enterprise) y que ya tenga un remote real (`git push`). El agente en la nube **no** tiene acceso a tu Neo4j/Qdrant locales — por eso el impacto del grafo y los hallazgos de Sonar viajan como texto ya calculado dentro del Issue, no se consultan en vivo desde la nube.
+- **B1 — Sin `GITHUB_REPO`, con `ANTHROPIC_API_KEY` u Ollama alcanzable**: `coding_agent.py`, un **agente real local** — mismo backend dual (Anthropic primero, Ollama de fallback) y la misma maquinaria de tool-calling que ya usa el agente juez (`agent_loop.py`). Razona en varios turnos, con herramientas reales confinadas al repo objetivo: leer/escribir/listar archivos, buscar texto (`grep`), correr comandos de shell, y los mismos MCP del juez (Neo4j-cypher, Qdrant-rag) para consultar el grafo/código histórico por su cuenta. **Cada escritura de archivo y cada comando piden confirmación humana antes de ejecutarse** — se ven y se responden en vivo en la terminal (`[s/n]`), nunca actúa sin supervisión.
+- **B2 — Sin `GITHUB_REPO` y sin ningún backend de modelo**: cae a `gh copilot suggest` sobre el prompt saneado — una sugerencia de un solo tiro, sin memoria ni loop, con la misma confirmación antes de ejecutar. Es el fallback de siempre, para quien no tiene `ANTHROPIC_API_KEY` ni Ollama corriendo.
+
+En B1 y B2, el resultado (si hay cambios) se commitea en una rama nueva `copilot/<ticket>-<timestamp>` dentro del repo real detectado en el paso 4, **nunca en la rama que tenías checked out**.
 
 ```bash
-# revisar el resultado del camino B (fallback local), desde el repo real:
+# revisar el resultado del camino B (B1 o B2), desde el repo real:
 git diff <rama-base-real>..copilot/<rama-que-te-haya-mostrado-el-script>
 ```
+
+## 6.1. Trabajar con épicas
+
+```bash
+./run_poc_loop.sh --epic EPIC-123
+# equivalente: python3 orchestration.py --epic EPIC-123
+```
+
+En vez de un ticket individual, trae la **épica completa + todas sus historias hijas** (vía JQL — por default `parent = "{epic_key}"`, el campo estándar en proyectos "team-managed"; si tu proyecto es "company-managed" y todavía usa el campo custom `Epic Link`, ajustá `JIRA_EPIC_LINK_JQL` en `.env`) y arma **un solo prompt combinado** — Copilot ve el contexto completo de la épica y coordina los cambios entre componentes, en vez de procesar cada historia por separado.
+
+**Solo funciona si todos los componentes que tocan los hijos de la épica viven en el mismo repo.** El pipeline está construido alrededor de un repo por corrida (`TARGET_REPO_DIR`) — si los hijos tocan componentes que en realidad viven en repos distintos, no hay forma honesta de resolverlo en una sola corrida, así que **se niega a trabajar** en vez de intentarlo a medias. Para poder confirmar esto, cada nodo del grafo de Neo4j necesita la propiedad `repo_url` seteada (ver `seed/seed.cypher` y `prompts/sync_graph_from_azure_devops.md`) — sin ese dato en cualquiera de los componentes involucrados, también rechaza la corrida (nunca asume que es el mismo repo sin poder confirmarlo). Cuando rechaza, deja un comentario claro en la épica explicando el conflicto (o el dato faltante) antes de terminar.
+
+Si todo coincide, sigue el mismo flujo que un ticket normal (firewall → coding agent → testing agent → juez → Falco) usando la épica como `TICKET_ID` (ramas/commits quedan como `copilot/EPIC-123-<timestamp>`), y al final deja un comentario en cada historia hija señalando que se procesó como parte de esa corrida combinada.
 
 ## 7. Romper el flujo a propósito
 

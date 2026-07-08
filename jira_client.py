@@ -152,14 +152,31 @@ def _fetch_rovo_attachment_context(jira_url: str, headers: dict, ticket_key: str
     }
 
 
-def fetch_ticket_live() -> dict:
-    jira_url = os.environ["JIRA_URL"].rstrip("/")
+def _resolve_repository_origen(fields: dict) -> str | None:
+    """Prefer the native Components field (what it's actually for); fall
+    back to labels for tickets/projects that only use those. Shared by
+    fetch_ticket_live() and fetch_epic_with_children() so both resolve
+    repository_origen the exact same way.
+    """
+    labels = fields.get("labels", []) or []
+    components = [c.get("name") for c in (fields.get("components") or []) if c.get("name")]
+    return (
+        next((c for c in components if c in KNOWN_REPOS), None)
+        or next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
+    )
+
+
+def _auth_headers() -> dict:
     email = os.environ["JIRA_EMAIL"]
     token = os.environ["JIRA_API_TOKEN"]
-    ticket_key = os.environ["JIRA_TICKET_KEY"]
-
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
-    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+    return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+
+
+def fetch_ticket_live() -> dict:
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    ticket_key = os.environ["JIRA_TICKET_KEY"]
+    headers = _auth_headers()
 
     resp = httpx.get(
         f"{jira_url}/rest/api/3/issue/{ticket_key}",
@@ -171,14 +188,6 @@ def fetch_ticket_live() -> dict:
     issue = resp.json()
 
     fields = issue.get("fields", {})
-    labels = fields.get("labels", []) or []
-    components = [c.get("name") for c in (fields.get("components") or []) if c.get("name")]
-    # Prefer the native Components field (what it's actually for); fall back
-    # to labels for tickets/projects that only use those.
-    repository_origen = (
-        next((c for c in components if c in KNOWN_REPOS), None)
-        or next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
-    )
     attachment_info = _fetch_rovo_attachment_context(jira_url, headers, ticket_key, fields.get("attachment", []) or [])
     description_text = _adf_to_text(fields.get("description")).strip()
 
@@ -186,14 +195,68 @@ def fetch_ticket_live() -> dict:
         "ticket_id": issue.get("key"),
         "summary": fields.get("summary", ""),
         "description": description_text,
-        "labels": labels,
-        "components": components,
-        "repository_origen": repository_origen,
+        "labels": fields.get("labels", []) or [],
+        "components": [c.get("name") for c in (fields.get("components") or []) if c.get("name")],
+        "repository_origen": _resolve_repository_origen(fields),
         "status": (fields.get("status") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
         "figma_link": _extract_figma_link(description_text),
         **attachment_info,
     }
+
+
+def fetch_epic_with_children(epic_key: str) -> dict:
+    """Fetches an Epic and its child issues, each with repository_origen
+    already resolved -- used by --epic mode (run_poc_loop.sh/orchestration.py)
+    to build one combined prompt instead of processing children one by one.
+
+    Children are looked up via JQL, not the attachment/Rovo machinery of
+    fetch_ticket_live() (that's N extra HTTP round-trips for what's meant to
+    be a lightweight list) -- just summary/description/repository_origen.
+
+    JQL default targets team-managed projects (the "parent" field). Override
+    JIRA_EPIC_LINK_JQL in .env (a template with {epic_key}) for
+    company-managed projects still using the custom "Epic Link" field.
+    """
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    headers = _auth_headers()
+
+    epic_resp = httpx.get(
+        f"{jira_url}/rest/api/3/issue/{epic_key}",
+        headers=headers,
+        params={"fields": "summary,description,labels,status,components"},
+        timeout=15.0,
+    )
+    epic_resp.raise_for_status()
+    epic_issue = epic_resp.json()
+    epic_fields = epic_issue.get("fields", {})
+    epic = {
+        "ticket_id": epic_issue.get("key"),
+        "summary": epic_fields.get("summary", ""),
+        "description": _adf_to_text(epic_fields.get("description")).strip(),
+        "repository_origen": _resolve_repository_origen(epic_fields),
+    }
+
+    jql_template = os.environ.get("JIRA_EPIC_LINK_JQL", 'parent = "{epic_key}"')
+    jql = jql_template.format(epic_key=epic_key)
+    search_resp = httpx.get(
+        f"{jira_url}/rest/api/3/search",
+        headers=headers,
+        params={"jql": jql, "fields": "summary,description,labels,components"},
+        timeout=15.0,
+    )
+    search_resp.raise_for_status()
+    children = [
+        {
+            "ticket_id": issue.get("key"),
+            "summary": issue.get("fields", {}).get("summary", ""),
+            "description": _adf_to_text(issue.get("fields", {}).get("description")).strip(),
+            "repository_origen": _resolve_repository_origen(issue.get("fields", {})),
+        }
+        for issue in search_resp.json().get("issues", [])
+    ]
+
+    return {"epic": epic, "children": children}
 
 
 def get_ticket() -> dict:
@@ -203,6 +266,60 @@ def get_ticket() -> dict:
         params={"ticket_key": ticket_key, "jira_url": os.environ.get("JIRA_URL", "")},
         fetch_fn=fetch_ticket_live,
     )
+
+
+def _build_smoke_ticket_payload(component: str) -> dict:
+    """Body for POST /rest/api/3/issue used by scripts/smoke_test.sh to
+    create a real, disposable Jira ticket per run. Uses the labels-fallback
+    resolution path for repository_origen (not the native Components field)
+    because that requires the named Component to already be configured in
+    the Jira project's Settings, which a smoke test can't safely assume.
+    The description carries a real codeBlock node (exercises
+    has_log_evidence) with synthetic, boring text -- no jailbreak patterns,
+    no secrets, this is meant to sail cleanly through the firewall so the
+    smoke test validates the happy path.
+    """
+    issue_type = os.environ.get("JIRA_SMOKE_TEST_ISSUE_TYPE", "Task")
+    return {
+        "fields": {
+            "project": {"key": os.environ["JIRA_PROJECT_KEY"]},
+            "issuetype": {"name": issue_type},
+            "summary": f"[smoke-test] Validacion automatizada del pipeline ({component})",
+            "labels": ["smoke-test", component],
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Ticket generado automaticamente por scripts/smoke_test.sh."}],
+                    },
+                    {
+                        "type": "codeBlock",
+                        "content": [{"type": "text", "text": "SmokeTestException: synthetic stack trace for has_log_evidence"}],
+                    },
+                ],
+            },
+        }
+    }
+
+
+def create_smoke_ticket(component: str) -> str:
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    email = os.environ["JIRA_EMAIL"]
+    token = os.environ["JIRA_API_TOKEN"]
+
+    auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
+
+    resp = httpx.post(
+        f"{jira_url}/rest/api/3/issue",
+        headers=headers,
+        json=_build_smoke_ticket_payload(component),
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["key"]
 
 
 def post_audit_comment(ticket_key: str, text: str) -> dict:
@@ -281,6 +398,24 @@ def transition_ticket(ticket_key: str, target_status_name: str) -> dict:
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "fetch-epic":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "usage: jira_client.py fetch-epic <EPIC_KEY>"}), file=sys.stderr)
+            sys.exit(1)
+        try:
+            result = fetch_epic_with_children(sys.argv[2])
+        except KeyError as exc:
+            print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
+            sys.exit(1)
+        except httpx.HTTPStatusError as exc:
+            print(
+                json.dumps({"error": "jira_http_error", "status_code": exc.response.status_code, "body": exc.response.text}),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
     if len(sys.argv) >= 2 and sys.argv[1] == "comment":
         if len(sys.argv) < 3:
             print(json.dumps({"error": "usage: jira_client.py comment \"<texto>\""}), file=sys.stderr)
@@ -298,6 +433,24 @@ def main():
             )
             sys.exit(1)
         print(json.dumps({"comment_id": result.get("id"), "ticket_id": ticket_key}, ensure_ascii=False))
+        return
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "create-smoke-ticket":
+        if len(sys.argv) < 3:
+            print(json.dumps({"error": "usage: jira_client.py create-smoke-ticket <component>"}), file=sys.stderr)
+            sys.exit(1)
+        try:
+            ticket_id = create_smoke_ticket(sys.argv[2])
+        except KeyError as exc:
+            print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
+            sys.exit(1)
+        except httpx.HTTPStatusError as exc:
+            print(
+                json.dumps({"error": "jira_http_error", "status_code": exc.response.status_code, "body": exc.response.text}),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(json.dumps({"ticket_id": ticket_id}, ensure_ascii=False))
         return
 
     if len(sys.argv) >= 2 and sys.argv[1] == "transition":

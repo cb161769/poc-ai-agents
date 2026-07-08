@@ -49,9 +49,20 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp import StdioServerParameters
 
+from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_to_blocks/_estimate_cost_usd
+    ANTHROPIC_MODEL,       # re-exported so existing imports/tests of judge_agent keep working
+    _call_mcp_tool,
+    _call_model_turn,
+    _connect_mcp_servers,
+    _estimate_cost_usd,
+    _final_text_with_json_retry,
+    _messages_to_ollama,
+    _mcp_tools_to_anthropic_format,
+    _ollama_response_to_blocks,
+    _select_backend,
+)
 from firewall_proxy import _redact
 
 load_dotenv()
@@ -59,10 +70,6 @@ load_dotenv()
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 VERDICT_LOG = LOG_DIR / "judge_verdicts.jsonl"
 
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 MAX_TOOL_TURNS = 6
 
 JUDGE_SYSTEM_PROMPT = """Sos un revisor de seguridad y calidad, independiente y escéptico, \
@@ -73,7 +80,10 @@ Tenés acceso a herramientas reales sobre el grafo de dependencias (Neo4j) y \
 sobre código/histórico indexado (Qdrant) — usalas para VERIFICAR las afirmaciones \
 del contexto que te dan, no des por cierto lo que dice el texto sin chequearlo \
 cuando tengas dudas razonables. Por ejemplo: si el contexto dice que un cambio \
-en un servicio no afecta a otros, consultá el grafo vos mismo antes de confiarlo.
+en un servicio no afecta a otros, consultá el grafo vos mismo antes de confiarlo. \
+Cuando SÍ uses una herramienta, citá en tu "reasoning" el resultado concreto que \
+obtuviste (qué devolvió el grafo, qué encontraste en Qdrant) — no alcanza con decir \
+"verifiqué el grafo", decí qué viste ahí exactamente.
 
 Evaluás tres cosas: (1) si la decisión del firewall (APPROVED/REJECTED) fue \
 correcta dado el contexto real del ticket, (2) si el cambio de código \
@@ -120,40 +130,6 @@ def _extract_json(text: str) -> dict:
     return json.loads(text.strip())
 
 
-async def _connect_mcp_servers(stack: AsyncExitStack) -> dict:
-    """Best-effort: a server that's unreachable (uvx missing, Neo4j/Qdrant
-    down) is skipped, not fatal — the judge just has fewer tools that run.
-    """
-    sessions = {}
-    for name, params in MCP_SERVERS.items():
-        try:
-            read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-            sessions[name] = session
-        except Exception as exc:
-            print(f"(juez: no se pudo conectar al MCP '{name}', se omite: {exc})", file=sys.stderr)
-    return sessions
-
-
-def _mcp_tools_to_anthropic_format(server_name: str, tools) -> list:
-    return [
-        {
-            "name": f"{server_name}__{t.name}",
-            "description": t.description or "",
-            "input_schema": t.inputSchema,
-        }
-        for t in tools
-    ]
-
-
-async def _call_mcp_tool(sessions: dict, qualified_name: str, tool_input: dict) -> str:
-    server_name, tool_name = qualified_name.split("__", 1)
-    session = sessions[server_name]
-    result = await session.call_tool(tool_name, tool_input)
-    return "\n".join(getattr(c, "text", str(c)) for c in result.content)
-
-
 def _build_user_prompt(payload: dict) -> str:
     return f"""Ticket: {payload['ticket'].get('ticket_id')} — {payload['ticket'].get('summary')}
 Descripcion: {payload['ticket'].get('description')}
@@ -173,147 +149,6 @@ vos — si llego a esta etapa es porque paso, pero fijate si el alcance de los \
 tests es suficiente para el cambio real, no asumas que "paso" significa \
 "esta bien probado"):
 {payload.get('test_summary', 'sin tests corridos para esta corrida')}"""
-
-
-def _select_backend() -> str:
-    """Anthropic first (best quality); local Ollama as a free/offline
-    fallback if reachable; otherwise the judge is skipped entirely — the
-    same behavior as before this got a fallback.
-    """
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    try:
-        httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
-        return "ollama"
-    except httpx.HTTPError:
-        return "none"
-
-
-def _tools_to_ollama_format(tools: list) -> list:
-    return [
-        {
-            "type": "function",
-            "function": {"name": t["name"], "description": t["description"], "parameters": t["input_schema"]},
-        }
-        for t in tools
-    ]
-
-
-def _messages_to_ollama(messages: list) -> list:
-    """Flattens our Anthropic-shaped message history (content = string, or a
-    list of text/tool_use/tool_result blocks) into Ollama's chat format.
-    """
-    out = []
-    for m in messages:
-        content = m["content"]
-        if isinstance(content, str):
-            out.append({"role": m["role"], "content": content})
-            continue
-
-        if m["role"] == "assistant":
-            text_parts = [b["text"] for b in content if b.get("type") == "text"]
-            tool_calls = [
-                {"function": {"name": b["name"], "arguments": b.get("input", {})}}
-                for b in content
-                if b.get("type") == "tool_use"
-            ]
-            msg = {"role": "assistant", "content": "\n".join(text_parts)}
-            if tool_calls:
-                msg["tool_calls"] = tool_calls
-            out.append(msg)
-        else:
-            for b in content:
-                out.append({"role": "tool", "content": b.get("content", "")})
-    return out
-
-
-def _ollama_response_to_blocks(message: dict) -> tuple:
-    blocks = []
-    text = message.get("content") or ""
-    if text:
-        blocks.append({"type": "text", "text": text})
-
-    tool_calls = message.get("tool_calls") or []
-    for i, tc in enumerate(tool_calls):
-        fn = tc.get("function", {})
-        arguments = fn.get("arguments", {})
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError:
-                arguments = {}
-        blocks.append({"type": "tool_use", "id": f"ollama_call_{i}", "name": fn.get("name"), "input": arguments})
-
-    stop_reason = "tool_use" if tool_calls else "end_turn"
-    return blocks, stop_reason
-
-
-# Precios aproximados por millon de tokens (USD) — solo para tener una
-# estimacion de costo en los evals/logs, no son precios contractuales.
-# Ajustar si cambian o si se usa otro modelo.
-ANTHROPIC_PRICING_PER_MILLION = {
-    "claude-sonnet-5": {"input": 3.0, "output": 15.0},
-    "claude-opus-4-8": {"input": 15.0, "output": 75.0},
-    "claude-haiku-4-5-20251001": {"input": 0.8, "output": 4.0},
-}
-
-
-def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    pricing = ANTHROPIC_PRICING_PER_MILLION.get(model)
-    if not pricing:
-        return 0.0
-    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
-
-
-async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: list, tools: list) -> tuple:
-    """Returns (content_blocks, stop_reason, usage) normalized to the
-    Anthropic content-block shape regardless of which backend answered.
-    usage = {"input_tokens": int, "output_tokens": int} (0s for Ollama,
-    which is free/local so cost tracking doesn't apply the same way).
-    """
-    if backend == "anthropic":
-        request_body = {
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": 1536,
-            "system": JUDGE_SYSTEM_PROMPT,
-            "messages": messages,
-        }
-        if tools:
-            request_body["tools"] = tools
-
-        resp = await client.post(
-            ANTHROPIC_API_URL,
-            headers={
-                "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=request_body,
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        usage = data.get("usage", {})
-        return (
-            data["content"],
-            data.get("stop_reason", "end_turn"),
-            {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0)},
-        )
-
-    if backend == "ollama":
-        ollama_messages = [{"role": "system", "content": JUDGE_SYSTEM_PROMPT}] + _messages_to_ollama(messages)
-        request_body = {"model": OLLAMA_MODEL, "messages": ollama_messages, "stream": False}
-        if tools:
-            request_body["tools"] = _tools_to_ollama_format(tools)
-
-        resp = await client.post(f"{OLLAMA_URL}/api/chat", json=request_body, timeout=120.0)
-        resp.raise_for_status()
-        data = resp.json()
-        blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}))
-        usage = {"input_tokens": data.get("prompt_eval_count", 0), "output_tokens": data.get("eval_count", 0)}
-        return blocks, stop_reason, usage
-
-    raise RuntimeError("ni ANTHROPIC_API_KEY ni un Ollama local disponible — el juez no puede correr")
 
 
 async def judge_with_tools(payload: dict) -> dict:
@@ -339,7 +174,7 @@ async def judge_with_tools(payload: dict) -> dict:
         return verdict
 
     async with AsyncExitStack() as stack:
-        sessions = await _connect_mcp_servers(stack)
+        sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="juez")
 
         tools = []
         for name, session in sessions.items():
@@ -353,14 +188,25 @@ async def judge_with_tools(payload: dict) -> dict:
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage = await _call_model_turn(client, backend, messages, tools)
+                content, stop_reason, usage = await _call_model_turn(client, backend, messages, tools, JUDGE_SYSTEM_PROMPT)
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
                 messages.append({"role": "assistant", "content": content})
 
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
-                    return _finalize(_extract_json(final_text))
+                    try:
+                        return _finalize(_extract_json(final_text))
+                    except json.JSONDecodeError:
+                        # Un solo reintento acotado -- si el modelo tampoco
+                        # devuelve JSON valido esta vez, se deja propagar y
+                        # main() lo maneja como error, sin loop infinito.
+                        retry_text, retry_usage = await _final_text_with_json_retry(
+                            client, backend, messages, tools, JUDGE_SYSTEM_PROMPT
+                        )
+                        total_input_tokens += retry_usage.get("input_tokens", 0)
+                        total_output_tokens += retry_usage.get("output_tokens", 0)
+                        return _finalize(_extract_json(retry_text))
 
                 tool_results = []
                 for block in content:

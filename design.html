@@ -682,10 +682,19 @@
       </div>
       <div class="connector"></div>
       <div class="stage" style="--stage-color:var(--violet)">
-        <div class="stage-num">05b</div>
+        <div class="stage-num">05b1</div>
+        <div class="stage-card">
+          <div class="stage-title">Agente local real: coding_agent.py</div>
+          <div class="stage-desc">Sin GITHUB_REPO, con backend (Anthropic/Ollama) disponible: agente real con loop de tool-calling (agent_loop.py, compartido con el juez) — lee/escribe/lista/busca en el repo y consulta los MCP del juez. Confirmación humana antes de cada escritura/comando; si aplica, commitea en una rama nueva.</div>
+          <div class="stage-io"><b>out</b> copilot_contribution.jsonl · logs/coding_agent_runs.jsonl</div>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage" style="--stage-color:var(--violet)">
+        <div class="stage-num">05b2</div>
         <div class="stage-card">
           <div class="stage-title">Fallback: gh copilot suggest</div>
-          <div class="stage-desc">Sin GITHUB_REPO: sugerencia de un solo tiro, no un agente. Confirmación humana antes de ejecutar; si aplica, commitea en una rama nueva del repo real detectado (donde el usuario está parado), nunca en la rama base original.</div>
+          <div class="stage-desc">Sin GITHUB_REPO ni backend de modelo disponible: sugerencia de un solo tiro, no un agente. Confirmación humana antes de ejecutar; si aplica, commitea en una rama nueva del repo real detectado (donde el usuario está parado), nunca en la rama base original.</div>
           <div class="stage-io"><b>out</b> copilot_contribution.jsonl · <b>POST</b> /issue/:key/comment</div>
         </div>
       </div>
@@ -694,7 +703,7 @@
         <div class="stage-num">06</div>
         <div class="stage-card">
           <div class="stage-title">Testing agent (gate real)</div>
-          <div class="stage-desc">Solo camino 05b con diff aplicado: auto-detecta el stack por archivo de proyecto (pom.xml/*.csproj/go.mod/Gemfile/Cargo.toml/package.json) y corre el test suite real en contenedor descartable — cubre .NET, NestJS, Angular, Ionic, Expo, React Native, Go, Ruby, Rust, Java, Python sin tocar el script. Determinístico, no un LLM. Si falla: bloquea ahí mismo, el juez ni se llama.</div>
+          <div class="stage-desc">Solo caminos 05b1/05b2 con diff aplicado: auto-detecta el stack por archivo de proyecto (pom.xml/*.csproj/go.mod/Gemfile/Cargo.toml/package.json) y corre el test suite real en contenedor descartable — cubre .NET, NestJS, Angular, Ionic, Expo, React Native, Go, Ruby, Rust, Java, Python sin tocar el script. Determinístico, no un LLM. Si falla: bloquea ahí mismo, el juez ni se llama.</div>
           <div class="stage-io"><b>run</b> run_module_tests.sh (auto-detección)</div>
         </div>
       </div>
@@ -843,6 +852,9 @@
         <li><span class="n">＋</span><span class="t"><b>Gate de Docker alineado entre bash y Prefect</b> — orchestration.py omite el testing agent con gracia si Docker no está en el host, igual que run_poc_loop.sh, en vez de fallar la corrida entera.</span></li>
         <li><span class="n">＋</span><span class="t"><b>repository_origen resuelto de forma inteligente</b> — prioriza el campo nativo Components de Jira (fallback a labels), y el set de componentes conocidos se deriva de los nombres de nodo reales en Neo4j en cada corrida, no de una lista estática en .env.</span></li>
         <li><span class="n">＋</span><span class="t"><b>Mejora continua del juez (curación humana)</b> — review_judge_verdicts.py + promote_reviews_to_evals.py convierten corridas reales confirmadas/corregidas por un humano en casos nuevos de judge_eval_cases.jsonl. Sin reentrenar ningún modelo — es curación de dataset.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Smoke test end-to-end real</b> — scripts/smoke_test.sh crea un ticket Jira real descartable + repo git temporal, corre run_poc_loop.sh de verdad y valida las etapas 1-4 sin mocks. La etapa 5 queda afuera a propósito: gh copilot suggest es una TUI interactiva no automatizable.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Modo épica (--epic)</b> — trae una épica + todos sus hijos y arma un prompt combinado, en vez de procesarlos uno por uno. Solo avanza si todos los componentes resuelven al mismo repo_url en el grafo (nueva propiedad por nodo); si no, se niega a trabajar en vez de adivinar.</span></li>
+        <li><span class="n">＋</span><span class="t"><b>Agente de código local real (Camino B1)</b> — coding_agent.py: mismo backend dual Anthropic/Ollama y loop de tool-calling que el juez (agent_loop.py, compartido). Lee/escribe/lista/busca en el repo real y consulta los MCP del juez, con confirmación humana antes de cada escritura o comando. Sin backend disponible, cae a gh copilot suggest (B2) como antes.</span></li>
       </ol>
     </div>
   </div>

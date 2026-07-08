@@ -2,9 +2,20 @@
 # End-to-end orchestrator: real Jira ticket -> real Neo4j graph impact ->
 # real SonarQube findings -> AI Firewall -> real gh copilot suggest, applied
 # on a review branch OF YOUR REAL REPO. The scenario (clean vs. malicious)
-# is decided by the real content of the Jira ticket in JIRA_TICKET_KEY, not
-# by a flag: edit the ticket in Jira to break the flow, then re-run this
-# script.
+# is decided by the real content of the Jira ticket, not by a flag: edit
+# the ticket in Jira to break the flow, then re-run this script.
+#
+# Which ticket: pass it as the first argument (./run_poc_loop.sh JIRA-123)
+# to work any ticket someone hands to Copilot without touching .env. Without
+# an argument, falls back to JIRA_TICKET_KEY from .env (the original
+# behavior, still handy for repeatedly testing the same ticket).
+#
+# Epic mode: ./run_poc_loop.sh --epic EPIC-123 fetches the epic and ALL its
+# children, and runs ONE combined prompt through the whole pipeline instead
+# of processing children one by one. Only works if every child's component
+# resolves to the SAME repo_url in the Neo4j graph -- this pipeline is built
+# around one repo per run (TARGET_REPO_DIR), so if the epic's children
+# genuinely live in different repos, it refuses instead of guessing.
 #
 # IMPORTANT: this operates on whatever git repo you are standing in when you
 # invoke it (cd to your real project first) — it does NOT use sample-repo/
@@ -20,6 +31,15 @@ if [ -f "${SCRIPT_DIR}/.env" ]; then
   # shellcheck disable=SC1090
   . "${SCRIPT_DIR}/.env"
   set +a
+fi
+
+EPIC_MODE=false
+EPIC_KEY=""
+if [ "${1:-}" = "--epic" ]; then
+  EPIC_MODE=true
+  EPIC_KEY="${2:?usage: run_poc_loop.sh --epic <EPIC_KEY>}"
+elif [ -n "${1:-}" ]; then
+  JIRA_TICKET_KEY="$1"
 fi
 
 NEO4J_URI="${NEO4J_URI:-bolt://localhost:7687}"
@@ -69,9 +89,11 @@ log_contribution() {
 # Posts an audit comment on the real Jira ticket so anyone reviewing the
 # ticket sees, directly in Jira's own comment history, what the firewall
 # decided and what Copilot did — no need to go dig through local log files.
+# In epic mode TICKET_ID is the epic key, so this naturally comments on the
+# epic; run_epic_etapas() also comments on each child individually.
 post_jira_comment() {
   local text="$1"
-  python3 "${SCRIPT_DIR}/jira_client.py" comment "${text}" >/dev/null 2>&1 \
+  JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" comment "${text}" >/dev/null 2>&1 \
     || echo "(no se pudo dejar el comentario de auditoria en Jira — revisa credenciales)"
 }
 
@@ -81,7 +103,7 @@ post_jira_comment() {
 # if the workflow doesn't have that exact transition name, it just warns.
 transition_jira_ticket() {
   local target_status="${JIRA_IN_PROGRESS_STATUS:-In Progress}"
-  python3 "${SCRIPT_DIR}/jira_client.py" transition "${target_status}" >/dev/null 2>&1 \
+  JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${target_status}" >/dev/null 2>&1 \
     || echo "(no se pudo mover el ticket a '${target_status}' — puede que tu workflow use otro nombre; revisa JIRA_IN_PROGRESS_STATUS)"
 }
 
@@ -135,7 +157,7 @@ run_judge() {
 
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): FLAGGED. ${reasoning} — ${location_label} bloqueado, requiere revision humana antes de continuar."
 
-    python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
+    JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
       || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
 
     if [ -n "${branch}" ]; then
@@ -189,7 +211,7 @@ run_tests_gate() {
 
   post_jira_comment "🧪 Testing agent (automatizado): los tests reales de '${component}' FALLARON en la rama '${branch}'. Bloqueado antes de llegar al juez — requiere revision humana."
 
-  python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
+  JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
     || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
 
   if [ -n "${branch}" ]; then
@@ -230,6 +252,351 @@ check_falco_correlation() {
   fi
 }
 
+# Dado un listado (uno por linea) de nombres de componente distintos, chequea
+# en el grafo real de Neo4j que todos tengan repo_url seteado y que sea el
+# MISMO para todos. Fail-safe a proposito: sin dato, o con datos distintos,
+# nunca asume que es un solo repo -- deja EPIC_REJECT_REASON con el motivo y
+# retorna 1. Si todos coinciden, deja EPIC_REPO_URL seteado y retorna 0.
+check_epic_single_repo() {
+  local component_names="$1"
+  local quoted_list query rows expected_count found_count
+  quoted_list=$(echo "${component_names}" | sed "s/.*/'&'/" | paste -sd, -)
+
+  query="MATCH (n) WHERE n.name IN [${quoted_list}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
+  rows=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain "${query}" 2>/dev/null \
+    | tail -n +2 | tr -d '"')
+
+  expected_count=$(echo "${component_names}" | grep -c . || true)
+  found_count=$(echo "${rows}" | grep -c . || true)
+  if [ -z "${rows}" ] || [ "${found_count}" -ne "${expected_count}" ]; then
+    EPIC_REJECT_REASON="No se pudieron resolver todos los componentes de la epica en el grafo Neo4j (esperados: ${expected_count}, encontrados: ${found_count:-0}). Componentes: $(echo "${component_names}" | tr '\n' ' ')"
+    return 1
+  fi
+
+  local line name repo_url missing_list="" repo_url_list=""
+  while IFS= read -r line; do
+    [ -z "${line}" ] && continue
+    name=$(echo "${line}" | cut -d'|' -f1)
+    repo_url=$(echo "${line}" | cut -d'|' -f2-)
+    if [ -z "${repo_url}" ]; then
+      missing_list="${missing_list}${name}, "
+    fi
+    repo_url_list="${repo_url_list}${repo_url}
+"
+  done <<< "${rows}"
+
+  if [ -n "${missing_list}" ]; then
+    EPIC_REJECT_REASON="Estos componentes no tienen repo_url seteado en el grafo, asi que no se puede confirmar si viven en el mismo repo: ${missing_list%, }. Agregaselo (ver prompts/sync_graph_from_azure_devops.md) antes de reintentar."
+    return 1
+  fi
+
+  local distinct_count
+  distinct_count=$(echo "${repo_url_list}" | sort -u | grep -c . || true)
+  if [ "${distinct_count}" -ne 1 ]; then
+    EPIC_REJECT_REASON="Los componentes de esta epica viven en repos distintos segun el grafo: $(echo "${repo_url_list}" | sort -u | tr '\n' ' '). No se puede procesar una epica que toca mas de un repo en una sola corrida."
+    return 1
+  fi
+
+  EPIC_REPO_URL=$(echo "${repo_url_list}" | sort -u | grep -v '^$' | head -n1)
+  return 0
+}
+
+# Etapas 1-4 para el modo --epic: trae la epica + TODOS sus hijos, confirma
+# que viven en un solo repo (o se niega, ver check_epic_single_repo), y arma
+# UN prompt combinado con el contexto de la epica y cada historia hija. A
+# partir de ahi se une al mismo flujo que un ticket normal
+# (run_pipeline_delivery), sin duplicar coding agent/testing agent/juez.
+run_epic_etapas() {
+  echo "=================================================================="
+  echo " MODO EPICA — Lectura de ${EPIC_KEY} y sus hijos"
+  echo "=================================================================="
+
+  local epic_json child_count unresolved distinct_components
+  epic_json=$(python3 "${SCRIPT_DIR}/jira_client.py" fetch-epic "${EPIC_KEY}") \
+    || fail "no se pudo leer la epica ${EPIC_KEY} de Jira. Revisa que la key exista y JIRA_EPIC_LINK_JQL si tu proyecto es company-managed."
+
+  TICKET_ID="${EPIC_KEY}"
+  SUMMARY=$(echo "${epic_json}" | jq -r '.epic.summary')
+  local epic_description
+  epic_description=$(echo "${epic_json}" | jq -r '.epic.description')
+
+  child_count=$(echo "${epic_json}" | jq '.children | length')
+  echo "Hijos encontrados: ${child_count}"
+  if [ "${child_count}" -eq 0 ]; then
+    fail "la epica ${EPIC_KEY} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent' -- ver README."
+  fi
+
+  unresolved=$(echo "${epic_json}" | jq -r '[.children[] | select(.repository_origen == null) | .ticket_id] | join(", ")')
+  if [ -n "${unresolved}" ]; then
+    EPIC_REJECT_REASON="Estos hijos de ${EPIC_KEY} no tienen un componente resuelto (el campo Components/label no matchea ningun nodo conocido del grafo): ${unresolved}."
+    post_jira_comment "🚫 Modo epica (automatizado): no se pudo procesar ${EPIC_KEY} — ${EPIC_REJECT_REASON}"
+    fail "${EPIC_REJECT_REASON}"
+  fi
+
+  distinct_components=$(echo "${epic_json}" | jq -r '[.children[].repository_origen] | unique | .[]')
+
+  if ! check_epic_single_repo "${distinct_components}"; then
+    post_jira_comment "🚫 Modo epica (automatizado): no se pudo procesar ${EPIC_KEY} — ${EPIC_REJECT_REASON}"
+    fail "${EPIC_REJECT_REASON}"
+  fi
+  echo "Todos los componentes de ${EPIC_KEY} confirmados en el mismo repo: ${EPIC_REPO_URL}"
+
+  local origin_url
+  origin_url=$(git -C "${TARGET_REPO_DIR}" remote get-url origin 2>/dev/null || echo "")
+  if [ -n "${origin_url}" ] && [ "${origin_url}" != "${EPIC_REPO_URL}" ]; then
+    echo "⚠️  El remote 'origin' de ${TARGET_REPO_DIR} (${origin_url}) no coincide exactamente con repo_url del grafo (${EPIC_REPO_URL}) — puede ser solo ssh vs https, pero confirma que estas parado en el repo correcto para esta epica."
+  fi
+
+  REPO_ORIGEN=$(echo "${distinct_components}" | paste -sd, -)
+
+  echo
+  echo "Consultando grafo/Sonar reales por cada componente de la epica..."
+  GRAPH_RESULT=""
+  SONAR_ISSUES=""
+  SONAR_ERRORS_ARRAY="[]"
+  local component g s
+  while IFS= read -r component; do
+    [ -z "${component}" ] && continue
+    g=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain \
+      "MATCH (origin {name: '${component}'})<-[:DEPENDS_ON]-(dependent) RETURN dependent.name AS servicio, dependent.language AS lenguaje" 2>/dev/null)
+    GRAPH_RESULT="${GRAPH_RESULT}
+--- ${component} ---
+${g}"
+    s=$(python3 "${SCRIPT_DIR}/sonar_client.py" "${component}" 2>/dev/null)
+    if [ -n "${s}" ]; then
+      SONAR_ISSUES="${SONAR_ISSUES}
+--- ${component} ---
+$(echo "${s}" | jq -r '.issues[] | "- [\(.severity)] \(.rule): \(.message) (linea \(.line))"')"
+      SONAR_ERRORS_ARRAY=$(jq -s 'add' <(echo "${SONAR_ERRORS_ARRAY}") <(echo "${s}" | jq '[.issues[].message]'))
+    fi
+  done <<< "${distinct_components}"
+
+  local children_text
+  children_text=$(echo "${epic_json}" | jq -r '.children[] | "- \(.ticket_id) (\(.repository_origen)): \(.summary)\n  \(.description)"')
+
+  PROMPT=$(cat <<EOF
+ESTO ES UNA EPICA con ${child_count} historias hijas. Resolvelas todas juntas, coordinando los cambios entre los componentes que toca cada una.
+
+Epica ${EPIC_KEY}: ${SUMMARY}
+${epic_description}
+
+--- Historias hijas ---
+${children_text}
+--- Grafo de impacto (por componente) ---
+${GRAPH_RESULT}
+--- Hallazgos Sonar (reales, por componente) ---
+${SONAR_ISSUES}
+EOF
+)
+
+  JIRA_CONTEXT=$(jq -n --arg id "${EPIC_KEY}" --arg summary "${SUMMARY}" --arg desc "${epic_description}" --arg repo "${REPO_ORIGEN}" \
+    '{ticket_id: $id, summary: $summary, description: $desc, repository_origen: $repo}')
+
+  echo "Prompt combinado armado para ${EPIC_KEY}: ${child_count} hijos, componentes $(echo "${distinct_components}" | tr '\n' ' ')."
+
+  echo "${epic_json}" | jq -r '.children[].ticket_id' | while IFS= read -r child_key; do
+    [ -z "${child_key}" ] && continue
+    JIRA_TICKET_KEY="${child_key}" python3 "${SCRIPT_DIR}/jira_client.py" comment \
+      "🧩 Modo epica (automatizado): esta historia se proceso como parte de una corrida combinada de la epica ${EPIC_KEY}. Revisa el resultado en ${EPIC_KEY}." \
+      >/dev/null 2>&1 || true
+  done
+}
+
+# Etapas 5 en adelante: composicion del prompt final al firewall, camino A/B
+# del coding agent, testing agent, juez y correlacion de Falco. Comun tanto
+# al modo ticket normal como al modo epica -- ambos llegan aca habiendo
+# seteado PROMPT/JIRA_CONTEXT/SONAR_ERRORS_ARRAY/TICKET_ID/SUMMARY/REPO_ORIGEN
+# de la forma que corresponda.
+run_pipeline_delivery() {
+  echo
+  echo "=================================================================="
+  echo " ETAPA 4/5 — Envio al AI Firewall"
+  echo "=================================================================="
+
+  local payload
+  payload=$(jq -n \
+    --arg prompt "${PROMPT}" \
+    --argjson jira_context "${JIRA_CONTEXT}" \
+    --argjson sonar_errors "${SONAR_ERRORS_ARRAY}" \
+    '{prompt: $prompt, jira_context: $jira_context, sonar_errors: $sonar_errors}')
+
+  local firewall_auth_header=()
+  if [ -n "${FIREWALL_API_KEY:-}" ]; then
+    firewall_auth_header=(-H "X-Firewall-Key: ${FIREWALL_API_KEY}")
+  fi
+
+  local response http_code body
+  response=$(curl -s -w '\n%{http_code}' -X POST "${FIREWALL_URL}/evaluate" \
+    -H "Content-Type: application/json" \
+    "${firewall_auth_header[@]}" \
+    -d "${payload}")
+
+  http_code=$(echo "${response}" | tail -n1)
+  body=$(echo "${response}" | sed '$d')
+
+  STATUS=$(echo "${body}" | jq -r '.status')
+
+  echo "HTTP ${http_code} — status: ${STATUS}"
+
+  if [ "${STATUS}" = "REJECTED" ]; then
+    REASON=$(echo "${body}" | jq -r '.reason')
+    echo
+    echo "🛑 EL AI FIREWALL RECHAZO LA PETICION"
+    echo "Razon: ${REASON}"
+    echo "gh copilot NO fue invocado."
+    post_jira_comment "🛡️ AI Firewall (automatizado): solicitud RECHAZADA. Motivo: ${REASON}. gh copilot no fue invocado."
+    log_contribution "REJECTED" 0 false false ""
+    run_judge "firewall_rejected" "${REASON}" "solicitud rechazada por el firewall"
+    exit 1
+  fi
+
+  if [ "${STATUS}" = "APPROVED" ]; then
+    SANITIZED=$(echo "${body}" | jq -r '.sanitized_prompt')
+    REDACTIONS=$(echo "${body}" | jq -r '.redactions_applied')
+
+    echo
+    echo "✅ APROBADO — redacciones aplicadas: ${REDACTIONS}"
+    echo
+    echo "--- PROMPT ORIGINAL --------------------------------------------"
+    echo "${PROMPT}"
+    echo "--- PROMPT SANEADO (lo que recibe el agente) --------------------"
+    echo "${SANITIZED}"
+    echo "-------------------------------------------------------------"
+
+    echo
+    echo "Moviendo el ticket ${TICKET_ID} a '${JIRA_IN_PROGRESS_STATUS:-In Progress}'..."
+    transition_jira_ticket
+
+    # scripts/smoke_test.sh setea esto para validar las etapas 1-4 (Jira real,
+    # grafo real, Sonar real, firewall real) sin tocar la etapa 5: gh copilot
+    # suggest es una TUI interactiva (no automatizable sin volverse fragil) y
+    # el coding agent en la nube abre el PR async — ninguno de los dos entra
+    # en un smoke test corto y automatico. Sin esta variable, cero cambios.
+    if [ "${SMOKE_TEST_MODE:-false}" = "true" ]; then
+      echo
+      echo "SMOKE_TEST_MODE=true — deteniendo aca a proposito (etapas 1-4 validadas)."
+      echo "La etapa 5 (coding agent) requiere confirmacion interactiva de 'gh copilot suggest' o un repo GitHub real — fuera del alcance de un smoke test automatizado."
+      post_jira_comment "🧪 Smoke test (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Etapas 1-4 validadas de punta a punta; se detiene antes de la etapa 5 por SMOKE_TEST_MODE."
+      exit 0
+    fi
+
+    local falco_since_ts
+    falco_since_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # --- Camino A: agente real. Si hay un repo real configurado, se crea un
+    # Issue con el contexto ya armado (ticket + impacto de grafo + hallazgos
+    # Sonar, todo pre-computado localmente) y se asigna al GitHub Copilot
+    # coding agent, que corre en la nube de GitHub con su propio loop de
+    # razonamiento y herramientas — no una sugerencia de un solo tiro.
+    if [ -n "${GITHUB_REPO:-}" ]; then
+      echo
+      echo "=================================================================="
+      echo " ETAPA 5/5 — Asignando el ticket a GitHub Copilot coding agent (${GITHUB_REPO})"
+      echo "=================================================================="
+
+      local issue_body issue_url
+      issue_body=$(cat <<EOF
+${SANITIZED}
+
+---
+Generado automaticamente por poc-ai-agents desde el ticket Jira ${TICKET_ID}.
+EOF
+)
+
+      issue_url=$(gh issue create --repo "${GITHUB_REPO}" --title "${SUMMARY}" --body "${issue_body}") \
+        || fail "no se pudo crear el issue en ${GITHUB_REPO}. Revisa que el repo exista y tengas permisos."
+
+      echo "Issue creado: ${issue_url}"
+
+      if gh issue edit "${issue_url}" --add-assignee "${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}" >/dev/null 2>&1; then
+        echo "Asignado a ${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}. El agente trabaja de forma asincronica en la nube y va a abrir un PR."
+        post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo y asigno ${issue_url} — el agente trabaja en la nube y va a abrir un PR."
+        log_contribution "APPROVED" "${REDACTIONS}" true true "issue:${issue_url}"
+        # El PR todavia no existe (el coding agent trabaja async): el juez solo
+        # puede evaluar la decision del firewall + el planteo del issue por ahora.
+        run_judge "issue_only" "${issue_body}" "issue ${issue_url}" "" "${issue_url}"
+      else
+        echo "No se pudo asignar a '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}'. Verifica que el coding agent este habilitado en ${GITHUB_REPO} y que el login del assignee sea correcto."
+        post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${issue_url} pero no se pudo asignar al coding agent — revisar configuracion del repo."
+        log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${issue_url}"
+      fi
+      check_falco_correlation "${falco_since_ts}"
+      exit 0
+    fi
+
+    # --- Camino B: sin repo real configurado. B1 (agente real local, con
+    # loop de razonamiento y confirmacion antes de aplicar) si hay backend
+    # de modelo disponible; si no, B2 (gh copilot suggest, sugerencia de un
+    # solo tiro, sin loop) como fallback — ver PLAN.md.
+    echo
+    echo "=================================================================="
+    echo " ETAPA 5/5 — Coding agent local (sin GITHUB_REPO)"
+    echo "=================================================================="
+
+    local applied=false branch base_branch diff_text tests_gate_result
+    base_branch=$(git -C "${TARGET_REPO_DIR}" rev-parse --abbrev-ref HEAD)
+    branch="copilot/${TICKET_ID}-$(date +%s)"
+    git -C "${TARGET_REPO_DIR}" checkout -b "${branch}" >/dev/null
+
+    local backend_available=false
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      backend_available=true
+    elif curl -sf "${OLLAMA_URL:-http://localhost:11434}/api/tags" >/dev/null 2>&1; then
+      backend_available=true
+    fi
+
+    if [ "${backend_available}" = "true" ]; then
+      # --- Camino B1: agente real local (coding_agent.py). Razona en varios
+      # pasos, puede leer/escribir/listar/grep el repo y consultar los MCP
+      # que ya tiene el juez (Neo4j/Qdrant) — cada escritura/comando pide
+      # confirmacion antes de aplicarse, se ve y se responde en la terminal.
+      echo "Backend de modelo disponible — usando el agente de codigo local real (coding_agent.py)."
+      local payload_file agent_result_json
+      payload_file=$(mktemp)
+      jq -n --arg ticket_id "${TICKET_ID}" --arg sanitized "${SANITIZED}" --arg repo "${TARGET_REPO_DIR}" \
+        '{ticket_id: $ticket_id, sanitized_prompt: $sanitized, target_repo_dir: $repo}' > "${payload_file}"
+
+      agent_result_json=$(python3 "${SCRIPT_DIR}/coding_agent.py" "${payload_file}")
+      rm -f "${payload_file}"
+      echo "Resultado del agente: $(echo "${agent_result_json}" | jq -r '.status') — $(echo "${agent_result_json}" | jq -r '.summary')"
+    else
+      # --- Camino B2 (fallback): gh copilot suggest, sugerencia de un solo
+      # tiro sin loop ni acceso a los MCP — ver PLAN.md.
+      echo "Sin ANTHROPIC_API_KEY ni Ollama alcanzable — usando gh copilot suggest como fallback (sugerencia puntual, no un agente)."
+      echo "Copilot va a sugerir un comando para resolver ${TICKET_ID} en ${TARGET_REPO_DIR}. Se te pedira confirmar antes de ejecutar nada."
+      gh copilot suggest -t shell "${SANITIZED}"
+    fi
+
+    if [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
+      git -C "${TARGET_REPO_DIR}" add -A
+      git -C "${TARGET_REPO_DIR}" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null
+      applied=true
+      echo "Cambio aplicado y commiteado en la rama '${branch}' de ${TARGET_REPO_DIR} — NO en '${base_branch}'."
+      echo "Revisalo con: git -C \"${TARGET_REPO_DIR}\" diff ${base_branch}..${branch}"
+      post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${branch}' de tu repo, pendiente de revision humana antes de mergear."
+      diff_text=$(git -C "${TARGET_REPO_DIR}" diff "${base_branch}..${branch}")
+      run_tests_gate "${REPO_ORIGEN}" "${branch}"
+      tests_gate_result=$?
+      log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "${TEST_PASSED}"
+      if [ "${tests_gate_result}" -eq 0 ]; then
+        run_judge "local_diff" "${diff_text}" "rama '${branch}' de ${TARGET_REPO_DIR}" "${branch}" "" "${TEST_OUTPUT}"
+      fi
+    else
+      git -C "${TARGET_REPO_DIR}" checkout "${base_branch}" >/dev/null 2>&1
+      git -C "${TARGET_REPO_DIR}" branch -D "${branch}" >/dev/null 2>&1
+      echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
+      post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
+      branch=""
+      log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"
+      run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"
+    fi
+    check_falco_correlation "${falco_since_ts}"
+    exit 0
+  fi
+
+  fail "respuesta inesperada del firewall: ${body}"
+}
+
 command -v jq >/dev/null 2>&1 || fail "jq no esta instalado (requerido para parsear JSON). Instalalo y reintenta."
 command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 
@@ -244,6 +611,12 @@ if command -v cypher-shell >/dev/null 2>&1; then
     export JIRA_KNOWN_COMPONENTS="${DISCOVERED_COMPONENTS}"
     echo "Componentes conocidos derivados del grafo Neo4j: ${JIRA_KNOWN_COMPONENTS}"
   fi
+fi
+
+if [ "${EPIC_MODE}" = "true" ]; then
+  run_epic_etapas
+  run_pipeline_delivery
+  exit 0
 fi
 
 echo "=================================================================="
@@ -346,10 +719,6 @@ else
   echo "El ticket no trae un link de Figma — se omite esta etapa."
 fi
 
-echo
-echo "=================================================================="
-echo " ETAPA 4/5 — Composicion del prompt y envio al AI Firewall"
-echo "=================================================================="
 PROMPT=$(cat <<EOF
 ${SUMMARY}
 ${DESCRIPTION}
@@ -370,144 +739,4 @@ fi
 JIRA_CONTEXT=$(echo "${JIRA_JSON}" | jq '{ticket_id, summary, description, repository_origen}')
 SONAR_ERRORS_ARRAY=$(echo "${SONAR_JSON}" | jq '[.issues[].message]')
 
-PAYLOAD=$(jq -n \
-  --arg prompt "${PROMPT}" \
-  --argjson jira_context "${JIRA_CONTEXT}" \
-  --argjson sonar_errors "${SONAR_ERRORS_ARRAY}" \
-  '{prompt: $prompt, jira_context: $jira_context, sonar_errors: $sonar_errors}')
-
-FIREWALL_AUTH_HEADER=()
-if [ -n "${FIREWALL_API_KEY:-}" ]; then
-  FIREWALL_AUTH_HEADER=(-H "X-Firewall-Key: ${FIREWALL_API_KEY}")
-fi
-
-RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "${FIREWALL_URL}/evaluate" \
-  -H "Content-Type: application/json" \
-  "${FIREWALL_AUTH_HEADER[@]}" \
-  -d "${PAYLOAD}")
-
-HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
-BODY=$(echo "${RESPONSE}" | sed '$d')
-
-STATUS=$(echo "${BODY}" | jq -r '.status')
-
-echo "HTTP ${HTTP_CODE} — status: ${STATUS}"
-
-if [ "${STATUS}" = "REJECTED" ]; then
-  REASON=$(echo "${BODY}" | jq -r '.reason')
-  echo
-  echo "🛑 EL AI FIREWALL RECHAZO LA PETICION"
-  echo "Razon: ${REASON}"
-  echo "gh copilot NO fue invocado."
-  post_jira_comment "🛡️ AI Firewall (automatizado): solicitud RECHAZADA. Motivo: ${REASON}. gh copilot no fue invocado."
-  log_contribution "REJECTED" 0 false false ""
-  run_judge "firewall_rejected" "${REASON}" "solicitud rechazada por el firewall"
-  exit 1
-fi
-
-if [ "${STATUS}" = "APPROVED" ]; then
-  SANITIZED=$(echo "${BODY}" | jq -r '.sanitized_prompt')
-  REDACTIONS=$(echo "${BODY}" | jq -r '.redactions_applied')
-
-  echo
-  echo "✅ APROBADO — redacciones aplicadas: ${REDACTIONS}"
-  echo
-  echo "--- PROMPT ORIGINAL --------------------------------------------"
-  echo "${PROMPT}"
-  echo "--- PROMPT SANEADO (lo que recibe el agente) --------------------"
-  echo "${SANITIZED}"
-  echo "-------------------------------------------------------------"
-
-  echo
-  echo "Moviendo el ticket ${TICKET_ID} a '${JIRA_IN_PROGRESS_STATUS:-In Progress}'..."
-  transition_jira_ticket
-
-  FALCO_SINCE_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-  # --- Camino A: agente real. Si hay un repo real configurado, se crea un
-  # Issue con el contexto ya armado (ticket + impacto de grafo + hallazgos
-  # Sonar, todo pre-computado localmente) y se asigna al GitHub Copilot
-  # coding agent, que corre en la nube de GitHub con su propio loop de
-  # razonamiento y herramientas — no una sugerencia de un solo tiro.
-  if [ -n "${GITHUB_REPO:-}" ]; then
-    echo
-    echo "=================================================================="
-    echo " ETAPA 5/5 — Asignando el ticket a GitHub Copilot coding agent (${GITHUB_REPO})"
-    echo "=================================================================="
-
-    ISSUE_BODY=$(cat <<EOF
-${SANITIZED}
-
----
-Generado automaticamente por poc-ai-agents desde el ticket Jira ${TICKET_ID}.
-EOF
-)
-
-    ISSUE_URL=$(gh issue create --repo "${GITHUB_REPO}" --title "${SUMMARY}" --body "${ISSUE_BODY}") \
-      || fail "no se pudo crear el issue en ${GITHUB_REPO}. Revisa que el repo exista y tengas permisos."
-
-    echo "Issue creado: ${ISSUE_URL}"
-
-    if gh issue edit "${ISSUE_URL}" --add-assignee "${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}" >/dev/null 2>&1; then
-      echo "Asignado a ${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}. El agente trabaja de forma asincronica en la nube y va a abrir un PR."
-      post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo y asigno ${ISSUE_URL} — el agente trabaja en la nube y va a abrir un PR."
-      log_contribution "APPROVED" "${REDACTIONS}" true true "issue:${ISSUE_URL}"
-      # El PR todavia no existe (el coding agent trabaja async): el juez solo
-      # puede evaluar la decision del firewall + el planteo del issue por ahora.
-      run_judge "issue_only" "${ISSUE_BODY}" "issue ${ISSUE_URL}" "" "${ISSUE_URL}"
-    else
-      echo "No se pudo asignar a '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}'. Verifica que el coding agent este habilitado en ${GITHUB_REPO} y que el login del assignee sea correcto."
-      post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${ISSUE_URL} pero no se pudo asignar al coding agent — revisar configuracion del repo."
-      log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${ISSUE_URL}"
-    fi
-    check_falco_correlation "${FALCO_SINCE_TS}"
-    exit 0
-  fi
-
-  # --- Camino B (fallback): sin repo real configurado, se pide una
-  # sugerencia de un solo tiro con gh copilot suggest y se aplica local.
-  # Esto NO es un agente autonomo, es una llamada puntual — ver PLAN.md.
-  echo
-  echo "=================================================================="
-  echo " ETAPA 5/5 — gh copilot suggest (fallback local, sin GITHUB_REPO)"
-  echo "=================================================================="
-
-  APPLIED=false
-  BRANCH=""
-
-  BASE_BRANCH=$(git -C "${TARGET_REPO_DIR}" rev-parse --abbrev-ref HEAD)
-  BRANCH="copilot/${TICKET_ID}-$(date +%s)"
-  git -C "${TARGET_REPO_DIR}" checkout -b "${BRANCH}" >/dev/null
-
-  echo "Copilot va a sugerir un comando para resolver ${TICKET_ID} en ${TARGET_REPO_DIR}. Se te pedira confirmar antes de ejecutar nada."
-  gh copilot suggest -t shell "${SANITIZED}"
-  SUGGEST_EXIT=$?
-
-  if [ "${SUGGEST_EXIT}" -eq 0 ] && [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
-    git -C "${TARGET_REPO_DIR}" add -A
-    git -C "${TARGET_REPO_DIR}" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null
-    APPLIED=true
-    echo "Cambio aplicado y commiteado en la rama '${BRANCH}' de ${TARGET_REPO_DIR} — NO en '${BASE_BRANCH}'."
-    echo "Revisalo con: git -C \"${TARGET_REPO_DIR}\" diff ${BASE_BRANCH}..${BRANCH}"
-    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${BRANCH}' de tu repo, pendiente de revision humana antes de mergear."
-    DIFF_TEXT=$(git -C "${TARGET_REPO_DIR}" diff "${BASE_BRANCH}..${BRANCH}")
-    run_tests_gate "${REPO_ORIGEN}" "${BRANCH}"
-    TESTS_GATE_RESULT=$?
-    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}" "${TEST_PASSED}"
-    if [ "${TESTS_GATE_RESULT}" -eq 0 ]; then
-      run_judge "local_diff" "${DIFF_TEXT}" "rama '${BRANCH}' de ${TARGET_REPO_DIR}" "${BRANCH}" "" "${TEST_OUTPUT}"
-    fi
-  else
-    git -C "${TARGET_REPO_DIR}" checkout "${BASE_BRANCH}" >/dev/null 2>&1
-    git -C "${TARGET_REPO_DIR}" branch -D "${BRANCH}" >/dev/null 2>&1
-    echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
-    post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
-    BRANCH=""
-    log_contribution "APPROVED" "${REDACTIONS}" true "${APPLIED}" "${BRANCH}" "null"
-    run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"
-  fi
-  check_falco_correlation "${FALCO_SINCE_TS}"
-  exit 0
-fi
-
-fail "respuesta inesperada del firewall: ${BODY}"
+run_pipeline_delivery
