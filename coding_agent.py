@@ -44,6 +44,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
+import sonar_client
 from agent_loop import (
     ANTHROPIC_MODEL,
     _call_mcp_tool,
@@ -100,16 +101,25 @@ CODING_AGENT_SYSTEM_PROMPT = """Sos un agente de codigo real, trabajando sobre u
 ya esta parado en una rama nueva (nunca la rama base) creada especificamente para este cambio.
 
 Tenes herramientas reales: leer archivos, listar directorios, buscar texto/patrones en el codigo, \
-escribir archivos, y correr comandos de shell -- todas confinadas a este repo, nunca fuera de el. \
-Tambien tenes acceso al grafo de dependencias (Neo4j) y a codigo/historico indexado (Qdrant) si estan \
-disponibles, para verificar el impacto real de tu cambio antes de aplicarlo.
+editar un fragmento especifico de un archivo, escribir/crear archivos, correr comandos de shell, ver tu \
+propio diff y el historial de commits, detectar el stack del proyecto, y consultar hallazgos reales de \
+Sonar -- todas confinadas a este repo, nunca fuera de el. Tambien tenes acceso al grafo de dependencias \
+(Neo4j) y a codigo/historico indexado (Qdrant) si estan disponibles, para verificar el impacto real de \
+tu cambio antes de aplicarlo.
 
-REGLA OBLIGATORIA: no podes usar write_file ni run_shell_command hasta haber usado al menos una vez \
-read_file, list_directory, o grep_search en esta corrida -- si lo intentas antes, la herramienta va a \
-rechazar el llamado y vas a perder un turno. Investiga primero, siempre.
+Preferi edit_file sobre write_file cuando modifiques un archivo EXISTENTE -- edit_file cambia solo el \
+fragmento exacto que indiques (como un str_replace), en vez de reescribir el archivo entero; reserva \
+write_file para crear archivos nuevos o reescrituras genuinamente completas. Usa detect_project_stack \
+antes de asumir un comando de test/build, y query_sonar si necesitas mas detalle de un hallazgo puntual \
+en vez de confiar solo en lo que ya te dieron. Usa git_diff antes de declararte "done" para revisar tu \
+propio cambio de punta a punta.
 
-Cada escritura de archivo y cada comando de shell tambien requieren confirmacion humana antes de \
-ejecutarse -- si el usuario rechaza uno, no insistas con el mismo cambio, ajusta tu plan.
+REGLA OBLIGATORIA: no podes usar write_file, edit_file, ni run_shell_command hasta haber usado al menos \
+una vez read_file, list_directory, o grep_search en esta corrida -- si lo intentas antes, la herramienta \
+va a rechazar el llamado y vas a perder un turno. Investiga primero, siempre.
+
+Cada escritura, edicion, o comando de shell tambien requieren confirmacion humana antes de ejecutarse -- \
+si el usuario rechaza uno, no insistas con el mismo cambio, ajusta tu plan.
 
 Hace el cambio MAS CHICO Y SEGURO que resuelva el ticket. No inventes archivos ni asumas estructura que \
 no verificaste -- si justificas un cambio citando el codigo existente, citalo con ruta:linea real, no de memoria.
@@ -305,6 +315,136 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     return f"escrito ok: {path}"
 
 
+def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string: str) -> str:
+    """str_replace-style edit: old_string must match EXACTLY ONCE in the
+    file, same discipline as the Edit tool this session already uses --
+    cheaper in tokens and produces a much more reviewable diff than
+    rewriting the whole file via write_file for a small change.
+    """
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if _is_inside_git_dir(full_path, target_repo_dir):
+        return f"error: no se puede escribir dentro de .git/ ({path})"
+    if not full_path.exists() or not full_path.is_file():
+        return f"error: no existe {path} -- usa write_file para crear un archivo nuevo"
+
+    try:
+        current = full_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"error leyendo {path}: {exc}"
+
+    count = current.count(old_string)
+    if count == 0:
+        return f"error: old_string no se encontro en {path} -- verifica que coincida exactamente (incluido whitespace)"
+    if count > 1:
+        return f"error: old_string aparece {count} veces en {path} -- agrega mas contexto para que sea unico"
+
+    new_content = current.replace(old_string, new_string, 1)
+    diff_lines = list(
+        difflib.unified_diff(
+            current.splitlines(keepends=True),
+            new_content.splitlines(keepends=True),
+            fromfile=f"{path} (actual)",
+            tofile=f"{path} (nuevo)",
+        )
+    )
+    print(f"\nEl agente quiere editar '{path}':", file=sys.stderr)
+    print("---", file=sys.stderr)
+    print("".join(diff_lines) if diff_lines else "(sin cambios)", file=sys.stderr)
+    print("---", file=sys.stderr)
+    if not _confirm("¿Aplicar este cambio? [s/n]: "):
+        return "el usuario rechazo este cambio, no se edito nada"
+
+    full_path.write_text(new_content, encoding="utf-8")
+    return f"editado ok: {path}"
+
+
+def tool_git_diff(target_repo_dir: str, path: str = "") -> str:
+    """Solo lectura -- deja que el agente revise su propio cambio antes de
+    declararse "done", en vez de confiar de memoria en lo que escribio.
+    """
+    cmd = ["git", "-C", target_repo_dir, "diff"]
+    if path:
+        try:
+            _safe_path(target_repo_dir, path)
+        except ValueError as exc:
+            return f"error: {exc}"
+        cmd.extend(["--", path])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "error: git diff supero el timeout de 30s"
+    if result.returncode != 0:
+        return f"error corriendo git diff: {result.stderr.strip()}"
+    return _truncate(result.stdout, _MAX_SHELL_OUTPUT_CHARS) or "(sin cambios)"
+
+
+def tool_git_log(target_repo_dir: str, n: int = 10) -> str:
+    try:
+        n = max(1, min(int(n), 50))
+    except (TypeError, ValueError):
+        n = 10
+    try:
+        result = subprocess.run(
+            ["git", "-C", target_repo_dir, "log", f"-{n}", "--oneline"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "error: git log supero el timeout de 30s"
+    if result.returncode != 0:
+        return f"error corriendo git log: {result.stderr.strip()}"
+    return result.stdout or "(sin commits)"
+
+
+# Mismo orden de deteccion que scripts/run_module_tests.sh -- de mas
+# especifico a mas generico, package.json al final porque es el marcador
+# mas generico (cualquier sabor de Node/TS).
+_STACK_MARKERS = [
+    ("pom.xml", "Maven/Java", "mvn -B -q test"),
+    ("go.mod", "Go", "go test ./..."),
+    ("Gemfile", "Ruby", "bundle exec rspec"),
+    ("Cargo.toml", "Rust", "cargo test"),
+    ("Pipfile", "Python (Pipenv)", "pipenv run pytest -q"),
+    ("requirements.txt", "Python (pip)", "pytest -q"),
+    ("package.json", "Node/TS", "npm test"),
+]
+
+
+def tool_detect_project_stack(target_repo_dir: str) -> str:
+    """Puramente informativo -- no ejecuta nada, solo le dice al agente que
+    stack detecto y que comando de verificacion sugiere, para que no tenga
+    que adivinarlo. El agente sigue usando run_shell_command (con
+    confirmacion) para correrlo de verdad.
+    """
+    root = Path(target_repo_dir).resolve()
+    for marker, stack, suggested_cmd in _STACK_MARKERS:
+        if (root / marker).exists():
+            return f"stack detectado: {stack} (por {marker}) -- comando de verificacion sugerido: {suggested_cmd}"
+    if list(root.glob("*.csproj")) or list(root.glob("*.sln")):
+        return "stack detectado: .NET (por *.csproj/*.sln) -- comando de verificacion sugerido: dotnet test"
+    return "no se detecto un marcador de stack conocido en la raiz del repo -- inspecciona manualmente con list_directory/read_file"
+
+
+def tool_query_sonar(target_repo_dir: str, component: str) -> str:
+    """Los hallazgos de Sonar le llegan precomputados una sola vez en el
+    prompt inicial -- esto le permite volver a consultarlos en vivo
+    (reusando sonar_client.py real, mismo cache) si necesita mas detalle.
+    """
+    try:
+        result = sonar_client.get_issues(component)
+    except Exception as exc:
+        return f"error consultando Sonar para '{component}': {exc}"
+    issues = result.get("issues", [])
+    if not issues:
+        return f"sin hallazgos abiertos para '{component}'"
+    lines = [f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in issues]
+    return "\n".join(lines)
+
+
 def tool_run_shell_command(target_repo_dir: str, command: str) -> str:
     print(f"\nEl agente quiere correr en {target_repo_dir}:", file=sys.stderr)
     print(f"  $ {command}", file=sys.stderr)
@@ -361,6 +501,46 @@ LOCAL_TOOLS = {
         "description": "Corre un comando de shell dentro del repo objetivo (tests, build, etc). Requiere confirmacion humana.",
         "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
         "fn": tool_run_shell_command,
+    },
+    "edit_file": {
+        "description": (
+            "Reemplaza old_string por new_string en un archivo existente del repo objetivo. old_string debe "
+            "matchear EXACTAMENTE UNA VEZ (agrega contexto si no es unico). Preferir esto sobre write_file "
+            "para cambios chicos en archivos existentes. Requiere confirmacion humana."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+        "fn": tool_edit_file,
+    },
+    "git_diff": {
+        "description": "Muestra el diff real (git diff) del repo objetivo, opcionalmente acotado a un path. Solo lectura.",
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []},
+        "fn": tool_git_diff,
+    },
+    "git_log": {
+        "description": "Muestra los ultimos N commits (git log --oneline) del repo objetivo. Solo lectura.",
+        "input_schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": []},
+        "fn": tool_git_log,
+    },
+    "detect_project_stack": {
+        "description": (
+            "Detecta el stack del repo objetivo (Maven/Go/Ruby/Rust/Python/Node/.NET) por su archivo de "
+            "proyecto y sugiere el comando de test/build -- no ejecuta nada, solo informa. Solo lectura."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "fn": tool_detect_project_stack,
+    },
+    "query_sonar": {
+        "description": "Consulta hallazgos REALES y actuales de SonarQube para un componente (mismo cliente que alimenta el pipeline). Solo lectura.",
+        "input_schema": {"type": "object", "properties": {"component": {"type": "string"}}, "required": ["component"]},
+        "fn": tool_query_sonar,
     },
 }
 
@@ -466,7 +646,7 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
                     name = block["name"]
                     tool_input = block.get("input", {})
                     try:
-                        if name in ("write_file", "run_shell_command") and not has_investigated:
+                        if name in ("write_file", "edit_file", "run_shell_command") and not has_investigated:
                             output = (
                                 "Todavia no investigaste el repo. Usa read_file, list_directory, o "
                                 "grep_search antes de escribir o ejecutar algo."

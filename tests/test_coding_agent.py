@@ -8,6 +8,8 @@ verify-before-done) by mocking _call_model_turn/_connect_mcp_servers -- no
 real model backend or MCP server involved.
 """
 import asyncio
+import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -16,6 +18,17 @@ import coding_agent as ca
 
 async def _fake_connect_mcp(stack, servers, label="agente"):
     return {}
+
+
+def _init_git_repo(repo_dir):
+    subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+    (repo_dir / "f.py").write_text("original content\n")
+    subprocess.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "add", "-A"], cwd=repo_dir, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "baseline"],
+        cwd=repo_dir,
+        check=True,
+    )
 
 
 def test_safe_path_allows_relative_path_inside_repo(tmp_path):
@@ -311,3 +324,183 @@ def test_call_mcp_tool_times_out_gracefully(monkeypatch):
     result = asyncio.run(agent_loop._call_mcp_tool({"neo4j-cypher": _HangingSession()}, "neo4j-cypher__read", {}))
 
     assert "no respondio" in result
+
+
+# --- tool_edit_file ---
+
+
+def test_tool_edit_file_applies_unique_replacement(tmp_path, monkeypatch, capsys):
+    (tmp_path / "f.py").write_text("def foo():\n    return 1\n")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "return 1", "return 2")
+
+    assert result == "editado ok: f.py"
+    assert (tmp_path / "f.py").read_text() == "def foo():\n    return 2\n"
+    captured = capsys.readouterr()
+    assert "-    return 1" in captured.err
+    assert "+    return 2" in captured.err
+
+
+def test_tool_edit_file_rejects_zero_matches(tmp_path, monkeypatch):
+    (tmp_path / "f.py").write_text("def foo():\n    return 1\n")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "does not exist", "x")
+
+    assert "error" in result
+    assert "no se encontro" in result
+    assert (tmp_path / "f.py").read_text() == "def foo():\n    return 1\n"
+
+
+def test_tool_edit_file_rejects_multiple_matches(tmp_path, monkeypatch):
+    (tmp_path / "f.py").write_text("x = 1\nx = 1\n")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "x = 1", "x = 2")
+
+    assert "error" in result
+    assert "2 veces" in result
+    assert (tmp_path / "f.py").read_text() == "x = 1\nx = 1\n"
+
+
+def test_tool_edit_file_skips_when_rejected(tmp_path, monkeypatch):
+    (tmp_path / "f.py").write_text("original\n")
+    monkeypatch.setattr("builtins.input", lambda: "n")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "original", "cambiado")
+
+    assert "rechazo" in result
+    assert (tmp_path / "f.py").read_text() == "original\n"
+
+
+def test_tool_edit_file_rejects_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "nope.py", "a", "b")
+
+    assert "error" in result
+    assert "no existe" in result
+
+
+def test_tool_edit_file_blocks_path_traversal(tmp_path):
+    result = ca.tool_edit_file(str(tmp_path), "../outside.py", "a", "b")
+
+    assert "error" in result
+
+
+# --- tool_git_diff / tool_git_log ---
+
+
+def test_tool_git_diff_shows_uncommitted_changes(tmp_path):
+    _init_git_repo(tmp_path)
+    (tmp_path / "f.py").write_text("changed content\n")
+
+    result = ca.tool_git_diff(str(tmp_path))
+
+    assert "changed content" in result
+
+
+def test_tool_git_diff_no_changes(tmp_path):
+    _init_git_repo(tmp_path)
+
+    result = ca.tool_git_diff(str(tmp_path))
+
+    assert result == "(sin cambios)"
+
+
+def test_tool_git_log_shows_commits(tmp_path):
+    _init_git_repo(tmp_path)
+
+    result = ca.tool_git_log(str(tmp_path))
+
+    assert "baseline" in result
+
+
+def test_tool_git_log_respects_n(tmp_path):
+    _init_git_repo(tmp_path)
+
+    result = ca.tool_git_log(str(tmp_path), n=1)
+
+    assert "baseline" in result
+
+
+# --- tool_detect_project_stack ---
+
+
+def test_tool_detect_project_stack_finds_node(tmp_path):
+    (tmp_path / "package.json").write_text("{}")
+
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "Node/TS" in result
+    assert "npm test" in result
+
+
+def test_tool_detect_project_stack_finds_maven(tmp_path):
+    (tmp_path / "pom.xml").write_text("<project/>")
+
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "Maven/Java" in result
+
+
+def test_tool_detect_project_stack_unknown(tmp_path):
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "no se detecto" in result
+
+
+# --- tool_query_sonar ---
+
+
+def test_tool_query_sonar_formats_issues(tmp_path):
+    with patch("coding_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {
+            "issues": [{"severity": "BLOCKER", "rule": "java:S2068", "message": "Hardcoded credential", "line": 14}]
+        }
+        result = ca.tool_query_sonar(str(tmp_path), "AuthService")
+
+    assert "BLOCKER" in result
+    assert "Hardcoded credential" in result
+
+
+def test_tool_query_sonar_no_issues(tmp_path):
+    with patch("coding_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {"issues": []}
+        result = ca.tool_query_sonar(str(tmp_path), "Frontend")
+
+    assert "sin hallazgos" in result
+
+
+# --- Guardrail: edit_file tambien exige investigar antes ---
+
+
+def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path):
+    (tmp_path / "f.py").write_text("original\n")
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    call_count = {"n": 0}
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "edit_file",
+                    "input": {"path": "f.py", "old_string": "original", "new_string": "cambiado"},
+                }
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert (tmp_path / "f.py").read_text() == "original\n"

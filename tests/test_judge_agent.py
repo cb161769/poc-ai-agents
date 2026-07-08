@@ -2,8 +2,12 @@
 model's reply, the Anthropic<->Ollama message-shape adapters, and the cost
 estimator. No network, no MCP servers, no model calls involved.
 """
+import asyncio
+from unittest.mock import patch
+
 import pytest
 
+import judge_agent
 from judge_agent import (
     _estimate_cost_usd,
     _extract_json,
@@ -142,3 +146,84 @@ def test_redact_payload_for_logging_leaves_clean_text_untouched():
 
     assert redacted["ticket"]["description"] == payload["ticket"]["description"]
     assert redacted["change_description"] == payload["change_description"]
+
+
+def test_judge_tool_query_sonar_formats_issues():
+    with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {
+            "issues": [
+                {"severity": "CRITICAL", "rule": "python:S105", "message": "Hardcoded password", "line": 5},
+            ]
+        }
+        result = judge_agent.tool_query_sonar("AuthService")
+
+    mock_get_issues.assert_called_once_with("AuthService")
+    assert "CRITICAL" in result
+    assert "Hardcoded password" in result
+
+
+def test_judge_tool_query_sonar_no_issues():
+    with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {"issues": []}
+        result = judge_agent.tool_query_sonar("Frontend")
+
+    assert "sin hallazgos" in result
+
+
+def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
+    """Cuando el modelo llama a query_sonar, el loop de judge_with_tools()
+    tiene que resolverlo via JUDGE_LOCAL_TOOLS -- no intentar _call_mcp_tool
+    (que fallaria porque no hay ninguna sesion MCP conectada en este test).
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    call_count = {"n": 0}
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "query_sonar",
+                    "input": {"component": "AuthService"},
+                }
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    '{"verdict": "OK", "firewall_assessment": "ok", '
+                    '"change_assessment": "ok", "reasoning": "listo"}'
+                ),
+            }
+        ]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
+
+    with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {"issues": []}
+        payload = {
+            "ticket": {
+                "ticket_id": "T-1",
+                "summary": "algo",
+                "description": "desc",
+                "repository_origen": "AuthService",
+            },
+            "firewall": {"status": "APPROVED", "reason": None, "redactions_applied": 0},
+            "change_source": "local_diff",
+            "change_description": "diff",
+            "test_summary": "3 tests pasaron",
+        }
+        result = asyncio.run(judge_agent.judge_with_tools(payload))
+
+    assert result["verdict"] == "OK"
+    mock_get_issues.assert_called_once_with("AuthService")

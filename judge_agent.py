@@ -51,6 +51,7 @@ import httpx
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
+import sonar_client
 from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_to_blocks/_estimate_cost_usd
     ANTHROPIC_MODEL,       # re-exported so existing imports/tests of judge_agent keep working
     _call_mcp_tool,
@@ -76,14 +77,16 @@ JUDGE_SYSTEM_PROMPT = """Sos un revisor de seguridad y calidad, independiente y 
 para un pipeline que conecta tickets de Jira con un agente de código autónomo. \
 Tu trabajo es encontrar problemas, no confirmar que todo estuvo bien.
 
-Tenés acceso a herramientas reales sobre el grafo de dependencias (Neo4j) y \
-sobre código/histórico indexado (Qdrant) — usalas para VERIFICAR las afirmaciones \
-del contexto que te dan, no des por cierto lo que dice el texto sin chequearlo \
-cuando tengas dudas razonables. Por ejemplo: si el contexto dice que un cambio \
-en un servicio no afecta a otros, consultá el grafo vos mismo antes de confiarlo. \
-Cuando SÍ uses una herramienta, citá en tu "reasoning" el resultado concreto que \
-obtuviste (qué devolvió el grafo, qué encontraste en Qdrant) — no alcanza con decir \
-"verifiqué el grafo", decí qué viste ahí exactamente.
+Tenés acceso a herramientas reales sobre el grafo de dependencias (Neo4j), sobre \
+código/histórico indexado (Qdrant), y podés volver a consultar hallazgos REALES \
+y actuales de SonarQube (query_sonar) si el contexto que te dieron no alcanza — \
+usalas para VERIFICAR las afirmaciones del contexto que te dan, no des por cierto \
+lo que dice el texto sin chequearlo cuando tengas dudas razonables. Por ejemplo: \
+si el contexto dice que un cambio en un servicio no afecta a otros, consultá el \
+grafo vos mismo antes de confiarlo. Cuando SÍ uses una herramienta, citá en tu \
+"reasoning" el resultado concreto que obtuviste (qué devolvió el grafo, qué \
+encontraste en Qdrant o Sonar) — no alcanza con decir "verifiqué el grafo", decí \
+qué viste ahí exactamente.
 
 Evaluás tres cosas: (1) si la decisión del firewall (APPROVED/REJECTED) fue \
 correcta dado el contexto real del ticket, (2) si el cambio de código \
@@ -119,6 +122,38 @@ MCP_SERVERS = {
         },
     ),
 }
+
+
+def tool_query_sonar(component: str) -> str:
+    """El contexto del juez hoy no incluye hallazgos de Sonar -- esto le da
+    la capacidad de consultarlos en vivo (mismo cliente real que alimenta
+    el pipeline, mismo cache) si necesita mas detalle de un componente.
+    """
+    try:
+        result = sonar_client.get_issues(component)
+    except Exception as exc:
+        return f"error consultando Sonar para '{component}': {exc}"
+    issues = result.get("issues", [])
+    if not issues:
+        return f"sin hallazgos abiertos para '{component}'"
+    lines = [f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in issues]
+    return "\n".join(lines)
+
+
+JUDGE_LOCAL_TOOLS = {
+    "query_sonar": {
+        "description": "Consulta hallazgos REALES y actuales de SonarQube para un componente. Solo lectura.",
+        "input_schema": {"type": "object", "properties": {"component": {"type": "string"}}, "required": ["component"]},
+        "fn": tool_query_sonar,
+    },
+}
+
+
+def _local_tools_to_anthropic_format() -> list:
+    return [
+        {"name": name, "description": spec["description"], "input_schema": spec["input_schema"]}
+        for name, spec in JUDGE_LOCAL_TOOLS.items()
+    ]
 
 
 def _extract_json(text: str) -> dict:
@@ -176,7 +211,7 @@ async def judge_with_tools(payload: dict) -> dict:
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="juez")
 
-        tools = []
+        tools = list(_local_tools_to_anthropic_format())
         for name, session in sessions.items():
             try:
                 listed = await session.list_tools()
@@ -211,12 +246,17 @@ async def judge_with_tools(payload: dict) -> dict:
                 tool_results = []
                 for block in content:
                     if block.get("type") == "tool_use":
+                        name = block["name"]
+                        tool_input = block.get("input", {})
                         try:
-                            output = await _call_mcp_tool(sessions, block["name"], block.get("input", {}))
+                            if name in JUDGE_LOCAL_TOOLS:
+                                output = JUDGE_LOCAL_TOOLS[name]["fn"](**tool_input)
+                            else:
+                                output = await _call_mcp_tool(sessions, name, tool_input)
                         except Exception as exc:
                             output = f"error llamando a la herramienta: {exc}"
                         tool_results.append(
-                            {"type": "tool_result", "tool_use_id": block["id"], "content": output}
+                            {"type": "tool_result", "tool_use_id": block["id"], "content": str(output)}
                         )
                 messages.append({"role": "user", "content": tool_results})
 
