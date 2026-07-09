@@ -10,6 +10,8 @@ import pytest
 import judge_agent
 from judge_agent import (
     JUDGE_POLICY_IDS,
+    RETRYABLE_POLICY_REFERENCES,
+    _build_user_prompt,
     _estimate_cost_usd,
     _extract_json,
     _messages_to_ollama,
@@ -106,11 +108,19 @@ def test_ollama_response_to_blocks_with_tool_call_string_arguments():
     ],
 )
 def test_estimate_cost_usd_known_model(input_tokens, output_tokens, expected):
-    assert _estimate_cost_usd("claude-sonnet-5", input_tokens, output_tokens) == expected
+    assert _estimate_cost_usd("anthropic", "claude-sonnet-5", input_tokens, output_tokens) == expected
 
 
 def test_estimate_cost_usd_unknown_model_is_zero():
-    assert _estimate_cost_usd("some-model-not-in-the-pricing-table", 1000, 1000) == 0.0
+    assert _estimate_cost_usd("anthropic", "some-model-not-in-the-pricing-table", 1000, 1000) == 0.0
+
+
+def test_estimate_cost_usd_ollama_backend_is_always_zero():
+    assert _estimate_cost_usd("ollama", "llama3.1", 1_000_000, 1_000_000) == 0.0
+
+
+def test_estimate_cost_usd_unknown_backend_is_zero():
+    assert _estimate_cost_usd("some-future-backend", "claude-sonnet-5", 1_000_000, 1_000_000) == 0.0
 
 
 def test_redact_payload_for_logging_redacts_ticket_description_and_diff():
@@ -172,6 +182,47 @@ def test_normalize_policy_reference_falls_back_to_other_when_invalid_id():
 
 def test_judge_policy_ids_include_other_as_fallback():
     assert "other" in JUDGE_POLICY_IDS
+
+
+def _base_judge_payload(**overrides):
+    payload = {
+        "ticket": {"ticket_id": "T-1", "summary": "Fix login", "description": "desc", "repository_origen": "AuthService"},
+        "firewall": {"status": "APPROVED", "reason": None, "redactions_applied": 0},
+        "change_source": "local_diff",
+        "change_description": "diff",
+        "test_summary": "tests passed",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_build_user_prompt_defaults_to_pointwise_rubric():
+    prompt = _build_user_prompt(_base_judge_payload())
+
+    assert "Modo de evaluación: pointwise" in prompt
+
+
+def test_build_user_prompt_includes_reference_grounded_context():
+    prompt = _build_user_prompt(
+        _base_judge_payload(reference_answer="La forma correcta de resolver esto es X.")
+    )
+
+    assert "Modo de evaluación: reference_grounded" in prompt
+    assert "La forma correcta de resolver esto es X." in prompt
+
+
+def test_judge_system_prompt_embeds_policy_rubric():
+    assert "scope-mismatch" in judge_agent.JUDGE_SYSTEM_PROMPT
+    assert "graph-impact-unverified" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_retryable_policy_references_excludes_security_criteria():
+    assert "data-leak-evidence" not in RETRYABLE_POLICY_REFERENCES
+    assert "jailbreak-evidence" not in RETRYABLE_POLICY_REFERENCES
+    assert "firewall-false-negative" not in RETRYABLE_POLICY_REFERENCES
+    assert "other" not in RETRYABLE_POLICY_REFERENCES
+    assert RETRYABLE_POLICY_REFERENCES <= set(JUDGE_POLICY_IDS)
+    assert "scope-mismatch" in RETRYABLE_POLICY_REFERENCES
 
 
 def test_judge_tool_query_sonar_formats_issues():

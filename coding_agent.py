@@ -52,7 +52,7 @@ from agent_loop import (
     _connect_mcp_servers,
     _estimate_cost_usd,
     _final_text_with_json_retry,
-    _mcp_tools_to_anthropic_format,
+    _normalize_tool_schema,
     _select_backend,
 )
 from log_utils import get_logger
@@ -586,11 +586,7 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
             "latency_seconds": round(time.monotonic() - start_time, 2),
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens,
-            "estimated_cost_usd": (
-                round(_estimate_cost_usd(ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6)
-                if backend == "anthropic"
-                else 0.0
-            ),
+            "estimated_cost_usd": round(_estimate_cost_usd(backend, ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6),
         }
         return result
 
@@ -601,7 +597,7 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
         for name, session in sessions.items():
             try:
                 listed = await session.list_tools()
-                tools.extend(_mcp_tools_to_anthropic_format(name, listed.tools))
+                tools.extend(_normalize_tool_schema(name, listed.tools))
             except Exception as exc:
                 logger.warning(f"coding agent: no se pudieron listar tools de '{name}': {exc}")
 

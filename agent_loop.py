@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from llm_backends import estimate_cost_usd, get_backend_priority
 from log_utils import get_logger
 
 load_dotenv()
@@ -49,34 +50,29 @@ ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 
-# Precios aproximados por millon de tokens (USD) — solo para tener una
-# estimacion de costo en los evals/logs, no son precios contractuales.
-# Ajustar si cambian o si se usa otro modelo.
-ANTHROPIC_PRICING_PER_MILLION = {
-    "claude-sonnet-5": {"input": 3.0, "output": 15.0},
-    "claude-opus-4-8": {"input": 15.0, "output": 75.0},
-    "claude-haiku-4-5-20251001": {"input": 0.8, "output": 4.0},
-}
-
-
-def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
-    pricing = ANTHROPIC_PRICING_PER_MILLION.get(model)
-    if not pricing:
-        return 0.0
-    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+# Pricing y orden de preferencia viven en llm_backends.py (el registro de
+# backends) -- _estimate_cost_usd() se mantiene aca como wrapper fino para
+# que coding_agent.py/judge_agent.py no tengan que cambiar su import.
+def _estimate_cost_usd(backend: str, model: str, input_tokens: int, output_tokens: int) -> float:
+    return estimate_cost_usd(backend, model, input_tokens, output_tokens)
 
 
 def _select_backend() -> str:
-    """Anthropic first (best quality); local Ollama as a free/offline
-    fallback if reachable; otherwise "none" -- caller decides what that means.
+    """Recorre get_backend_priority() (default: Anthropic primero, Ollama
+    como fallback gratuito/local si esta alcanzable; configurable via
+    LLM_BACKEND_PRIORITY) y devuelve el primero disponible, o "none" si
+    ninguno lo esta -- el caller decide que significa eso para el.
     """
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    try:
-        httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
-        return "ollama"
-    except httpx.HTTPError:
-        return "none"
+    for backend in get_backend_priority():
+        if backend == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
+            return "anthropic"
+        if backend == "ollama":
+            try:
+                httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
+                return "ollama"
+            except httpx.HTTPError:
+                continue
+    return "none"
 
 
 def _tools_to_ollama_format(tools: list) -> list:
@@ -243,7 +239,15 @@ async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: 
     return sessions
 
 
-def _mcp_tools_to_anthropic_format(server_name: str, tools) -> list:
+def _normalize_tool_schema(server_name: str, tools) -> list:
+    """Normaliza tools listadas por un servidor MCP al formato interno
+    compartido (bloques con "name"/"description"/"input_schema") -- el
+    mismo formato que ya usan los bloques text/tool_use/tool_result en
+    todo este modulo. Anthropic es uno de los backends que lo consume tal
+    cual; Ollama pasa por _tools_to_ollama_format() para adaptarlo -- ambos
+    son adaptadores simetricos de este formato neutral, no hay un backend
+    "nativo" y otro "adaptado".
+    """
     return [
         {
             "name": f"{server_name}__{t.name}",

@@ -51,6 +51,8 @@ import httpx
 from dotenv import load_dotenv
 from prefect import flow, get_run_logger, task
 
+import graph_writer
+
 load_dotenv()
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -63,6 +65,13 @@ FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
 # ALERT_WEBHOOK_URL es el nombre generalizado (antes solo existia para
 # Falco); FALCO_ALERT_WEBHOOK_URL sigue funcionando como alias retrocompatible.
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL") or os.environ.get("FALCO_ALERT_WEBHOOK_URL", "")
+
+# Debe mantenerse sincronizado con RETRYABLE_POLICY_REFERENCES en
+# judge_agent.py (se duplica en vez de importarse porque judge_agent.py se
+# invoca como subprocess aca, no se importa). Deliberadamente NO incluye
+# data-leak-evidence/jailbreak-evidence/firewall-false-negative/other: esos
+# son de seguridad o ambiguos, nunca se reintentan automaticamente.
+RETRYABLE_POLICY_REFERENCES = {"scope-mismatch", "insufficient-test-coverage", "graph-impact-unverified"}
 
 
 def post_alert_webhook(text: str):
@@ -137,7 +146,7 @@ def discover_known_components():
         output = _run(
             [
                 "cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass,
-                "--format", "plain", "MATCH (n) RETURN DISTINCT n.name AS name",
+                "--format", "plain", "MATCH (n:Service) RETURN DISTINCT n.name AS name",
             ]
         )
     except RuntimeError:
@@ -271,11 +280,11 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
     if suggest.returncode == 0 and status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
         subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Copilot suggestion for {ticket_id}"], check=True)
-        return {"applied": True, "branch": branch, "base_branch": base_branch}
+        return {"applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest"}
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
-    return {"applied": False, "branch": None, "base_branch": base_branch}
+    return {"applied": False, "branch": None, "base_branch": base_branch, "backend": "gh_copilot_suggest"}
 
 
 def _local_coding_agent_backend_available() -> bool:
@@ -326,9 +335,11 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     finally:
         payload_file.unlink(missing_ok=True)
 
+    agent_backend = None
     try:
         agent_result = json.loads(result.stdout)
         print(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
+        agent_backend = agent_result.get("_meta", {}).get("backend")
     except json.JSONDecodeError:
         print("El agente no devolvio un JSON valido en stdout.")
 
@@ -339,11 +350,57 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
         subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
-        return {"applied": True, "branch": branch, "base_branch": base_branch}
+        return {"applied": True, "branch": branch, "base_branch": base_branch, "backend": agent_backend}
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
-    return {"applied": False, "branch": None, "base_branch": base_branch}
+    return {"applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend}
+
+
+@task(retries=0, name="coding-agent-local-real-retry")
+def retry_coding_agent_local_real(ticket_id: str, augmented_prompt: str, target_repo_dir: str) -> dict:
+    """Segundo pase de Camino B1 tras un veredicto FLAGGED retryable --
+    reusa la rama que el primer intento ya dejo checked out (NO crea una
+    rama nueva), y solo le pide a coding_agent.py que reintente con el
+    feedback del juez ya incluido en el prompt. Espeja
+    run_coding_agent_local_real() sin el paso de checkout -b.
+    """
+    payload_file = SCRIPT_DIR / "logs" / f".coding_agent_retry_payload_{ticket_id}_{int(time.time())}.json"
+    payload_file.parent.mkdir(parents=True, exist_ok=True)
+    payload_file.write_text(
+        json.dumps({"ticket_id": ticket_id, "sanitized_prompt": augmented_prompt, "target_repo_dir": target_repo_dir}),
+        encoding="utf-8",
+    )
+    try:
+        result = subprocess.run(
+            ["python3", str(SCRIPT_DIR / "coding_agent.py"), str(payload_file)],
+            stdout=subprocess.PIPE,
+            text=True,
+            cwd=target_repo_dir,
+        )
+    finally:
+        payload_file.unlink(missing_ok=True)
+
+    backend = None
+    try:
+        agent_result = json.loads(result.stdout)
+        print(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
+        backend = agent_result.get("_meta", {}).get("backend")
+    except json.JSONDecodeError:
+        print("El agente no devolvio un JSON valido en stdout en el segundo intento.")
+
+    status = subprocess.run(
+        ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
+    ).stdout
+
+    if not status.strip():
+        return {"applied": False, "backend": backend}
+
+    subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
+    )
+    return {"applied": True, "backend": backend}
 
 
 @task(retries=0, name="testing-agent")
@@ -394,7 +451,7 @@ def check_epic_single_repo_task(component_names: list) -> str:
     neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
     neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
     quoted = ", ".join(f"'{name}'" for name in component_names)
-    query = f"MATCH (n) WHERE n.name IN [{quoted}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
+    query = f"MATCH (n:Service) WHERE n.name IN [{quoted}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
     output = _run(["cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass, "--format", "plain", query])
 
     name_to_repo_url = {}
@@ -470,6 +527,57 @@ def check_falco_correlation(since_iso: str, ticket_id: str):
     post_alert_webhook(f"🚨 Falco detecto {count} alerta(s) en la corrida de {ticket_id}: {alert_lines}")
 
 
+@task(retries=1, name="record-run-in-graph")
+def record_run_in_graph(payload: dict) -> dict:
+    """Writes this run into the Neo4j knowledge graph (graph_writer.py) --
+    Story/Epic, Run, one Decision per stage, and a Risk node if the judge
+    cited a real policy_reference. Best-effort like graph_writer.record_run()
+    itself: it never raises for a connection failure, only for a malformed
+    payload (a real bug worth surfacing), so this task failing means a
+    programming error here, not a Neo4j hiccup.
+    """
+    return graph_writer.record_run(payload)
+
+
+def _build_graph_payload(
+    ticket_id: str,
+    summary: str,
+    components: list,
+    firewall_result: dict,
+    tests_status: str,
+    tests_reason: str | None,
+    judge_verdict: dict | None,
+    branch: str | None,
+    backend: str | None,
+    is_epic: bool = False,
+    child_ticket_keys: list | None = None,
+) -> dict:
+    judge_status = "SKIPPED"
+    judge_reason = None
+    policy_reference = None
+    if judge_verdict is not None:
+        judge_status = judge_verdict.get("verdict", "SKIPPED")
+        judge_reason = judge_verdict.get("reasoning")
+        policy_reference = judge_verdict.get("policy_reference")
+
+    return {
+        "run_id": f"{ticket_id}-{int(time.time())}",
+        "ticket_key": ticket_id,
+        "ticket_summary": summary,
+        "is_epic": is_epic,
+        "child_ticket_keys": child_ticket_keys or [],
+        "components": components,
+        "branch": branch,
+        "backend": backend,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "decisions": [
+            {"stage": "firewall", "status": firewall_result.get("status"), "reason": firewall_result.get("reason"), "policy_reference": None},
+            {"stage": "tests", "status": tests_status, "reason": tests_reason, "policy_reference": None},
+            {"stage": "judge", "status": judge_status, "reason": judge_reason, "policy_reference": policy_reference},
+        ],
+    }
+
+
 def _run_judge_safe(*args, **kwargs) -> dict | None:
     """Same tolerance as run_poc_loop.sh: if the judge can't run at all (no
     ANTHROPIC_API_KEY, no reachable Ollama, network failure), the pipeline
@@ -482,7 +590,61 @@ def _run_judge_safe(*args, **kwargs) -> dict | None:
         return None
 
 
-def _handle_rejected(ticket_id: str, jira_context: dict, firewall_result: dict):
+def _retry_local_diff(
+    ticket_id: str,
+    sanitized: str,
+    target_repo_dir: str,
+    agent_result: dict,
+    judge_verdict: dict,
+    jira_context: dict,
+    firewall_result: dict,
+    components: list,
+    summary: str,
+    is_epic: bool,
+    child_ticket_keys: list | None,
+    falco_since: str,
+) -> dict | None:
+    """Le da al coding agent un segundo (y ultimo) intento cuando el primer
+    veredicto fue FLAGGED con un policy_reference retryable -- reusa la
+    misma rama, le agrega el feedback del juez al prompt, y si produce
+    cambios nuevos vuelve a correr tests + juez. Devuelve el veredicto
+    nuevo (final) si hubo un segundo intento con resultado, o None si no
+    hubo cambios nuevos (el llamador se queda con el veredicto original).
+    Si los tests fallan en el reintento, bloquea directo (mismo criterio
+    que el primer intento) en vez de devolver un veredicto.
+    """
+    reasoning = judge_verdict.get("reasoning", "")
+    augmented_prompt = f"{sanitized}\n\n--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+
+    retry_result = retry_coding_agent_local_real(ticket_id, augmented_prompt, target_repo_dir)
+    if not retry_result["applied"]:
+        print("El segundo intento no produjo cambios nuevos -- se mantiene el veredicto FLAGGED original.")
+        return None
+
+    branch = agent_result["branch"]
+    test_result = run_tests(target_repo_dir)
+    if not test_result["passed"]:
+        comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON en el segundo intento de '{branch}'.", ticket_key=ticket_id)
+        post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id} (segundo intento): los tests reales fallaron en '{branch}'.")
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
+        check_falco_correlation(falco_since, ticket_id)
+        record_run_in_graph(
+            _build_graph_payload(
+                ticket_id, summary, components, firewall_result,
+                tests_status="FAILED", tests_reason="el test suite real fallo (segundo intento)",
+                judge_verdict=None, branch=branch, backend=retry_result.get("backend"),
+                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+            )
+        )
+        raise PipelineBlocked("tests reales fallaron en el segundo intento")
+
+    diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{branch}"])
+    return _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
+
+
+def _handle_rejected(
+    ticket_id: str, jira_context: dict, firewall_result: dict, is_epic: bool = False, child_ticket_keys: list | None = None
+):
     """Shared by ticket mode and epic mode: the firewall said REJECTED, the
     judge gets a chance to flag a possible false positive (advisory only,
     never overrides the firewall), then the flow stops.
@@ -507,10 +669,34 @@ def _handle_rejected(ticket_id: str, jira_context: dict, firewall_result: dict):
                 ticket_key=ticket_id,
             )
 
+    record_run_in_graph(
+        _build_graph_payload(
+            ticket_id,
+            jira_context.get("summary", ""),
+            (jira_context.get("repository_origen") or "").split(","),
+            firewall_result,
+            tests_status="SKIPPED",
+            tests_reason=None,
+            judge_verdict=judge_verdict,
+            branch=None,
+            backend=None,
+            is_epic=is_epic,
+            child_ticket_keys=child_ticket_keys,
+        )
+    )
+
     raise PipelineBlocked(firewall_result["reason"])
 
 
-def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: dict, target_repo_dir: str) -> dict:
+def _deliver(
+    ticket_id: str,
+    summary: str,
+    firewall_result: dict,
+    jira_context: dict,
+    target_repo_dir: str,
+    is_epic: bool = False,
+    child_ticket_keys: list | None = None,
+) -> dict:
     """Etapa 5 en adelante: coding agent (nube o fallback local), testing
     agent, juez, correlacion de Falco. Compartido por ticket mode y epic
     mode -- ambos llegan aca con el firewall ya en APPROVED y jira_context
@@ -519,6 +705,7 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
     sanitized = firewall_result["sanitized_prompt"]
     transition_jira(JIRA_IN_PROGRESS_STATUS, ticket_key=ticket_id)
     falco_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    components = (jira_context.get("repository_origen") or "").split(",")
 
     if GITHUB_REPO:
         agent_result = run_coding_agent_cloud(ticket_id, summary, sanitized)
@@ -531,11 +718,15 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
             jira_context, firewall_result, "issue_only", sanitized,
             "sin tests (coding agent en la nube, el PR aun no existe en el momento de esta corrida)",
         )
+        tests_status, tests_reason, branch, backend = "SKIPPED", None, None, "cloud"
     else:
         if _local_coding_agent_backend_available():
             agent_result = run_coding_agent_local_real(ticket_id, sanitized, target_repo_dir)
         else:
             agent_result = run_coding_agent_local(ticket_id, sanitized, target_repo_dir)
+
+        branch = agent_result.get("branch")
+        backend = agent_result.get("backend")
 
         if agent_result["applied"]:
             comment_jira(
@@ -550,12 +741,38 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
                 post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id}: los tests reales fallaron en '{agent_result['branch']}'.")
                 transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
                 check_falco_correlation(falco_since, ticket_id)
+                record_run_in_graph(
+                    _build_graph_payload(
+                        ticket_id, summary, components, firewall_result,
+                        tests_status="FAILED", tests_reason="el test suite real fallo",
+                        judge_verdict=None, branch=branch, backend=backend,
+                        is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+                    )
+                )
                 raise PipelineBlocked("tests reales fallaron")
 
             diff_text = _run([
                 "git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{agent_result['branch']}"
             ])
             judge_verdict = _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
+            tests_status, tests_reason = "PASSED", None
+
+            if (
+                judge_verdict is not None
+                and judge_verdict.get("verdict") == "FLAGGED"
+                and judge_verdict.get("policy_reference") in RETRYABLE_POLICY_REFERENCES
+            ):
+                print(
+                    f"🔁 El juez marco un problema potencialmente corregible "
+                    f"({judge_verdict.get('policy_reference')}) -- dandole al coding agent un segundo intento."
+                )
+                retried_verdict = _retry_local_diff(
+                    ticket_id, sanitized, target_repo_dir, agent_result, judge_verdict,
+                    jira_context, firewall_result, components, summary,
+                    is_epic, child_ticket_keys, falco_since,
+                )
+                if retried_verdict is not None:
+                    judge_verdict = retried_verdict
         else:
             comment_jira(
                 "🤖 Copilot (Prefect): AI Firewall aprobo la solicitud "
@@ -563,6 +780,7 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
                 ticket_key=ticket_id,
             )
             judge_verdict = _run_judge_safe(jira_context, firewall_result, "issue_only", sanitized, "sin cambios aplicados")
+            tests_status, tests_reason = "SKIPPED", None
 
     if judge_verdict is None:
         print("El juez no pudo evaluar esta corrida — continua sin veredicto.")
@@ -574,6 +792,15 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
         comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK. {judge_verdict['reasoning']}", ticket_key=ticket_id)
 
     check_falco_correlation(falco_since, ticket_id)
+
+    record_run_in_graph(
+        _build_graph_payload(
+            ticket_id, summary, components, firewall_result,
+            tests_status=tests_status, tests_reason=tests_reason,
+            judge_verdict=judge_verdict, branch=branch, backend=backend,
+            is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+        )
+    )
 
     return {"firewall": firewall_result, "agent": agent_result, "judge": judge_verdict}
 
@@ -709,12 +936,16 @@ def run_epic_pipeline(epic_key: str):
     }
 
     firewall_result = evaluate_firewall(prompt, jira_context, sonar_errors)
+    child_ticket_keys = [c["ticket_id"] for c in children]
 
     if firewall_result["status"] == "REJECTED":
         logger.warning(f"Rechazado por el firewall: {firewall_result['reason']}")
-        _handle_rejected(epic_key, jira_context, firewall_result)
+        _handle_rejected(epic_key, jira_context, firewall_result, is_epic=True, child_ticket_keys=child_ticket_keys)
 
-    result = _deliver(epic_key, epic["summary"], firewall_result, jira_context, target_repo_dir)
+    result = _deliver(
+        epic_key, epic["summary"], firewall_result, jira_context, target_repo_dir,
+        is_epic=True, child_ticket_keys=child_ticket_keys,
+    )
 
     for child in children:
         comment_jira(

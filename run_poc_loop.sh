@@ -47,6 +47,9 @@ NEO4J_USERNAME="${NEO4J_USERNAME:-neo4j}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:-test_password_local}"
 FIREWALL_URL="${FIREWALL_URL:-http://localhost:8080}"
 CONTRIBUTION_LOG="${SCRIPT_DIR}/logs/copilot_contribution.jsonl"
+# Historias hijas de la epica actual, para record_run_in_graph() -- solo se
+# llena en modo --epic (run_epic_etapas()); en modo ticket normal queda "[]".
+CHILD_TICKET_KEYS_JSON="[]"
 
 fail() {
   echo "ERROR: $1" >&2
@@ -165,21 +168,131 @@ transition_jira_ticket() {
     || echo "(no se pudo mover el ticket a '${target_status}' — puede que tu workflow use otro nombre; revisa JIRA_IN_PROGRESS_STATUS)"
 }
 
+# Registra esta corrida en el grafo de conocimiento de Neo4j (graph_writer.py)
+# -- Story/Epic, Run, una Decision por etapa (firewall/tests/judge), y un
+# Risk si el juez cito un policy_reference real (evals/JUDGE_POLICY.md).
+# Best-effort SIEMPRE: graph_writer.py ya maneja fallos de conexion
+# internamente y nunca devuelve exit != 0 por eso, pero igual no dejamos que
+# esto frene la corrida si algo mas raro pasa (jq roto, etc).
+record_run_in_graph() {
+  local branch="$1" backend="$2" tests_status="$3" tests_reason="$4" judge_status="$5" judge_reason="$6" judge_policy_ref="$7"
+
+  local components_json is_epic_json decisions_json payload run_id
+  components_json=$(echo "${REPO_ORIGEN}" | tr ',' '\n' | jq -R . | jq -s .)
+  if [ -n "${EPIC_KEY}" ]; then
+    is_epic_json="true"
+  else
+    is_epic_json="false"
+  fi
+  run_id="${TICKET_ID}-$(date +%s)"
+
+  decisions_json=$(jq -n \
+    --arg fw_status "${STATUS}" --arg fw_reason "${REASON:-}" \
+    --arg tests_status "${tests_status}" --arg tests_reason "${tests_reason}" \
+    --arg judge_status "${judge_status}" --arg judge_reason "${judge_reason}" \
+    --arg judge_policy_ref "${judge_policy_ref}" \
+    '[
+      {stage: "firewall", status: $fw_status, reason: (if $fw_reason == "" then null else $fw_reason end), policy_reference: null},
+      {stage: "tests", status: $tests_status, reason: (if $tests_reason == "" then null else $tests_reason end), policy_reference: null},
+      {stage: "judge", status: $judge_status, reason: (if $judge_reason == "" then null else $judge_reason end), policy_reference: (if $judge_policy_ref == "" or $judge_policy_ref == "null" then null else $judge_policy_ref end)}
+    ]')
+
+  payload=$(jq -n \
+    --arg run_id "${run_id}" \
+    --arg ticket_key "${TICKET_ID}" \
+    --arg ticket_summary "${SUMMARY:-}" \
+    --argjson is_epic "${is_epic_json}" \
+    --argjson child_ticket_keys "${CHILD_TICKET_KEYS_JSON:-[]}" \
+    --argjson components "${components_json}" \
+    --arg branch "${branch}" \
+    --arg backend "${backend}" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson decisions "${decisions_json}" \
+    '{run_id: $run_id, ticket_key: $ticket_key, ticket_summary: $ticket_summary, is_epic: $is_epic, child_ticket_keys: $child_ticket_keys, components: $components, branch: (if $branch == "" then null else $branch end), backend: (if $backend == "" then null else $backend end), ts: $ts, decisions: $decisions}')
+
+  echo "${payload}" | python3 "${SCRIPT_DIR}/graph_writer.py" >/dev/null 2>&1 || true
+}
+
+# Criterios de policy_reference que el juez puede marcar y que el coding
+# agent tiene chance real de corregir -- debe mantenerse sincronizado con
+# RETRYABLE_POLICY_REFERENCES en judge_agent.py. Deliberadamente NO incluye
+# data-leak-evidence/jailbreak-evidence/firewall-false-negative/other: esos
+# son de seguridad o ambiguos, nunca se reintentan automaticamente.
+RETRYABLE_POLICY_REFS=(scope-mismatch insufficient-test-coverage graph-impact-unverified)
+
+# Le da al coding agent un segundo intento (UNA sola vez) cuando el juez
+# marco un problema potencialmente corregible. Reusa la MISMA rama (no crea
+# una nueva), le agrega el feedback del juez al prompt original, y si
+# produce cambios nuevos vuelve a correr tests + juez una vez mas
+# (run_judge con retry_count=1, que ya no vuelve a intentar). Devuelve 0 si
+# el segundo intento produjo algun resultado manejado (tests fallidos o un
+# nuevo veredicto), 1 si no hubo cambios nuevos -- en ese caso el llamador
+# se queda con el veredicto FLAGGED original.
+retry_coding_agent_with_feedback() {
+  local branch="$1" reasoning="$2"
+  local retry_payload_file retry_agent_result_json retry_diff_text retry_tests_gate_result
+
+  local augmented_prompt="${SANITIZED}
+
+--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---
+${reasoning}"
+
+  retry_payload_file=$(mktemp)
+  jq -n --arg ticket_id "${TICKET_ID}" --arg sanitized "${augmented_prompt}" --arg repo "${TARGET_REPO_DIR}" \
+    '{ticket_id: $ticket_id, sanitized_prompt: $sanitized, target_repo_dir: $repo}' > "${retry_payload_file}"
+
+  retry_agent_result_json=$(python3 "${SCRIPT_DIR}/coding_agent.py" "${retry_payload_file}")
+  rm -f "${retry_payload_file}"
+  echo "Resultado del segundo intento: $(echo "${retry_agent_result_json}" | jq -r '.status') — $(echo "${retry_agent_result_json}" | jq -r '.summary')"
+  AGENT_BACKEND=$(echo "${retry_agent_result_json}" | jq -r '._meta.backend // "unknown"')
+
+  if [ -z "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
+    echo "El segundo intento no produjo cambios nuevos."
+    return 1
+  fi
+
+  git -C "${TARGET_REPO_DIR}" add -A
+  git -C "${TARGET_REPO_DIR}" commit -m "Coding agent retry for ${TICKET_ID} (feedback del juez)" >/dev/null
+
+  retry_diff_text=$(git -C "${TARGET_REPO_DIR}" diff "${base_branch}..${branch}")
+  run_tests_gate "${REPO_ORIGEN}" "${branch}"
+  retry_tests_gate_result=$?
+  log_contribution "APPROVED" "${REDACTIONS}" true true "${branch}" "${TEST_PASSED}"
+
+  if [ "${retry_tests_gate_result}" -eq 0 ]; then
+    run_judge "local_diff" "${retry_diff_text}" "rama '${branch}' de ${TARGET_REPO_DIR} (segundo intento)" "${branch}" "" "${TEST_OUTPUT}" 1
+  fi
+  return 0
+}
+
 # Independent judge (Claude, no gh copilot) que revisa la decision del
 # firewall + el cambio real (o el issue, si el coding agent en la nube
 # todavia no genero PR) + la corrida completa. Si marca FLAGGED, tiene poder
 # de bloqueo real: reabre/transiciona el ticket a un estado bloqueado, deja
 # un comentario fuerte, y si hay una rama local, la marca inequivocamente en
 # el propio historial de git.
+#
+# Ultimo parametro (retry_count, default 0): si el veredicto es FLAGGED con
+# un policy_reference retryable, change_source="local_diff", y todavia no se
+# reintento en esta corrida, le da al coding agent un segundo intento
+# (retry_coding_agent_with_feedback) en vez de bloquear directo. El segundo
+# llamado a run_judge se hace con retry_count=1, así no hay un tercer intento.
 run_judge() {
-  local change_source="$1" change_description="$2" location_label="$3" branch="${4:-}" issue_url="${5:-}" test_summary="${6:-sin tests corridos para esta corrida}"
+  local change_source="$1" change_description="$2" location_label="$3" branch="${4:-}" issue_url="${5:-}" test_summary="${6:-sin tests corridos para esta corrida}" retry_count="${7:-0}"
 
   echo
   echo "=================================================================="
   echo " ETAPA 7 — Agente juez (segunda opinion independiente, con poder de bloqueo)"
   echo "=================================================================="
 
-  local judge_payload verdict_json verdict reasoning
+  local judge_payload verdict_json verdict reasoning policy_ref
+  local tests_status_for_graph="SKIPPED"
+  if [ "${TEST_PASSED:-}" = "true" ]; then
+    tests_status_for_graph="PASSED"
+  elif [ "${TEST_PASSED:-}" = "false" ]; then
+    tests_status_for_graph="FAILED"
+  fi
+
   judge_payload=$(jq -n \
     --argjson ticket "${JIRA_CONTEXT}" \
     --arg status "${STATUS}" \
@@ -192,14 +305,31 @@ run_judge() {
 
   if ! verdict_json=$(echo "${judge_payload}" | python3 "${SCRIPT_DIR}/judge_agent.py" 2>/dev/null); then
     echo "El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad). Continua sin veredicto."
+    record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "${tests_status_for_graph}" "" "SKIPPED" "sin backend de modelo disponible" ""
     return
   fi
 
   verdict=$(echo "${verdict_json}" | jq -r '.verdict')
   reasoning=$(echo "${verdict_json}" | jq -r '.reasoning')
+  policy_ref=$(echo "${verdict_json}" | jq -r '.policy_reference // ""')
 
   echo "Veredicto del juez: ${verdict}"
   echo "Razonamiento: ${reasoning}"
+
+  if [ "${verdict}" = "FLAGGED" ] && [ "${change_source}" = "local_diff" ] && [ "${retry_count}" = "0" ]; then
+    local ref is_retryable=false
+    for ref in "${RETRYABLE_POLICY_REFS[@]}"; do
+      [ "${ref}" = "${policy_ref}" ] && is_retryable=true
+    done
+    if [ "${is_retryable}" = "true" ]; then
+      echo
+      echo "🔁 El juez marco un problema potencialmente corregible (${policy_ref}) -- dandole al coding agent un segundo intento con el feedback."
+      if retry_coding_agent_with_feedback "${branch}" "${reasoning}"; then
+        return
+      fi
+      echo "El segundo intento no produjo cambios -- se bloquea con el veredicto original del juez."
+    fi
+  fi
 
   if [ "${verdict}" = "FLAGGED" ] && [ "${change_source}" = "firewall_rejected" ]; then
     # El juez audita un rechazo, nunca lo revierte: el firewall sigue siendo
@@ -234,6 +364,8 @@ run_judge() {
   else
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): OK. ${reasoning}"
   fi
+
+  record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "${tests_status_for_graph}" "" "${verdict}" "${reasoning}" "${policy_ref}"
 }
 
 # Testing agent (deterministic, not an LLM): corre el test suite real del
@@ -279,6 +411,8 @@ run_tests_gate() {
     echo "Rama '${branch}' marcada como bloqueada en su propio historial de git — no la mergees sin revision."
   fi
 
+  record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "FAILED" "el test suite real fallo" "SKIPPED" "no se llego a llamar al juez, los tests bloquearon antes" ""
+
   return 1
 }
 
@@ -316,7 +450,7 @@ check_epic_single_repo() {
   local quoted_list query rows expected_count found_count
   quoted_list=$(echo "${component_names}" | sed "s/.*/'&'/" | paste -sd, -)
 
-  query="MATCH (n) WHERE n.name IN [${quoted_list}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
+  query="MATCH (n:Service) WHERE n.name IN [${quoted_list}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
   rows=$(cypher_query "${query}" 2>/dev/null | tail -n +2 | tr -d '"')
 
   expected_count=$(echo "${component_names}" | grep -c . || true)
@@ -378,6 +512,8 @@ run_epic_etapas() {
   if [ "${child_count}" -eq 0 ]; then
     fail "la epica ${EPIC_KEY} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent' -- ver README."
   fi
+
+  CHILD_TICKET_KEYS_JSON=$(echo "${epic_json}" | jq '[.children[].ticket_id]')
 
   unresolved=$(echo "${epic_json}" | jq -r '[.children[] | select(.repository_origen == null) | .ticket_id] | join(", ")')
   if [ -n "${unresolved}" ]; then
@@ -505,6 +641,7 @@ run_pipeline_delivery() {
     echo "gh copilot NO fue invocado."
     post_jira_comment "🛡️ AI Firewall (automatizado): solicitud RECHAZADA. Motivo: ${REASON}. gh copilot no fue invocado."
     log_contribution "REJECTED" 0 false false ""
+    AGENT_BACKEND=""
     run_judge "firewall_rejected" "${REASON}" "solicitud rechazada por el firewall"
     exit 1
   fi
@@ -571,6 +708,7 @@ EOF
         echo "Asignado a ${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}. El agente trabaja de forma asincronica en la nube y va a abrir un PR."
         post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo y asigno ${issue_url} — el agente trabaja en la nube y va a abrir un PR."
         log_contribution "APPROVED" "${REDACTIONS}" true true "issue:${issue_url}"
+        AGENT_BACKEND="cloud"
         # El PR todavia no existe (el coding agent trabaja async): el juez solo
         # puede evaluar la decision del firewall + el planteo del issue por ahora.
         run_judge "issue_only" "${issue_body}" "issue ${issue_url}" "" "${issue_url}"
@@ -578,6 +716,7 @@ EOF
         echo "No se pudo asignar a '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}'. Verifica que el coding agent este habilitado en ${GITHUB_REPO} y que el login del assignee sea correcto."
         post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${issue_url} pero no se pudo asignar al coding agent — revisar configuracion del repo."
         log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${issue_url}"
+        record_run_in_graph "" "cloud" "SKIPPED" "" "SKIPPED" "no se pudo asignar el issue al coding agent" ""
       fi
       check_falco_correlation "${falco_since_ts}"
       exit 0
@@ -618,12 +757,14 @@ EOF
       agent_result_json=$(python3 "${SCRIPT_DIR}/coding_agent.py" "${payload_file}")
       rm -f "${payload_file}"
       echo "Resultado del agente: $(echo "${agent_result_json}" | jq -r '.status') — $(echo "${agent_result_json}" | jq -r '.summary')"
+      AGENT_BACKEND=$(echo "${agent_result_json}" | jq -r '._meta.backend // "unknown"')
     else
       # --- Camino B2 (fallback): gh copilot suggest, sugerencia de un solo
       # tiro sin loop ni acceso a los MCP — ver PLAN.md.
       echo "Sin ANTHROPIC_API_KEY ni Ollama alcanzable — usando gh copilot suggest como fallback (sugerencia puntual, no un agente)."
       echo "Copilot va a sugerir un comando para resolver ${TICKET_ID} en ${TARGET_REPO_DIR}. Se te pedira confirmar antes de ejecutar nada."
       gh copilot suggest -t shell "${SANITIZED}"
+      AGENT_BACKEND="gh_copilot_suggest"
     fi
 
     if [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
@@ -664,7 +805,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 # se mantenga sincronizada a mano. Best-effort: si Neo4j no esta disponible
 # o el grafo esta vacio, se deja lo que ya haya en .env sin tocar nada.
 if command -v cypher-shell >/dev/null 2>&1; then
-  DISCOVERED_COMPONENTS=$(cypher_query "MATCH (n) RETURN DISTINCT n.name AS name" 2>/dev/null | tail -n +2 | tr -d '"' | paste -sd, -)
+  DISCOVERED_COMPONENTS=$(cypher_query "MATCH (n:Service) RETURN DISTINCT n.name AS name" 2>/dev/null | tail -n +2 | tr -d '"' | paste -sd, -)
   if [ -n "${DISCOVERED_COMPONENTS}" ]; then
     export JIRA_KNOWN_COMPONENTS="${DISCOVERED_COMPONENTS}"
     echo "Componentes conocidos derivados del grafo Neo4j: ${JIRA_KNOWN_COMPONENTS}"

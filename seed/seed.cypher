@@ -21,3 +21,14 @@ MERGE (worker:Service {name: "DataWorker"})
 
 MERGE (frontend)-[:DEPENDS_ON]->(auth)
 MERGE (worker)-[:DEPENDS_ON]->(auth);
+
+// Ownership -- igual que repo_url, esto es dato de ejemplo curado a mano,
+// no algo que se derive automaticamente de un ticket puntual (quien esta
+// asignado a un ticket hoy no es lo mismo que quien es responsable del
+// componente). Ver prompts/sync_graph_from_azure_devops.md para la version
+// real (a partir de CODEOWNERS si el repo lo tiene).
+MERGE (platform_team:Owner {name: "Equipo Platform"})
+MERGE (frontend_team:Owner {name: "Equipo Frontend"})
+MERGE (auth)-[:OWNED_BY]->(platform_team)
+MERGE (worker)-[:OWNED_BY]->(platform_team)
+MERGE (frontend)-[:OWNED_BY]->(frontend_team);

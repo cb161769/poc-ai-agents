@@ -33,3 +33,13 @@ grafo Neo4j local).
 No inventes nodos o relaciones que no puedas verificar con las tools —
 si un repo no declara ninguna dependencia interna reconocible, no crees el
 edge.
+
+5. Ownership (opcional): si el repo tiene un archivo `CODEOWNERS` (raíz o
+   `.github/CODEOWNERS`), inspecciónalo y por cada regla que mapee el repo
+   completo (o su carpeta raíz) a un equipo/usuario, aplica `MERGE (o:Owner
+   {name: "<equipo o usuario>"})` y `MERGE (servicio)-[:OWNED_BY]->(o)`.
+   Esto es curación de un dato real del repo, no algo que Azure DevOps
+   entregue directamente — si el repo no tiene `CODEOWNERS`, omití este paso
+   por completo en vez de inventar un owner. No confundas esto con quién
+   está *asignado* a un ticket puntual: `OWNED_BY` es responsabilidad del
+   componente en general, no de una tarea específica.
