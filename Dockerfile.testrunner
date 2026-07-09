@@ -1,0 +1,31 @@
+# Imagen dedicada a correr los tests (y, si hace falta, run_poc_loop.sh/
+# scripts/smoke_test.sh) DENTRO de un contenedor -- evita depender de que el
+# host tenga python3/jq/git/cypher-shell resueltos correctamente en el PATH
+# (en Windows, python3 puede resolver al stub de Microsoft Store en vez del
+# interprete real; este Dockerfile no depende de eso en absoluto).
+#
+# Build:  docker build -f Dockerfile.testrunner -t poc-ai-agents-testrunner .
+# Tests:  docker run --rm -v "$(pwd):/repo" -w /repo poc-ai-agents-testrunner \
+#           python3 -m pytest tests/ -v
+FROM python:3.10-slim
+
+WORKDIR /repo
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git jq curl openjdk-21-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# cypher-shell: distribuido por Neo4j como paquete standalone, no via apt.
+RUN curl -fsSL -o /tmp/cypher-shell.deb \
+      "https://dist.neo4j.org/cypher-shell/cypher-shell_5.22.0_all.deb" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/cypher-shell.deb \
+    && rm -f /tmp/cypher-shell.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt pytest-timeout
+
+# El codigo se monta en runtime (-v "$(pwd):/repo"), no se copia acá -- así
+# corre siempre contra el estado real del repo sin tener que reconstruir la
+# imagen en cada cambio.
