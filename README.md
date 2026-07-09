@@ -1,4 +1,4 @@
-# PoC — Agente autónomo + AI Firewall local
+# PoC — Agente de código con supervisión humana + AI Firewall local
 
 **Estado: prueba de concepto (PoC) funcional, sin mocks.** Todos los componentes hablan con servicios reales (Jira Cloud, SonarQube, Neo4j, Qdrant, Azure DevOps, GitHub Copilot / Anthropic / Ollama) — nada acá simula una respuesta. Eso significa que también hereda las limitaciones reales de esos servicios (ver [Limitaciones](#limitaciones-reales)). No es un producto terminado ni un framework reusable fuera de este repo.
 
