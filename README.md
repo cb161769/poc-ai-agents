@@ -42,20 +42,29 @@ AI Firewall (:8080) ──rechaza──► REJECTED (403), corrida termina
        ▼
 Contexto compuesto: grafo Neo4j (impacto real) + hallazgos SonarQube (componente)
   [+ Figma specs si el ticket trae link]  [+ descripción de Rovo si hay adjunto]
+  [+ orden real por dependencia + conflictos si es una épica -- epic_planner.py, §6.1]
        ▼
 Agente de código (uno de tres caminos, ver §6):
-  A) GitHub Copilot coding agent (nube, PR async)
-  B1) coding_agent.py (agente local, Claude/Ollama, tool-calling con confirmación humana)
+  A) GitHub Copilot coding agent (nube, PR async) -- issue_body redactado antes de publicarse (§6.3)
+  B1) coding_agent.py (agente local, Claude/Ollama, tool-calling con confirmación humana,
+      autocrítica self_review antes de terminar -- §6.4)
   B2) gh copilot suggest (sugerencia de un tiro, fallback sin backend de modelo)
        ▼
-Testing agent (scripts/run_module_tests.sh) — test suite real del módulo, en contenedor descartable
+output_guard.py — mismas reglas del firewall aplicadas al DIFF que sale (no solo al prompt de entrada)
+       │  encuentra evidencia real ──► BLOCKED, corrida termina
+       ▼
+Testing agent (scripts/run_module_tests.sh) — test suite real del módulo + lint/format advisory,
+  en contenedor descartable; rescan_sonar.sh re-escanea el diff real (§9.1)
        │  falla ──► BLOCKED, corrida termina
        ▼
-Agente juez (judge_agent.py) — modelo distinto, con MCP real a Neo4j/Qdrant, puede volver a bloquear
+Falco (opcional) — correlación de syscalls de ESTA MISMA ventana, se le pasa al juez antes de que decida
        ▼
-Falco (opcional) — monitoreo a nivel de syscalls de los contenedores, correlacionado con la corrida
+Agente juez (judge_agent.py) — modelo distinto, con MCP real a Neo4j/Qdrant, ve self_review + Falco +
+  conflictos de épica + hallazgos nuevos de Sonar, puede volver a bloquear o pedir un reintento acotado
+       │  OK ──► push + PR real (Camino B1) + ticket a JIRA_REVIEW_STATUS (§6.5)
        ▼
-Comentario + transición de estado en el ticket de Jira real, logs de auditoría en logs/*.jsonl
+Comentario + transición de estado en el ticket de Jira real, corrida completa como evidencia en el
+  grafo de Neo4j (graph_writer.py, §8.1), logs de auditoría en logs/*.jsonl
 ```
 
 Todo lo anterior corre por default vía `run_poc_loop.sh` (bash secuencial). `orchestration.py` es el mismo pipeline orquestado por **Prefect** (reintentos, UI de grafo, estado persistido) — ver §13.
@@ -64,30 +73,38 @@ Todo lo anterior corre por default vía `run_poc_loop.sh` (bash secuencial). `or
 
 ```
 run_poc_loop.sh / orchestration.py   Punto de entrada del pipeline (bash vs. Prefect)
+pipeline_shared.py                   Constantes/logica compartidas entre AMBOS orquestadores (fuente unica, ver §6.2)
 jira_client.py                       Lee/comenta/transiciona tickets Jira reales
 sonar_client.py                      Consulta hallazgos reales de SonarQube (con cache)
-firewall_proxy.py                    AI Firewall: detección de fugas de datos y jailbreaks
+firewall_proxy.py                    AI Firewall: detección de fugas de datos y jailbreaks (entrada)
+output_guard.py                      Guardia de salida: mismas reglas del firewall, aplicadas al diff/issue que SALE del agente (§6.3)
 judge_agent.py                       Agente juez independiente (segunda opinión, MCP real)
-agent_loop.py                        Maquinaria compartida de tool-calling (backend dual, MCP)
+epic_planner.py                      Planificador de épicas: orden real por dependencia + conflictos (§6.1)
+graph_writer.py                      Escribe cada corrida como evidencia real en el grafo de Neo4j (§8.1)
+agent_loop.py                        Maquinaria compartida de tool-calling (backend dual, MCP, prompt caching)
 llm_backends.py                      Registro de backends LLM (orden de preferencia, pricing) -- ver §13.1
 coding_agent.py                      Agente de código local (Camino B1)
+chat.py                              Chat interactivo con el mismo backend dual + todas las tools (§14)
 figma_client.py                      Specs de Figma vía REST cuando el ticket trae un link
 cache_utils.py                       Cache genérico con TTL usado por los clientes reales
 
 scripts/
   setup.sh                           Un solo comando: .env + infra + SONAR_TOKEN real + modelo Ollama
-  check_prereqs.sh                   Valida que la infraestructura esté arriba
+  check_prereqs.sh                   Valida que la infraestructura esté arriba (incluye si Copilot coding agent es asignable de verdad)
   health_check.sh --json             Monitoreo continuo (cron/systemd) de los mismos servicios, postea a ALERT_WEBHOOK_URL si algo cae
   smoke_test.sh                      Corre el pipeline real de punta a punta con datos descartables
-  run_module_tests.sh                Testing agent: auto-detecta stack y corre el test suite real
+  run_module_tests.sh                Testing agent: auto-detecta stack, corre el test suite real + lint/format advisory
+  bootstrap_sonar.sh                 Rota el admin de Sonar, genera el token real, escanea sample-repo/ (corre en el contenedor sonar-scanner)
+  rescan_sonar.sh                    Re-escanea el repo objetivo DESPUÉS del cambio del coding agent (§9.1)
   report_sprint_metrics.py           Agrega logs/copilot_contribution.jsonl en métricas de sprint
   review_judge_verdicts.py           Curación humana de veredictos del juez
   promote_reviews_to_evals.py        Promueve revisiones humanas a casos de eval
   check_falco_alerts.py              Correlaciona alertas de Falco con la ventana de cada corrida
 
 evals/
-  judge_eval_cases.jsonl             Dataset etiquetado a mano para benchmarking del juez
-  run_judge_evals.py                 Corre el dataset contra judge_agent.py real
+  judge_eval_cases.jsonl             Dataset etiquetado a mano para benchmarking del juez (con expected_policy_reference)
+  JUDGE_POLICY.md                    Rúbrica versionada de criterios de bloqueo (policy_reference)
+  run_judge_evals.py                 Corre el dataset contra judge_agent.py real, mide accuracy de veredicto Y de policy_reference
 
 falco/custom_rules.yaml              Reglas propias de monitoreo a nivel de sistema operativo
 seed/seed.cypher                     Seed fallback del grafo si no se sincronizó desde Azure DevOps
@@ -96,6 +113,8 @@ prompts/                             Prompts para pegar en Copilot Chat (sync de
 tests/                               Tests unitarios de la herramienta misma (no del repo objetivo)
 logs/                                Auditoría real por corrida (gitignored)
 docker-compose.yml                   Neo4j, SonarQube, Qdrant, AI Firewall, Ollama, Falco, Prefect
+Dockerfile.firewall                  Imagen del AI Firewall / rag-indexer (Python + deps del proyecto)
+Dockerfile.testrunner                Imagen para correr tests/pipeline dentro de Docker sin depender del PATH del host (§0.1)
 ```
 
 ## Casos de uso
@@ -121,6 +140,17 @@ Si usas Linux/WSL, SonarQube requiere:
 ```bash
 sudo sysctl -w vm.max_map_count=524288
 ```
+
+#### 0.1. Alternativa: correr tests/pipeline dentro de Docker (sin depender del PATH del host)
+
+En Windows es común que `python3` resuelva al stub de Microsoft Store en vez del intérprete real, o que falten `jq`/`cypher-shell` en el `PATH` — en vez de pelearte con eso, `Dockerfile.testrunner` da un entorno con todo resuelto (Python real, `git`, `jq`, `cypher-shell`, dependencias de `requirements.txt`):
+
+```bash
+docker build -f Dockerfile.testrunner -t poc-ai-agents-testrunner .
+docker run --rm -v "$(pwd):/repo" -w /repo poc-ai-agents-testrunner python3 -m pytest tests/ -v
+```
+
+Para correr el pipeline real (no solo los tests) conectado a los servicios de `docker-compose.yml`, agregá `--network poc-ai-agents_poc-net` y apuntá las variables `*_URL`/`NEO4J_URI` de tu `.env` a los nombres de servicio (`ai-firewall`, `neo4j`, `sonarqube`, `qdrant`, `ollama`, `prefect-server`) en vez de `localhost` — dentro del contenedor, `localhost` es el contenedor mismo, no tu host.
 
 ### 1. Configurar credenciales
 
@@ -207,8 +237,8 @@ Apenas el firewall aprueba, el ticket se mueve automáticamente al estado que de
 
 **Importante — qué es y qué no es "el agente" acá:** las etapas 1-4 son orquestación determinística, no un agente. La etapa 5 (agente de código) tiene tres caminos posibles:
 
-- **A — Con `GITHUB_REPO` configurado en `.env`**: el script crea un Issue en tu repo real con todo el contexto ya armado y lo asigna al **GitHub Copilot coding agent**, que corre en la nube de GitHub con su propio razonamiento y abre un PR cuando termina. Requiere Copilot coding agent habilitado en ese repo (plan Business/Enterprise) y que ya tenga un remote real (`git push`). El agente en la nube **no** tiene acceso a tu Neo4j/Qdrant locales — por eso el impacto del grafo y los hallazgos de Sonar viajan como texto ya calculado dentro del Issue, no se consultan en vivo desde la nube.
-- **B1 — Sin `GITHUB_REPO`, con `ANTHROPIC_API_KEY` u Ollama alcanzable**: `coding_agent.py`, un **agente real local** — mismo backend dual (Anthropic primero, Ollama de fallback) y la misma maquinaria de tool-calling que ya usa el agente juez (`agent_loop.py`). Razona en varios turnos, con herramientas reales confinadas al repo objetivo: leer/escribir/editar/listar archivos, buscar texto (`grep`), ver su propio diff/historial de commits, detectar el stack del proyecto, consultar Sonar en vivo, correr comandos de shell, y los mismos MCP del juez (Neo4j-cypher, Qdrant-rag) para consultar el grafo/código histórico por su cuenta. **Cada escritura de archivo y cada comando piden confirmación humana antes de ejecutarse** — se ven y se responden en vivo en la terminal (`[s/n]`), nunca actúa sin supervisión.
+- **A — Con `GITHUB_REPO` configurado en `.env`**: el script crea un Issue en tu repo real con todo el contexto ya armado y lo asigna al **GitHub Copilot coding agent**, que corre en la nube de GitHub con su propio razonamiento y abre un PR cuando termina. Requiere Copilot coding agent habilitado en ese repo (plan Business/Enterprise) y que ya tenga un remote real (`git push`) — `check_prereqs.sh` y el propio pipeline verifican de antemano si el bot realmente aparece como asignable (§6.6), en vez de descubrirlo recién cuando la asignación falla. El agente en la nube **no** tiene acceso a tu Neo4j/Qdrant locales — por eso el impacto del grafo y los hallazgos de Sonar viajan como texto ya calculado dentro del Issue, no se consultan en vivo desde la nube. El `issue_body` se redacta con las mismas reglas del firewall antes de publicarse (§6.3) — puede terminar en un issue público de GitHub.
+- **B1 — Sin `GITHUB_REPO`, con `ANTHROPIC_API_KEY` u Ollama alcanzable**: `coding_agent.py`, un **agente real local** — mismo backend dual (Anthropic primero, Ollama de fallback) y la misma maquinaria de tool-calling que ya usa el agente juez (`agent_loop.py`). Razona en varios turnos, con herramientas reales confinadas al repo objetivo: leer/escribir/editar/listar archivos, buscar texto (`grep`), ver su propio diff/historial de commits, detectar el stack del proyecto, consultar Sonar en vivo, correr comandos de shell, y los mismos MCP del juez (Neo4j-cypher, Qdrant-rag) para consultar el grafo/código histórico por su cuenta — incluyendo el historial real de riesgos ya documentados para el componente que está tocando. **Cada escritura de archivo y cada comando piden confirmación humana antes de ejecutarse** — se ven y se responden en vivo en la terminal (`[s/n]`), nunca actúa sin supervisión. Antes de declararse terminado, se autoevalúa (`self_review`, §6.4) y esa autocrítica viaja al juez para que la contraste contra el diff real. Si el juez aprueba, el cambio se pushea y se abre un PR real automáticamente (§6.5).
 - **B2 — Sin `GITHUB_REPO` y sin ningún backend de modelo**: cae a `gh copilot suggest` sobre el prompt saneado — una sugerencia de un solo tiro, sin memoria ni loop, con la misma confirmación antes de ejecutar. Es el fallback de siempre, para quien no tiene `ANTHROPIC_API_KEY` ni Ollama corriendo.
 
 En B1 y B2, el resultado (si hay cambios) se commitea en una rama nueva `copilot/<ticket>-<timestamp>` dentro del repo real detectado en el paso 4, **nunca en la rama que tenías checked out**.
@@ -218,18 +248,44 @@ En B1 y B2, el resultado (si hay cambios) se commitea en una rama nueva `copilot
 git diff <rama-base-real>..copilot/<rama-que-te-haya-mostrado-el-script>
 ```
 
-#### 6.1. Trabajar con épicas
+#### 6.1. Trabajar con épicas (con planificación real, no solo concatenación)
 
 ```bash
 ./run_poc_loop.sh --epic EPIC-123
 # equivalente: python3 orchestration.py --epic EPIC-123
 ```
 
-En vez de un ticket individual, trae la **épica completa + todas sus historias hijas** (vía JQL — por default `parent = "{epic_key}"`, el campo estándar en proyectos "team-managed"; si tu proyecto es "company-managed" y todavía usa el campo custom `Epic Link`, ajustá `JIRA_EPIC_LINK_JQL` en `.env`) y arma **un solo prompt combinado** — Copilot ve el contexto completo de la épica y coordina los cambios entre componentes, en vez de procesar cada historia por separado.
+En vez de un ticket individual, trae la **épica completa + todas sus historias hijas** (vía JQL — por default `parent = "{epic_key}"`, el campo estándar en proyectos "team-managed"; si tu proyecto es "company-managed" y todavía usa el campo custom `Epic Link`, ajustá `JIRA_EPIC_LINK_JQL` en `.env`).
+
+**`epic_planner.py`** entra antes de armar el prompt combinado: consulta el grafo real de Neo4j (`DEPENDS_ON` entre los componentes que tocan las historias hijas) y reordena las historias por dependencia real — no por el orden mecánico en que Jira devolvió el JQL. Si encuentra coordinación necesaria entre historias (ej. dos tocan el mismo endpoint), lo suma como notas de coordinación al prompt; si detecta **conflictos** reales entre historias, los deja explícitos tanto en el prompt del coding agent como en el payload que evalúa el juez — para que el propio juez pueda marcar `FLAGGED` si el diff final no muestra evidencia de haberlos tenido en cuenta. Es best-effort: si no hay backend de modelo disponible, cae sola al orden mecánico original sin bloquear la corrida.
 
 **Solo funciona si todos los componentes que tocan los hijos de la épica viven en el mismo repo.** El pipeline está construido alrededor de un repo por corrida (`TARGET_REPO_DIR`) — si los hijos tocan componentes que en realidad viven en repos distintos, no hay forma honesta de resolverlo en una sola corrida, así que **se niega a trabajar** en vez de intentarlo a medias. Para poder confirmar esto, cada nodo del grafo de Neo4j necesita la propiedad `repo_url` seteada (ver `seed/seed.cypher` y `prompts/sync_graph_from_azure_devops.md`) — sin ese dato en cualquiera de los componentes involucrados, también rechaza la corrida (nunca asume que es el mismo repo sin poder confirmarlo). Cuando rechaza, deja un comentario claro en la épica explicando el conflicto (o el dato faltante) antes de terminar.
 
-Si todo coincide, sigue el mismo flujo que un ticket normal (firewall → coding agent → testing agent → juez → Falco) usando la épica como `TICKET_ID` (ramas/commits quedan como `copilot/EPIC-123-<timestamp>`), y al final deja un comentario en cada historia hija señalando que se procesó como parte de esa corrida combinada.
+Si todo coincide, sigue el mismo flujo que un ticket normal (firewall → coding agent → output_guard → testing agent → Falco → juez) usando la épica como `TICKET_ID` (ramas/commits quedan como `copilot/EPIC-123-<timestamp>`), y al final deja un comentario en cada historia hija señalando que se procesó como parte de esa corrida combinada.
+
+**Limitación real, a propósito no resuelta todavía**: el reordenamiento de `epic_planner.py` es hoy solo textual — cambia el orden en que el coding agent *lee* las historias en el prompt, pero el coding agent sigue recibiendo un único prompt combinado y decide su propio orden de ejecución interno. No hay enforcement real de secuencia (ej. aplicar la historia A, commitear, recién después empezar la B). Resolverlo bien implicaría partir el modo épica en llamadas secuenciales al coding agent, un cambio de arquitectura más grande que no se hizo todavía.
+
+#### 6.2. `pipeline_shared.py` — una sola fuente de verdad entre los dos orquestadores
+
+`run_poc_loop.sh` (bash) y `orchestration.py` (Prefect) implementan el mismo pipeline dos veces, en dos lenguajes — un caso real de esto se desincronizó silenciosamente: `RETRYABLE_POLICY_REFERENCES` (qué categorías de veredicto `FLAGGED` del juez ameritan un reintento automático del coding agent) vivía definida tres veces — en `judge_agent.py`, duplicada a mano en `orchestration.py`, y duplicada a mano en un array bash en `run_poc_loop.sh`. La copia de Python tenía un test que la comparaba contra la original; la de bash no tenía ninguno, y nadie lo notó hasta que se auditó explícitamente. `pipeline_shared.py` es la fuente única ahora: `judge_agent.py`/`orchestration.py` la importan directo, `run_poc_loop.sh` la lee vía `python3 pipeline_shared.py retryable-policy-references` en vez de mantener su propia copia.
+
+#### 6.3. Guardia de salida (`output_guard.py`) — el firewall también audita lo que SALE
+
+El AI Firewall (`firewall_proxy.py`) audita el prompt que **entra** al coding agent, pero hasta hace poco nada auditaba el diff que **sale** de él — si el agente escribía un secreto real al "arreglar" algo, o un patrón de jailbreak terminaba en un comentario de código, nada lo atrapaba hasta Sonar (si cubría ese patrón) o el juez (si lo notaba). `output_guard.py` corre las **mismas reglas** (`firewall/policies.yaml`, vía `firewall_proxy._redact()`/`_check_jailbreak()` reusado directo, no reimplementado) contra el diff real del Camino B1, **antes** del testing agent — si encuentra evidencia dura, bloquea con la misma severidad que un test fallido (comentario fuerte, transición a bloqueado, commit marcador), y el juez ni se llama.
+
+Para el Camino A (nube, sin diff local todavía), se aplica una versión acotada: el `issue_body` que se publica en GitHub pasa por la misma función de redacción de secretos (no el chequeo de jailbreak, que no aplica a contenido para humanos) antes de crearse — puede terminar en un issue público, así que vale la pena la misma barrida.
+
+#### 6.4. Autocrítica del coding agent (`self_review`) — informa al juez, no decide por sí sola
+
+Antes de declararse `"done"`, `coding_agent.py` tiene que completar una autoevaluación estructurada: `scope_matches_ticket`, `no_secrets_introduced`, `tests_adequate` (booleanos). Si falta, recibe un empujón único pidiéndosela; si tampoco la completa la segunda vez, se acepta igual (queda trazado como faltante, nunca bloquea infinito). Esa autocrítica viaja al payload del juez — que la contrasta explícitamente contra el diff real ("si dice que no introdujo secretos pero ves uno, señalalo") en vez de tomarla como verdad. **Deliberadamente no decide nada por sí sola**: una autoevaluación puede ser incorrecta, así que no dispara un retry automático ni un bloqueo — es señal para el juez, que es quien tiene la autoridad real de decisión.
+
+#### 6.5. Push + PR automático y transición a revisión (solo si el juez dice OK)
+
+Hasta hace poco, el Camino B1 nunca pasaba de un commit local — ni un PR, ni ninguna señal en Jira de que el trabajo estaba listo, aunque el juez lo hubiera aprobado. Ahora, si el veredicto final es `OK` y hay una rama con cambios reales: se intenta `git push` + `gh pr create` (best-effort — si el repo objetivo no tiene un remote real configurado, se omite sin bloquear, la rama queda local para pushear a mano), y el ticket se transiciona a `JIRA_REVIEW_STATUS` (default `"Code Review"`, ajustable en `.env`) — el mismo tipo de señal de "listo para revisión humana" que antes solo existía para el caso de bloqueo (`JIRA_BLOCKED_STATUS`).
+
+#### 6.6. Detección proactiva de si Copilot coding agent está habilitado de verdad
+
+Antes, la única forma de saber si el Copilot coding agent (Camino A) estaba realmente habilitado en `GITHUB_REPO` era crear un Issue y ver si la asignación fallaba — puro prueba y error. Ahora, tanto `check_prereqs.sh` como el propio pipeline consultan `Repository.suggestedActors` (GraphQL real de GitHub, capability `CAN_BE_ASSIGNED`) **antes** de crear el Issue — si el bot no aparece como asignable, avisa con un diagnóstico claro (revisar Settings → Copilot → Coding agent, plan Business/Enterprise) pero igual intenta crear+asignar (el chequeo puede tener falsos negativos por permisos del token, así que nunca bloquea el intento real).
 
 ### 7. Romper el flujo a propósito
 
@@ -269,6 +325,19 @@ Además, cada corrida deja un **comentario real en el ticket de Jira** (no solo 
 python3 jira_client.py comment "Prueba de comentario de auditoria"
 ```
 
+#### 8.1. Grafo de conocimiento: cada corrida queda como evidencia real en Neo4j
+
+Más allá del grafo de dependencias estático (`:Service` + `DEPENDS_ON`, sembrado desde Azure DevOps o `seed/seed.cypher`), `graph_writer.py` extiende ese mismo grafo con evidencia real de ejecución: un nodo `:Run` por corrida, un nodo `:Story`/`:Epic` para el ticket, un nodo `:Decision` por cada etapa (firewall/output_guard/tests/juez) con su resultado, y — si el juez citó un `policy_reference` real de `evals/JUDGE_POLICY.md` — un nodo `:Risk` que se acumula por componente a través de corridas. Deliberadamente **no** guarda contenido sensible (diffs completos, descripciones crudas) — eso ya vive en `logs/*.jsonl`; el grafo solo guarda campos cortos, redactados con la misma `firewall_proxy._redact()`.
+
+El valor real: un componente que ya tuvo un `data-leak-evidence` hace dos sprints queda consultable — `coding_agent.py`/`judge_agent.py` pueden preguntarle al grafo `MATCH (svc:Service {name: "X"})<-[:AFFECTS]-(r:Risk) RETURN r` antes de actuar sobre ese componente, en vez de partir de cero cada vez. Es una sugerencia en el prompt, no forzada — cada corrida trae `consulted_risk_graph` (true/false) en el resultado para poder auditar si realmente se está usando.
+
+```bash
+docker exec -it poc-neo4j cypher-shell -u neo4j -p test_password_local \
+  "MATCH (r:Risk)-[:AFFECTS]->(s:Service) RETURN s.name, r.policy_reference, count(*) ORDER BY count(*) DESC"
+```
+
+Best-effort SIEMPRE, igual que el resto de las integraciones opcionales: si Neo4j no está alcanzable, se loggea y la corrida sigue sin escribir en el grafo.
+
 ### 9. Testing agent (gate real de tests, antes del juez)
 
 Solo en el Camino B con un cambio aplicado localmente: antes de llamar al juez, el script corre el **test suite real** del módulo afectado dentro de un contenedor descartable (`scripts/run_module_tests.sh`) — nada instalado en tu máquina, nada persistido.
@@ -279,9 +348,15 @@ Solo en el Camino B con un cambio aplicado localmente: antes de llamar al juez, 
 
 Si los tests **fallan**, el pipeline se bloquea ahí mismo (comentario fuerte + transición a `JIRA_BLOCKED_STATUS` + commit `BLOCKED BY TESTS: ...` en la rama) y **el juez ni se llama**. Si pasan, el resultado se le pasa al juez como parte de su contexto — un test que pasa no prueba que su alcance sea suficiente para el cambio real, y el juez lo tiene en cuenta.
 
-Requiere Docker en el host (ya es un prerequisito). Sin Docker, este gate se omite sin bloquear la corrida. **Fuera de alcance**: UI real de apps móviles (Expo/React Native/Ionic) sobre emulador/dispositivo (Detox/Maestro/Espresso) — necesita virtualización de hardware, delicada dentro de Docker Desktop; esta auto-detección solo corre los tests unitarios/lógica de esos proyectos.
+Requiere Docker en el host (ya es un prerequisito). Sin Docker, este gate se omite sin bloquear la corrida — `orchestration.py`/`run_poc_loop.sh` lo detectan (`shutil.which("docker")`/`command -v docker`) y lo dicen explícitamente en vez de fingir que corrió. **Fuera de alcance**: UI real de apps móviles (Expo/React Native/Ionic) sobre emulador/dispositivo (Detox/Maestro/Espresso) — necesita virtualización de hardware, delicada dentro de Docker Desktop; esta auto-detección solo corre los tests unitarios/lógica de esos proyectos.
 
-### 10. Monitoreo a nivel de sistema (Falco)
+**Lint/format, advisory, no bloqueante**: en el mismo contenedor descartable, `run_module_tests.sh` corre además un chequeo de lint/format cuando detecta que el repo objetivo lo tiene configurado (`go vet`/`cargo clippy` siempre, por ser parte del toolchain; `eslint`/`rubocop`/`ruff`/`dotnet format`/checkstyle solo si encuentra el archivo de config correspondiente — nunca asume que existe). A propósito **no** es un gate duro como los tests: un repo objetivo arbitrario puede tener deuda de lint preexistente que no tiene nada que ver con este cambio puntual, así que el resultado se suma como contexto extra para el juez, no como un bloqueo automático.
+
+#### 9.1. Re-escaneo real de Sonar sobre el diff aplicado
+
+`sonar_client.py` (usado como contexto al principio de la corrida) solo **lee** análisis que ya existían — nada volvía a escanear después de que el coding agent aplicara su cambio, así que un hallazgo nuevo que el propio agente introdujera era invisible para el pipeline. `scripts/rescan_sonar.sh` corre justo después de que los tests pasan: dispara un `sonar-scanner` real sobre el repo objetivo (best-effort — si no tiene `sonar-project.properties` configurado, o `SONAR_TOKEN` no está seteado, se omite sin bloquear), compara los hallazgos de antes vs. después, y solo los **nuevos** (los que el diff realmente introdujo, no deuda técnica preexistente) se le pasan al juez como evidencia.
+
+### 10. Monitoreo a nivel de sistema (Falco) — llega al juez de la MISMA corrida, no solo a un comentario después
 
 Además del firewall/juez (que auditan a nivel *semántico* — qué dice el ticket, qué hace el diff), `falco` monitorea en tiempo real qué hacen los contenedores a nivel de **sistema operativo** (syscalls): shells inesperados dentro de `poc-ai-firewall` o el testing agent, escrituras fuera de las rutas esperadas, conexiones salientes raras desde los contenedores efímeros de test. Reglas propias en [falco/custom_rules.yaml](falco/custom_rules.yaml).
 
@@ -290,15 +365,15 @@ docker logs -f poc-falco          # alertas en vivo
 cat logs/falco_alerts.jsonl       # alertas persistidas
 ```
 
-**En Windows/Docker Desktop**: Falco necesita que el kernel de la VM WSL2 soporte su probe moderno de eBPF (`--modern-bpf`) — si el contenedor no arranca o no genera eventos, es una limitación de correr Falco fuera de un host Linux nativo, no de esta PoC. Si te da problemas, podés comentar el servicio `falco` en `docker-compose.yml` sin afectar al resto del pipeline.
+**En Windows/Docker Desktop**: la imagen de Falco puede necesitar ajustar el driver según la versión (`-o engine.kind=modern_ebpf` en el `command:` del `docker-compose.yml`, la sintaxis de CLI cambia entre versiones de la imagen) y que el kernel de la VM WSL2 soporte su probe eBPF — algunos tracepoints puntuales pueden fallar al engancharse sin que eso tumbe la detección en general. Si el contenedor no arranca en absoluto, es una limitación de correr Falco fuera de un host Linux nativo, no de esta PoC; podés comentar el servicio `falco` en `docker-compose.yml` sin afectar al resto del pipeline.
 
-**Las alertas se correlacionan con cada corrida, no quedan solo en el archivo**: al final de cada corrida (`run_poc_loop.sh`/`orchestration.py`), `scripts/check_falco_alerts.py` filtra `logs/falco_alerts.jsonl` por la ventana de tiempo de esa corrida (desde que el firewall aprobó hasta el final). Si encuentra algo, lo deja como comentario en el ticket de Jira y, si seteaste `FALCO_ALERT_WEBHOOK_URL` (formato compatible con un incoming webhook de Slack), también lo postea ahí. Es puramente informativo — nunca bloquea la corrida por su cuenta, a diferencia del testing agent o el juez.
+**Las alertas se correlacionan ANTES de que el juez decida, no solo después en un comentario**: `run_judge()` (tanto en `run_poc_loop.sh` como en `orchestration.py`) busca la ventana de Falco de la corrida actual **antes** de invocar al juez, y si hay alertas reales, se las suma al payload que el juez evalúa — para que la evidencia de runtime de la MISMA corrida pueda pesar en el veredicto, no solo llegar como un comentario de Jira que un humano lee después de que la decisión ya se tomó. El mismo fetch también dispara el comentario/webhook de siempre. Es informativo para el juez, no un gate duro por sí solo — el juez decide qué peso darle.
 
 ### 11. Agente juez (segunda opinión, con acceso real a MCP y poder de bloqueo)
 
-Cada corrida — **aprobada o rechazada por el firewall** — pasa además por un **modelo distinto** (Claude, no `gh copilot`) que audita: si el firewall decidió bien, si el cambio real resuelve el ticket, y si la corrida completa tiene sentido.
+Cada corrida — **aprobada o rechazada por el firewall** — pasa además por un **modelo distinto** (Claude, no `gh copilot`) que audita: si el firewall decidió bien, si el cambio real resuelve el ticket, y si la corrida completa tiene sentido. Además del texto del ticket/diff, el juez recibe como contexto real: la autocrítica `self_review` del coding agent (§6.4), las alertas de Falco de esta misma corrida (§10), los hallazgos nuevos de Sonar sobre el diff (§9.1), y los conflictos que `epic_planner.py` haya detectado si es una épica (§6.1) — todo señal, ninguno decide por sí solo, el juez es quien pesa todo eso.
 
-A diferencia del coding agent (que corre en la nube de GitHub y no puede tocar tu infraestructura local), **el juez corre en tu máquina** — así que se conecta de verdad a `mcp-neo4j-cypher` y `mcp-server-qdrant` por stdio, y puede *verificar* afirmaciones en vez de confiar ciegamente en el texto que le armamos (por ejemplo, consultar el grafo él mismo para confirmar si un cambio realmente no afecta a otros servicios, o volver a consultar Sonar en vivo). Si esos MCP no están disponibles (falta `uvx`, Neo4j/Qdrant caídos), el juez sigue funcionando sin herramientas, razonando solo sobre el texto.
+A diferencia del coding agent (que corre en la nube de GitHub y no puede tocar tu infraestructura local), **el juez corre en tu máquina** — así que se conecta de verdad a `mcp-neo4j-cypher` y `mcp-server-qdrant` por stdio, y puede *verificar* afirmaciones en vez de confiar ciegamente en el texto que le armamos (por ejemplo, consultar el grafo él mismo para confirmar si un cambio realmente no afecta a otros servicios, o volver a consultar Sonar en vivo). Si esos MCP no están disponibles (falta `uvx`, Neo4j/Qdrant caídos), el juez sigue funcionando sin herramientas, razonando solo sobre el texto. Cada veredicto trae `consulted_risk_graph` (si efectivamente llegó a consultar el historial de `:Risk` del componente en Neo4j, §8.1) — visibilidad de si la sugerencia de consultarlo se está siguiendo de verdad, sin forzarlo.
 
 **Backend del juez, sin depender de una API paga si no querés**: primero intenta Anthropic (`ANTHROPIC_API_KEY`); si no está configurada, cae al contenedor `ollama` local del `docker-compose.yml` (gratis, offline) — este fallback corre de verdad tanto desde `run_poc_loop.sh` como desde `orchestration.py`. Para que funcione, después de `docker compose up` descargá un modelo con tool-calling una sola vez:
 ```bash
@@ -328,7 +403,7 @@ Cada entrada trae `backend`, `latency_seconds`, `input_tokens`/`output_tokens` y
 ```bash
 python3 evals/run_judge_evals.py
 ```
-Corre cada caso contra `judge_agent.judge_with_tools()` de verdad (mismo código que usa `run_poc_loop.sh`/`orchestration.py`), imprime una matriz de confusión (tratando `FLAGGED` como la clase positiva — el error grave es un falso negativo: algo que debía bloquearse y el juez dejó pasar) y el costo/latencia total. Falla (`exit 1`) si hay algún falso negativo. Resultados acumulados en `logs/eval_judge_runs.jsonl`.
+Corre cada caso contra `judge_agent.judge_with_tools()` de verdad (mismo código que usa `run_poc_loop.sh`/`orchestration.py`), imprime una matriz de confusión (tratando `FLAGGED` como la clase positiva — el error grave es un falso negativo: algo que debía bloquearse y el juez dejó pasar) y el costo/latencia total. Falla (`exit 1`) si hay algún falso negativo. **Además** mide, por separado, si el juez citó el `policy_reference` correcto de `evals/JUDGE_POLICY.md` en cada caso `FLAGGED` — un veredicto puede ser correcto (bloqueó lo que había que bloquear) mientras cita el criterio equivocado, y esa métrica separada lo expone en vez de esconderlo detrás de un accuracy agregado. Resultados acumulados en `logs/eval_judge_runs.jsonl`.
 
 **Precisión del coding agent (proxy)** — no hay forma automática de saber "¿resolvió el ticket correctamente?" sin un humano, pero sí hay un piso medible: ¿pasó los tests reales que se supone que tiene que pasar? Eso ya lo agrega `report_sprint_metrics.py` (§8), leyendo el campo `tests_passed` que ahora graba `run_poc_loop.sh` en `copilot_contribution.jsonl` cada vez que el testing agent corre.
 
@@ -365,9 +440,20 @@ Decisión de arquitectura evaluada explícitamente (no por default): **se mantie
 - **El problema real de este repo no es de orquestación** — ya existe: `run_poc_loop.sh`/`orchestration.py` son un grafo de etapas con gates reales (firewall rechaza → corta; tests fallan → corta antes del juez; juez `FLAGGED` → bloquea o reintenta una vez). `orchestration.py` sobre Prefect (§13) ya da retries, estado persistido y una UI de grafo — exactamente lo que **LangGraph** ofrecería, expresado en otro DSL. Migrar sería reescribir la misma máquina de estados sin ganar una gate, un retry, ni una vista que no exista ya.
 - **No hay colaboración entre agentes que orquestar.** **CrewAI**/**AutoGen** resuelven agentes que negocian/delegan entre sí. Acá el coding agent y el juez son deliberadamente independientes y adversariales (el juez audita sin ver el razonamiento del coding agent, y nunca puede revertirlo) — es una decisión de gobernanza, no una limitación técnica. Un framework multi-agente empujaría hacia más acoplamiento entre ellos, en la dirección contraria a lo que la seguridad de este diseño necesita.
 - **Agno** apunta a prototipos livianos — este repo ya superó esa etapa (retries, secrets, rate limiting, logging estructurado, grafo de conocimiento en Neo4j).
-- **Lo que sí falta no lo da ningún framework de la lista**: un agente de planificación de épicas (hoy `--epic` concatena mecánicamente, no planifica orden/dependencias entre historias), un paso de exploración de contexto separado del coding agent, gestión de riesgo *proactiva* (hoy el juez es reactivo, audita después del cambio). Construir esos agentes nuevos usa el mismo patrón que ya tienen `coding_agent.py`/`judge_agent.py` (`agent_loop.py` compartido, tools locales + MCP, confirmación humana), no requiere adoptar un framework externo.
+- **Lo que faltaba, se construyó con el mismo patrón, no con un framework externo**: `epic_planner.py` (§6.1) ya reordena historias por dependencia real y detecta conflictos en vez de concatenar mecánicamente; `graph_writer.py` (§8.1) ya da al juez/coding agent historial real de riesgo por componente vía Neo4j, un paso hacia gestión de riesgo menos puramente reactiva (aunque el juez sigue evaluando *después* de que el diff existe — no hay un paso de pre-chequeo antes de escribir código). Ambos usan el mismo patrón que ya tenían `coding_agent.py`/`judge_agent.py` (`agent_loop.py` compartido, tools locales + MCP, confirmación humana) — la evidencia de que este patrón escala a nuevos agentes sin adoptar un framework externo ya no es solo una promesa, es lo que pasó.
 
 **Cuándo reconsiderar esto**: si en algún momento se necesitan agentes que genuinamente negocien entre sí (no es el caso hoy), LangGraph sería la opción más alineada por ya pensar en grafos de estado — pero no antes de que exista ese problema real.
+
+### 14. Chat interactivo (`chat.py`) — explorar y actuar sobre la PoC/el repo objetivo a mano
+
+Distinto de `docker exec -it poc-ollama ollama run llama3.1` (Ollama pelado, sin nada de este proyecto): `chat.py` reusa exactamente la misma infraestructura que `coding_agent.py`/`judge_agent.py` — el mismo backend dual con fallback en vivo (`agent_loop.py`), **todas** las tools locales de `coding_agent.py` (leer/escribir/editar archivos, listar, grep, git diff/log, detectar stack, consultar Sonar — con la misma confirmación humana `[s/n]` antes de escribir/ejecutar, que acá sí se responde en vivo porque lo corrés en tu propia terminal), y los mismos MCP reales (Neo4j-cypher, Qdrant-rag).
+
+```bash
+python chat.py                      # repo objetivo = directorio actual
+python chat.py /ruta/a/otro/repo    # o un repo puntual
+```
+
+Charla libre, sin JSON estructurado de salida — para explorar el grafo/código/Sonar interactivamente, o pedirle cambios puntuales sobre un repo con el mismo nivel de supervisión que ya tiene el pipeline. No es parte del pipeline auditado: no escribe en `logs/*.jsonl`, no exige un ticket de Jira. Escribí `salir`/`exit`/`quit` o `Ctrl+C` para cortar.
 
 ## Troubleshooting / FAQ
 
