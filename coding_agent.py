@@ -54,6 +54,7 @@ from agent_loop import (
     _final_text_with_json_retry,
     _normalize_tool_schema,
     _select_backend,
+    call_with_fallback,
 )
 from log_utils import get_logger
 
@@ -605,8 +606,8 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage = await _call_model_turn(
-                    client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT
+                content, stop_reason, usage, backend = await call_with_fallback(
+                    client, messages, tools, CODING_AGENT_SYSTEM_PROMPT
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)

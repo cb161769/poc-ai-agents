@@ -25,20 +25,18 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from llm_backends import estimate_cost_usd, get_backend_priority
+from llm_backends import (
+    MODEL_LIMITS,
+    RETRY_POLICY_PER_BACKEND,
+    estimate_cost_usd,
+    get_backend_priority,
+    is_within_budget,
+)
 from log_utils import get_logger
 
 load_dotenv()
 
 logger = get_logger(__name__)
-
-# Bounded retry for transient backend failures (529 overloaded, timeouts,
-# connection resets) -- a network blip shouldn't kill the whole run. Non-
-# transient errors (401 bad key, 400 malformed request) fail immediately,
-# no point retrying those.
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-_MAX_TRANSIENT_RETRIES = 2
-_RETRY_BACKOFF_SECONDS = [1, 2]
 
 JSON_CORRECTION_MESSAGE = (
     "Tu respuesta anterior no fue JSON valido. Respondé de nuevo usando "
@@ -57,21 +55,36 @@ def _estimate_cost_usd(backend: str, model: str, input_tokens: int, output_token
     return estimate_cost_usd(backend, model, input_tokens, output_tokens)
 
 
+def _backend_available(backend: str) -> bool:
+    """Chequeo real de si este backend puede atender una llamada ahora:
+    credenciales/alcanzabilidad (mismo criterio que _select_backend ya
+    usaba) MAS presupuesto diario si LLM_DAILY_BUDGET_USD esta seteada
+    (llm_backends.is_within_budget -- sin la env var, siempre True).
+    """
+    reachable = False
+    if backend == "anthropic":
+        reachable = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    elif backend == "ollama":
+        try:
+            httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
+            reachable = True
+        except httpx.HTTPError:
+            reachable = False
+    if not reachable:
+        return False
+    return is_within_budget(backend)
+
+
 def _select_backend() -> str:
     """Recorre get_backend_priority() (default: Anthropic primero, Ollama
     como fallback gratuito/local si esta alcanzable; configurable via
-    LLM_BACKEND_PRIORITY) y devuelve el primero disponible, o "none" si
-    ninguno lo esta -- el caller decide que significa eso para el.
+    LLM_BACKEND_PRIORITY) y devuelve el primero disponible (alcanzable Y
+    dentro de presupuesto), o "none" si ninguno lo esta -- el caller decide
+    que significa eso para el.
     """
     for backend in get_backend_priority():
-        if backend == "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
-            return "anthropic"
-        if backend == "ollama":
-            try:
-                httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
-                return "ollama"
-            except httpx.HTTPError:
-                continue
+        if _backend_available(backend):
+            return backend
     return "none"
 
 
@@ -134,22 +147,31 @@ def _ollama_response_to_blocks(message: dict) -> tuple:
     return blocks, stop_reason
 
 
-async def _post_with_retry(client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
-    """POSTs with a bounded retry for transient failures. On the final
-    attempt, a still-retryable status code just falls through to
-    raise_for_status() so the caller gets the real error, not a synthetic one.
+async def _post_with_retry(client: httpx.AsyncClient, backend: str, url: str, **kwargs) -> httpx.Response:
+    """POSTs with a bounded retry for transient failures, using the retry
+    policy for this specific backend (llm_backends.RETRY_POLICY_PER_BACKEND)
+    instead of one set of constants shared by every backend -- e.g. only
+    Anthropic's policy includes 529 ("overloaded"), which doesn't apply to
+    Ollama. On the final attempt, a still-retryable status code just falls
+    through to raise_for_status() so the caller gets the real error, not a
+    synthetic one.
     """
-    for attempt in range(_MAX_TRANSIENT_RETRIES + 1):
+    policy = RETRY_POLICY_PER_BACKEND[backend]
+    max_retries = policy["max_retries"]
+    backoff = policy["backoff_seconds"]
+    retryable_status_codes = policy["retryable_status_codes"]
+
+    for attempt in range(max_retries + 1):
         try:
             resp = await client.post(url, **kwargs)
         except (httpx.TimeoutException, httpx.ConnectError):
-            if attempt < _MAX_TRANSIENT_RETRIES:
-                await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+            if attempt < max_retries:
+                await asyncio.sleep(backoff[attempt])
                 continue
             raise
 
-        if resp.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_TRANSIENT_RETRIES:
-            await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+        if resp.status_code in retryable_status_codes and attempt < max_retries:
+            await asyncio.sleep(backoff[attempt])
             continue
 
         resp.raise_for_status()
@@ -165,7 +187,7 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
     if backend == "anthropic":
         request_body = {
             "model": ANTHROPIC_MODEL,
-            "max_tokens": 1536,
+            "max_tokens": MODEL_LIMITS["anthropic"]["max_tokens"],
             "system": system_prompt,
             "messages": messages,
         }
@@ -174,6 +196,7 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
 
         resp = await _post_with_retry(
             client,
+            "anthropic",
             ANTHROPIC_API_URL,
             headers={
                 "x-api-key": os.environ["ANTHROPIC_API_KEY"],
@@ -193,17 +216,64 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
 
     if backend == "ollama":
         ollama_messages = [{"role": "system", "content": system_prompt}] + _messages_to_ollama(messages)
-        request_body = {"model": OLLAMA_MODEL, "messages": ollama_messages, "stream": False}
+        request_body = {
+            "model": OLLAMA_MODEL,
+            "messages": ollama_messages,
+            "stream": False,
+            "options": {"num_predict": MODEL_LIMITS["ollama"]["max_tokens"]},
+        }
         if tools:
             request_body["tools"] = _tools_to_ollama_format(tools)
 
-        resp = await _post_with_retry(client, f"{OLLAMA_URL}/api/chat", json=request_body, timeout=120.0)
+        resp = await _post_with_retry(client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=120.0)
         data = resp.json()
         blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}))
         usage = {"input_tokens": data.get("prompt_eval_count", 0), "output_tokens": data.get("eval_count", 0)}
         return blocks, stop_reason, usage
 
     raise RuntimeError("ni ANTHROPIC_API_KEY ni un Ollama local disponible")
+
+
+async def call_with_fallback(
+    client: httpx.AsyncClient, messages: list, tools: list, system_prompt: str, exclude: set = None
+) -> tuple:
+    """Fallback EN VIVO entre backends -- a diferencia de _select_backend()
+    (que elige un backend una sola vez al arrancar la corrida), esto se
+    llama en CADA turno: si el backend actual falla de verdad (agoto sus
+    propios reintentos via _post_with_retry), prueba el siguiente backend
+    disponible de get_backend_priority() para ESE MISMO turno, en vez de
+    matar la corrida entera.
+
+    Devuelve (content_blocks, stop_reason, usage, backend_used) -- un
+    elemento mas que _call_model_turn (que backend realmente respondio),
+    para que el caller seek al loop de turnos siga usando ese backend en
+    el proximo turno en vez de recalcular desde "none".
+
+    Con un solo backend disponible (el caso mas comun), el comportamiento
+    es identico a llamar _call_model_turn directo: no hay a donde caer, y
+    la excepcion real del unico backend se re-lanza tal cual.
+    """
+    exclude = exclude or set()
+    last_exc = None
+    tried_any = False
+
+    for backend in get_backend_priority():
+        if backend in exclude or not _backend_available(backend):
+            continue
+        tried_any = True
+        try:
+            blocks, stop_reason, usage = await _call_model_turn(client, backend, messages, tools, system_prompt)
+            return blocks, stop_reason, usage, backend
+        except Exception as exc:
+            logger.warning(f"backend '{backend}' fallo, probando el siguiente disponible: {exc}")
+            last_exc = exc
+            continue
+
+    if last_exc is not None:
+        raise last_exc
+    if not tried_any:
+        raise RuntimeError("ningun backend disponible (ni alcanzable ni dentro de presupuesto)")
+    raise RuntimeError("ningun backend pudo atender esta llamada")
 
 
 async def _final_text_with_json_retry(

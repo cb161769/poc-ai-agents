@@ -17,9 +17,15 @@ Every backend registered here automatically gets agent_loop.py's shared
 JSON-correction retry (_final_text_with_json_retry) for free -- a model
 that returns malformed JSON on its final answer gets one bounded retry
 with a correction message, regardless of which backend answered. No
-backend needs to reimplement that.
+backend needs to reimplement that. It also gets live fallback
+(agent_loop.py::call_with_fallback) for free: if the backend fails after
+exhausting its own RETRY_POLICY_PER_BACKEND, the next backend in
+get_backend_priority() picks up the same turn instead of killing the run.
 """
+import json
 import os
+import time
+from pathlib import Path
 
 # Orden de preferencia por defecto -- Anthropic primero (mejor calidad),
 # Ollama como fallback gratuito/local. Configurable via LLM_BACKEND_PRIORITY
@@ -54,3 +60,70 @@ def estimate_cost_usd(backend: str, model: str, input_tokens: int, output_tokens
     if not pricing:
         return 0.0
     return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
+
+
+# Politica de retry transitorio por backend -- antes era un solo set global
+# en agent_loop.py que no incluia el 529 ("overloaded") especifico de
+# Anthropic, asi que ni el unico backend que existia se reintentaba bien
+# ante ese caso real. Cada backend nuevo trae su propia entrada aca en vez
+# de heredar una lista generica que puede no aplicarle.
+RETRY_POLICY_PER_BACKEND = {
+    "anthropic": {"retryable_status_codes": {429, 500, 502, 503, 504, 529}, "max_retries": 2, "backoff_seconds": [1, 2]},
+    "ollama": {"retryable_status_codes": {429, 500, 502, 503, 504}, "max_retries": 2, "backoff_seconds": [1, 2]},
+}
+
+# max_tokens por backend/modelo -- antes hardcodeado (1536) solo en la rama
+# Anthropic de _call_model_turn, sin equivalente para Ollama. NO incluye
+# chequeo real de ventana de contexto (requeriria un tokenizer por
+# proveedor) -- es una limitacion conocida, no una validacion que finge
+# existir.
+MODEL_LIMITS = {
+    "anthropic": {"max_tokens": 1536},
+    "ollama": {"max_tokens": 1536},
+}
+
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_SPEND_LOG_FILES = ["judge_verdicts.jsonl", "coding_agent_runs.jsonl"]
+
+
+def spend_today(backend: str) -> float:
+    """Suma estimated_cost_usd de las entradas de HOY (fecha UTC) para ese
+    backend, leyendo los logs que judge_agent.py/coding_agent.py YA
+    escriben (logs/judge_verdicts.jsonl, logs/coding_agent_runs.jsonl) --
+    no crea un store de gasto nuevo, reusa la auditoria que ya existe.
+    Best-effort: un log ausente o una linea corrupta no rompe el calculo,
+    simplemente no suma esa entrada.
+    """
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    total = 0.0
+    for filename in _SPEND_LOG_FILES:
+        path = _LOG_DIR / filename
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("backend") != backend:
+                continue
+            if not str(entry.get("ts", "")).startswith(today):
+                continue
+            total += entry.get("estimated_cost_usd", 0) or 0
+    return total
+
+
+def is_within_budget(backend: str) -> bool:
+    """True si no hay LLM_DAILY_BUDGET_USD seteada (sin limite, default), o
+    si el gasto de hoy para este backend todavia no lo alcanzo.
+    """
+    budget_raw = os.environ.get("LLM_DAILY_BUDGET_USD", "")
+    if not budget_raw.strip():
+        return True
+    try:
+        budget = float(budget_raw)
+    except ValueError:
+        return True
+    return spend_today(backend) < budget

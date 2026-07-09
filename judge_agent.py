@@ -63,6 +63,7 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
     _normalize_tool_schema,
     _ollama_response_to_blocks,
     _select_backend,
+    call_with_fallback,
 )
 from firewall_proxy import _redact
 from log_utils import get_logger
@@ -328,7 +329,7 @@ async def judge_with_tools(payload: dict) -> dict:
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage = await _call_model_turn(client, backend, messages, tools, JUDGE_SYSTEM_PROMPT)
+                content, stop_reason, usage, backend = await call_with_fallback(client, messages, tools, JUDGE_SYSTEM_PROMPT)
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
                 messages.append({"role": "assistant", "content": content})
