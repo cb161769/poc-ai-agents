@@ -268,10 +268,13 @@ def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> d
     jql_template = os.environ.get("JIRA_EPIC_LINK_JQL", 'parent = "{epic_key}"')
     jql = jql_template.format(epic_key=epic_key)
     def _search():
-        r = httpx.get(
-            f"{jira_url}/rest/api/3/search",
+        # GET /rest/api/3/search fue dado de baja por Atlassian (410 Gone) --
+        # el reemplazo es POST /rest/api/3/search/jql, con el JQL/campos en
+        # el body en vez de query params.
+        r = httpx.post(
+            f"{jira_url}/rest/api/3/search/jql",
             headers=headers,
-            params={"jql": jql, "fields": "summary,description,labels,components"},
+            json={"jql": jql, "fields": ["summary", "description", "labels", "components"]},
             timeout=15.0,
         )
         r.raise_for_status()

@@ -17,7 +17,10 @@ fi
 SONAR_NEW_ADMIN_PASSWORD="${SONAR_NEW_ADMIN_PASSWORD:-LocalPoc_Admin_2026!}"
 
 echo "[bootstrap_sonar] esperando a que SonarQube este UP..."
-until wget -qO- "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | grep -q '"status":"UP"'; do
+# sonarsource/sonar-scanner-cli no trae wget (si curl, ya usado mas abajo) --
+# con wget este loop fallaba en silencio en cada iteracion y nunca detectaba
+# que SonarQube estaba arriba, esperando para siempre.
+until curl -sf "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | grep -q '"status":"UP"'; do
   sleep 3
 done
 
@@ -31,6 +34,17 @@ if [ ! -f "${TOKEN_FILE}" ]; then
     --data-urlencode "login=admin" \
     --data-urlencode "previousPassword=admin" \
     --data-urlencode "password=${SONAR_NEW_ADMIN_PASSWORD}" \
+    >/dev/null 2>&1 || true
+
+  # Revoca cualquier token viejo con el mismo nombre antes de generar --
+  # idempotente ante un re-run parcial (ej. la generacion ya habia
+  # funcionado antes pero el guardado a disco fallo, dejando un token
+  # huerfano en SonarQube que hace fallar la proxima generacion con el
+  # mismo nombre). Best-effort: si no existe, revoke no hace nada.
+  curl -s -u "admin:${SONAR_NEW_ADMIN_PASSWORD}" -X POST \
+    "${SONAR_HOST_URL}/api/user_tokens/revoke" \
+    --data-urlencode "login=admin" \
+    --data-urlencode "name=poc-scanner-token" \
     >/dev/null 2>&1 || true
 
   echo "[bootstrap_sonar] generando token de analisis..."
@@ -53,11 +67,15 @@ fi
 
 for module in auth-service frontend data-worker; do
   echo "[bootstrap_sonar] escaneando /usr/src/${module}..."
+  # sonar.working.directory explicito: /usr/src esta montado :ro, y el
+  # scanner por default intenta crear .scannerwork DENTRO del projectBaseDir
+  # -- fallaba con "Read-only file system". /tmp si es escribible.
   sonar-scanner \
     -Dproject.settings="/usr/src/${module}/sonar-project.properties" \
     -Dsonar.host.url="${SONAR_HOST_URL}" \
     -Dsonar.token="${TOKEN}" \
-    -Dsonar.projectBaseDir="/usr/src/${module}"
+    -Dsonar.projectBaseDir="/usr/src/${module}" \
+    -Dsonar.working.directory="/tmp/.scannerwork-${module}"
 done
 
 echo "[bootstrap_sonar] listo. Consulta http://localhost:9000 (admin / ${SONAR_NEW_ADMIN_PASSWORD})"

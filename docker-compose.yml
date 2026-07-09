@@ -45,8 +45,13 @@ services:
     restart: unless-stopped
     ports:
       - "9000:9000"
-    environment:
-      SONAR_JDBC_URL: "jdbc:h2:tcp://localhost/sonar"
+    # Sin SONAR_JDBC_URL: SonarQube arranca con su base H2 embebida por
+    # default. El valor que tenia antes ("jdbc:h2:tcp://localhost/sonar")
+    # le pedia tratar a H2 como una base REMOTA por TCP, pero sin
+    # sonar.embeddedDatabase.port ni un proceso H2 real escuchando ahi --
+    # SonarQube crasheaba al arrancar (IllegalArgumentException: Missing
+    # property sonar.embeddedDatabase.port). No hay Postgres en este
+    # compose para Sonar, asi que la base embebida es la intencion real.
     volumes:
       - sonarqube_data:/opt/sonarqube/data
       - sonarqube_extensions:/opt/sonarqube/extensions
@@ -63,12 +68,22 @@ services:
   sonar-scanner:
     image: sonarsource/sonar-scanner-cli:latest
     container_name: poc-sonar-scanner
+    # La imagen corre como UID 1000 (scanner-cli) por default, sin permiso
+    # de escritura sobre el volumen sonar_bootstrap_state (Docker lo crea
+    # con ownership root) -- bootstrap_sonar.sh fallaba con "Permission
+    # denied" al guardar el token. Container de bootstrap de un solo uso en
+    # un entorno local de confianza, root es aceptable aca.
+    user: "0:0"
     depends_on:
       sonarqube:
         condition: service_healthy
     volumes:
       - ./sample-repo:/usr/src:ro
-      - ./scripts:/scripts:ro
+      # /scripts SIN :ro -- bind-montar .env como archivo DENTRO de un
+      # directorio que ya esta montado read-only fallaba al crear el
+      # mountpoint ("read-only file system: mknod ... /scripts/.env").
+      # El script no escribe nada en /scripts de todos modos.
+      - ./scripts:/scripts
       - ./.env:/scripts/.env:ro
       - sonar_bootstrap_state:/state
     entrypoint: ["/bin/sh", "/scripts/bootstrap_sonar.sh"]
@@ -86,7 +101,10 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz || exit 1"]
+      # qdrant/qdrant no trae wget ni curl -- usa /dev/tcp de bash (que si
+      # esta) para armar un GET crudo a /readyz en vez de una herramienta de
+      # red que no existe (mismo problema que tenia el healthcheck de ollama).
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333; printf \"GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3; head -1 <&3 | grep -q 200' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -112,6 +130,10 @@ services:
       - .env
     environment:
       QDRANT_URL: "http://qdrant:6333"
+      # Faltaba: sin esto, sonar_client.py caia al SONAR_URL de .env
+      # (localhost:9000), que DENTRO del contenedor apunta a si mismo, no a
+      # sonarqube -- fetch_resolved_history() fallaba con Connection refused.
+      SONAR_URL: "http://sonarqube:9000"
     networks:
       - poc-net
 
@@ -124,7 +146,12 @@ services:
     volumes:
       - ollama_models:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:11434/api/tags || exit 1"]
+      # La imagen ollama/ollama no trae wget ni curl -- el binario "ollama"
+      # si esta y habla con el servidor local, asi que se usa el mismo en
+      # vez de una herramienta de red que no existe (esto dejaba el
+      # contenedor "unhealthy" para siempre aunque el servidor respondiera
+      # bien, bloqueando a ollama-pull, que depende de service_healthy).
+      test: ["CMD-SHELL", "ollama list || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -158,7 +185,10 @@ services:
     volumes:
       - prefect_data:/root/.prefect
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:4200/api/health || exit 1"]
+      # La imagen prefecthq/prefect no trae wget ni curl -- usa el python3
+      # que si esta (mismo problema que tenian ollama/qdrant con imagenes
+      # minimales sin herramientas de red de linea de comandos).
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')\" || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -182,7 +212,11 @@ services:
       - ./logs:/var/log/falco
     command:
       - /usr/bin/falco
-      - --modern-bpf
+      # --modern-bpf ya no existe como flag de CLI en falcosecurity/falco:latest
+      # (cambio de sintaxis entre versiones) -- el driver ahora se elige via
+      # -o engine.kind=..., no un flag standalone.
+      - -o
+      - engine.kind=modern_ebpf
       - -o
       - json_output=true
       - -o

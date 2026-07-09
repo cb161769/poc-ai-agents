@@ -221,13 +221,18 @@ def _fake_search_response() -> MagicMock:
     return resp
 
 
+@patch("jira_client.httpx.post")
 @patch("jira_client.httpx.get")
-def test_fetch_epic_with_children_shape(mock_get, monkeypatch):
+def test_fetch_epic_with_children_shape(mock_get, mock_post, monkeypatch):
+    """La epica en si se sigue trayendo con GET; los hijos se buscan con
+    POST /rest/api/3/search/jql -- GET /rest/api/3/search fue dado de baja
+    por Atlassian (410 Gone)."""
     monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
     monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
     monkeypatch.setenv("JIRA_API_TOKEN", "tok")
     monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService", "Frontend"})
-    mock_get.side_effect = [_fake_epic_response(), _fake_search_response()]
+    mock_get.return_value = _fake_epic_response()
+    mock_post.return_value = _fake_search_response()
 
     result = fetch_epic_with_children("EPIC-1")
 
@@ -242,20 +247,22 @@ def test_fetch_epic_with_children_shape(mock_get, monkeypatch):
     }
     assert result["children"][1]["repository_origen"] == "AuthService"
 
-    search_call = mock_get.call_args_list[1]
-    assert search_call.kwargs["params"]["jql"] == 'parent = "EPIC-1"'
+    search_call = mock_post.call_args_list[0]
+    assert search_call.kwargs["json"]["jql"] == 'parent = "EPIC-1"'
 
 
+@patch("jira_client.httpx.post")
 @patch("jira_client.httpx.get")
-def test_fetch_epic_with_children_respects_custom_jql(mock_get, monkeypatch):
+def test_fetch_epic_with_children_respects_custom_jql(mock_get, mock_post, monkeypatch):
     monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
     monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
     monkeypatch.setenv("JIRA_API_TOKEN", "tok")
     monkeypatch.setenv("JIRA_EPIC_LINK_JQL", 'cf[10014] = "{epic_key}"')
     monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService"})
-    mock_get.side_effect = [_fake_epic_response(), _fake_search_response()]
+    mock_get.return_value = _fake_epic_response()
+    mock_post.return_value = _fake_search_response()
 
     fetch_epic_with_children("EPIC-1")
 
-    search_call = mock_get.call_args_list[1]
-    assert search_call.kwargs["params"]["jql"] == 'cf[10014] = "EPIC-1"'
+    search_call = mock_post.call_args_list[0]
+    assert search_call.kwargs["json"]["jql"] == 'cf[10014] = "EPIC-1"'

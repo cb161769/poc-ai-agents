@@ -80,10 +80,12 @@ def index_jira_history(client: QdrantClient, model: SentenceTransformer):
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
-    resp = httpx.get(
-        f"{jira_url.rstrip('/')}/rest/api/3/search",
+    # GET /rest/api/3/search fue dado de baja por Atlassian (410 Gone) -- el
+    # reemplazo es POST /rest/api/3/search/jql, con el JQL/campos en el body.
+    resp = httpx.post(
+        f"{jira_url.rstrip('/')}/rest/api/3/search/jql",
         headers=headers,
-        params={"jql": f"project = {project_key} ORDER BY updated DESC", "maxResults": 50, "fields": "summary,description"},
+        json={"jql": f"project = {project_key} ORDER BY updated DESC", "maxResults": 50, "fields": ["summary", "description"]},
         timeout=20.0,
     )
     resp.raise_for_status()
