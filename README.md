@@ -69,6 +69,7 @@ sonar_client.py                      Consulta hallazgos reales de SonarQube (con
 firewall_proxy.py                    AI Firewall: detección de fugas de datos y jailbreaks
 judge_agent.py                       Agente juez independiente (segunda opinión, MCP real)
 agent_loop.py                        Maquinaria compartida de tool-calling (backend dual, MCP)
+llm_backends.py                      Registro de backends LLM (orden de preferencia, pricing) -- ver §13.1
 coding_agent.py                      Agente de código local (Camino B1)
 figma_client.py                      Specs de Figma vía REST cuando el ticket trae un link
 cache_utils.py                       Cache genérico con TTL usado por los clientes reales
@@ -354,6 +355,17 @@ python3 orchestration.py
 ```
 
 Abrí `http://localhost:4200` para ver la corrida completa como un grafo — qué paso falló, cuánto tardó cada uno, y reintentos automáticos en los pasos que fallan por motivos transitorios (red, servicios que tardan en levantar). Usa las mismas variables de `.env` que `run_poc_loop.sh`.
+
+### 13.1. Por qué no migrar a un framework de agentes (LangGraph/CrewAI/AutoGen/Agno)
+
+Decisión de arquitectura evaluada explícitamente (no por default): **se mantiene la orquestación propia.**
+
+- **El problema real de este repo no es de orquestación** — ya existe: `run_poc_loop.sh`/`orchestration.py` son un grafo de etapas con gates reales (firewall rechaza → corta; tests fallan → corta antes del juez; juez `FLAGGED` → bloquea o reintenta una vez). `orchestration.py` sobre Prefect (§13) ya da retries, estado persistido y una UI de grafo — exactamente lo que **LangGraph** ofrecería, expresado en otro DSL. Migrar sería reescribir la misma máquina de estados sin ganar una gate, un retry, ni una vista que no exista ya.
+- **No hay colaboración entre agentes que orquestar.** **CrewAI**/**AutoGen** resuelven agentes que negocian/delegan entre sí. Acá el coding agent y el juez son deliberadamente independientes y adversariales (el juez audita sin ver el razonamiento del coding agent, y nunca puede revertirlo) — es una decisión de gobernanza, no una limitación técnica. Un framework multi-agente empujaría hacia más acoplamiento entre ellos, en la dirección contraria a lo que la seguridad de este diseño necesita.
+- **Agno** apunta a prototipos livianos — este repo ya superó esa etapa (retries, secrets, rate limiting, logging estructurado, grafo de conocimiento en Neo4j).
+- **Lo que sí falta no lo da ningún framework de la lista**: un agente de planificación de épicas (hoy `--epic` concatena mecánicamente, no planifica orden/dependencias entre historias), un paso de exploración de contexto separado del coding agent, gestión de riesgo *proactiva* (hoy el juez es reactivo, audita después del cambio). Construir esos agentes nuevos usa el mismo patrón que ya tienen `coding_agent.py`/`judge_agent.py` (`agent_loop.py` compartido, tools locales + MCP, confirmación humana), no requiere adoptar un framework externo.
+
+**Cuándo reconsiderar esto**: si en algún momento se necesitan agentes que genuinamente negocien entre sí (no es el caso hoy), LangGraph sería la opción más alineada por ya pensar en grafos de estado — pero no antes de que exista ese problema real.
 
 ## Troubleshooting / FAQ
 

@@ -24,6 +24,33 @@ def _fake_response(status_code: int) -> MagicMock:
     return resp
 
 
+def test_select_backend_prefers_anthropic_when_key_set(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    assert agent_loop._select_backend() == "anthropic"
+
+
+def test_select_backend_falls_back_to_ollama_when_reachable(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(agent_loop.httpx, "get", MagicMock(return_value=_fake_response(200)))
+    assert agent_loop._select_backend() == "ollama"
+
+
+def test_select_backend_returns_none_when_nothing_available(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(agent_loop.httpx, "get", MagicMock(side_effect=httpx.ConnectError("no ollama")))
+    assert agent_loop._select_backend() == "none"
+
+
+def test_select_backend_respects_custom_priority_order(monkeypatch):
+    """LLM_BACKEND_PRIORITY="ollama,anthropic" -- si Ollama esta alcanzable,
+    gana aunque ANTHROPIC_API_KEY tambien este seteada.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setenv("LLM_BACKEND_PRIORITY", "ollama,anthropic")
+    monkeypatch.setattr(agent_loop.httpx, "get", MagicMock(return_value=_fake_response(200)))
+    assert agent_loop._select_backend() == "ollama"
+
+
 def test_post_with_retry_retries_on_503_then_succeeds(monkeypatch):
     monkeypatch.setattr(agent_loop.asyncio, "sleep", AsyncMock())
     client = MagicMock()
