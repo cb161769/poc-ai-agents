@@ -29,6 +29,12 @@ QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 SAMPLE_REPO_DIR = Path(os.environ.get("SAMPLE_REPO_DIR", "./sample-repo"))
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 VECTOR_SIZE = 384  # all-MiniLM-L6-v2 output dimension
+# mcp-server-qdrant (.vscode/mcp.json, EMBEDDING_MODEL=sentence-transformers/
+# all-MiniLM-L6-v2) SIEMPRE consulta un vector NOMBRADO con este slug interno
+# de FastEmbed -- si esta coleccion se crea con un vector sin nombre (como
+# antes), toda query real del MCP falla con 400 "Vector with name
+# fast-all-minilm-l6-v2 is not configured in this collection".
+MCP_VECTOR_NAME = "fast-all-minilm-l6-v2"
 
 SOURCE_EXTENSIONS = {".java", ".ts", ".py"}
 
@@ -42,7 +48,7 @@ def ensure_collection(client: QdrantClient, name: str):
     if name not in existing:
         client.create_collection(
             collection_name=name,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+            vectors_config={MCP_VECTOR_NAME: VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)},
         )
 
 
@@ -56,7 +62,7 @@ def index_sample_repo_code(client: QdrantClient, model: SentenceTransformer):
             points.append(
                 PointStruct(
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, str(path))),
-                    vector=vector,
+                    vector={MCP_VECTOR_NAME: vector},
                     payload={"path": str(path.relative_to(SAMPLE_REPO_DIR)), "text": text},
                 )
             )
@@ -99,7 +105,7 @@ def index_jira_history(client: QdrantClient, model: SentenceTransformer):
         points.append(
             PointStruct(
                 id=str(uuid.uuid5(uuid.NAMESPACE_URL, issue.get("key", str(uuid.uuid4())))),
-                vector=vector,
+                vector={MCP_VECTOR_NAME: vector},
                 payload={"ticket_id": issue.get("key"), "summary": summary},
             )
         )
@@ -128,7 +134,7 @@ def index_sonar_history(client: QdrantClient, model: SentenceTransformer):
         points.append(
             PointStruct(
                 id=str(uuid.uuid4()),
-                vector=vector,
+                vector={MCP_VECTOR_NAME: vector},
                 payload={"rule": issue.get("rule"), "message": issue.get("message"), "component": issue.get("component")},
             )
         )
