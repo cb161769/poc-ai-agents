@@ -644,11 +644,15 @@ async def run_coding_agent(
     resume_state = resume_state or {}
     has_investigated = bool(resume_state.get("has_investigated"))
     has_run_verification = bool(resume_state.get("has_run_verification"))
+    initial_plan = resume_state.get("initial_plan")
+    consulted_risk_graph = bool(resume_state.get("consulted_risk_graph"))
     verification_nudge_given = False
     self_review_nudge_given = False
 
     def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
+        result["initial_plan"] = initial_plan
+        result["consulted_risk_graph"] = consulted_risk_graph
         result["_meta"] = {
             "backend": backend,
             "latency_seconds": round(time.monotonic() - start_time, 2),
@@ -663,6 +667,8 @@ async def run_coding_agent(
             "messages": messages,
             "has_investigated": has_investigated,
             "has_run_verification": has_run_verification,
+            "initial_plan": initial_plan,
+            "consulted_risk_graph": consulted_risk_graph,
         }
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="coding_agent_conversation_", delete=False, encoding="utf-8"
@@ -732,6 +738,11 @@ async def run_coding_agent(
 
                     return _finalize(result)
 
+                if initial_plan is None:
+                    plan_text = next((b["text"] for b in content if b.get("type") == "text" and b.get("text", "").strip()), None)
+                    if plan_text:
+                        initial_plan = plan_text
+
                 tool_results = []
                 for block in content:
                     if block.get("type") != "tool_use":
@@ -751,6 +762,8 @@ async def run_coding_agent(
                             if name == "run_shell_command":
                                 has_run_verification = True
                         else:
+                            if name.startswith("neo4j-cypher__"):
+                                consulted_risk_graph = True
                             output = await _call_mcp_tool(sessions, name, tool_input)
                     except Exception as exc:
                         output = f"error llamando a la herramienta: {exc}"

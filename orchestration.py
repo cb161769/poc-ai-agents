@@ -55,6 +55,7 @@ from prefect import flow, get_run_logger, task
 import epic_planner
 import graph_writer
 import output_guard
+from firewall_proxy import _redact
 
 load_dotenv()
 
@@ -62,6 +63,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
 JIRA_IN_PROGRESS_STATUS = os.environ.get("JIRA_IN_PROGRESS_STATUS", "In Progress")
 JIRA_BLOCKED_STATUS = os.environ.get("JIRA_BLOCKED_STATUS", "Blocked")
+# Corrida exitosa (juez OK) -- antes no habia NINGUNA transicion de exito, un
+# ticket que pasaba todo el pipeline se quedaba atascado en JIRA_IN_PROGRESS_STATUS.
+JIRA_REVIEW_STATUS = os.environ.get("JIRA_REVIEW_STATUS", "Code Review")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_COPILOT_ASSIGNEE = os.environ.get("GITHUB_COPILOT_ASSIGNEE", "copilot-swe-agent")
 FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
@@ -202,6 +206,24 @@ def query_sonar(component: str) -> dict:
     return json.loads(_run(["python3", "sonar_client.py", component]))
 
 
+@task(retries=0, name="rescan-sonar")
+def rescan_sonar(target_repo_dir: str, component: str) -> list:
+    """query_sonar() de arriba SOLO lee analisis YA existentes -- nada
+    volvia a escanear despues de que el coding agent aplicara su cambio, asi
+    que un hallazgo nuevo introducido por el propio cambio era invisible
+    para este pipeline. scripts/rescan_sonar.sh es best-effort real: si el
+    repo objetivo no tiene Sonar configurado o el scan/polling fallan,
+    devuelve scanned=false sin lanzar excepcion -- nunca bloquea la corrida.
+    """
+    try:
+        result = json.loads(
+            _run(["bash", str(SCRIPT_DIR / "scripts" / "rescan_sonar.sh"), target_repo_dir, component], check=False)
+        )
+    except (json.JSONDecodeError, RuntimeError):
+        return []
+    return result.get("new_issues", [])
+
+
 @task(retries=1, retry_delay_seconds=5, name="query-figma")
 def query_figma(figma_link: dict | None) -> dict | None:
     """Optional: only runs if the ticket's description carried a Figma link
@@ -252,12 +274,57 @@ def comment_jira(text: str, ticket_key: str | None = None):
     _run(["python3", "jira_client.py", "comment", text], check=False, env=env)
 
 
+@task(retries=0, name="push-and-open-pr")
+def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket_id: str, summary: str, body_text: str) -> dict:
+    """Camino B1 (coding agent local) nunca pasaba de un commit local -- code
+    review y merge quedaban 100% manuales, sin ningun artefacto reviewable
+    en GitHub. Best-effort: si el repo objetivo no tiene un remote real (o
+    git/gh fallan), se omite sin bloquear la corrida -- el veredicto del
+    juez ya fue OK, la rama sigue ahi intacta para pushear a mano.
+    """
+    remote_check = subprocess.run(
+        ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
+    )
+    if remote_check.returncode != 0 or not remote_check.stdout.strip():
+        return {"pushed": False, "pr_url": None, "reason": "el repo objetivo no tiene un remote 'origin' configurado"}
+
+    push_result = subprocess.run(
+        ["git", "-C", target_repo_dir, "push", "-u", "origin", branch], capture_output=True, text=True
+    )
+    if push_result.returncode != 0:
+        return {"pushed": False, "pr_url": None, "reason": f"git push fallo: {push_result.stderr.strip()[:300]}"}
+
+    pr_body = (
+        f"{body_text}\n\n---\nGenerado automaticamente por poc-ai-agents (orchestration.py) para el ticket "
+        f"Jira {ticket_id} -- paso firewall, tests reales, y el agente juez independiente antes de llegar aca."
+    )
+    # cwd=target_repo_dir (no --repo explicito) para que gh auto-detecte el
+    # owner/repo del remote local -- a diferencia de Camino A, que corre
+    # desde SCRIPT_DIR y por eso SI necesita GITHUB_REPO.
+    pr_result = subprocess.run(
+        ["gh", "pr", "create", "--title", summary, "--body", pr_body, "--base", base_branch, "--head", branch],
+        capture_output=True, text=True, cwd=target_repo_dir,
+    )
+    if pr_result.returncode != 0:
+        return {"pushed": True, "pr_url": None, "reason": f"gh pr create fallo: {pr_result.stderr.strip()[:300]}"}
+
+    return {"pushed": True, "pr_url": pr_result.stdout.strip(), "reason": None}
+
+
 @task(retries=1, name="coding-agent-cloud")
 def run_coding_agent_cloud(ticket_id: str, summary: str, sanitized_prompt: str) -> dict:
     issue_body = (
         f"{sanitized_prompt}\n\n---\nGenerado automaticamente por poc-ai-agents "
         f"(orchestration.py / Prefect) desde el ticket Jira {ticket_id}."
     )
+    # Camino A no tiene diff local -- output_guard.py (que audita el diff de
+    # Camino B1) no aplica aca. Se reusa igual la funcion de redaccion de
+    # secretos del firewall (no _check_jailbreak, el issue_body es contenido
+    # para humanos, no una instruccion a un modelo) como ultima linea antes
+    # de publicar en un issue de GitHub, que puede ser publico.
+    issue_body, redactions_applied = _redact(issue_body)
+    if redactions_applied:
+        print(f"output_guard (Camino A): {redactions_applied} redaccion(es) aplicada(s) al issue_body antes de publicarlo.")
     issue_url = _run(["gh", "issue", "create", "--repo", GITHUB_REPO, "--title", summary, "--body", issue_body]).strip()
     assigned = True
     try:
@@ -340,11 +407,13 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
 
     agent_backend = None
     conversation_file = None
+    self_review = None
     try:
         agent_result = json.loads(result.stdout)
         print(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
         agent_backend = agent_result.get("_meta", {}).get("backend")
         conversation_file = agent_result.get("_conversation_file")
+        self_review = agent_result.get("self_review")
     except json.JSONDecodeError:
         print("El agente no devolvio un JSON valido en stdout.")
 
@@ -361,13 +430,17 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "base_branch": base_branch,
             "backend": agent_backend,
             "conversation_file": conversation_file,
+            "self_review": self_review,
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
     if conversation_file:
         Path(conversation_file).unlink(missing_ok=True)
-    return {"applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend, "conversation_file": None}
+    return {
+        "applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend,
+        "conversation_file": None, "self_review": None,
+    }
 
 
 @task(retries=0, name="coding-agent-local-real-retry")
@@ -391,6 +464,7 @@ def retry_coding_agent_local_real(
         payload["resume_state"] = {
             "has_investigated": conversation_state.get("has_investigated", False),
             "has_run_verification": conversation_state.get("has_run_verification", False),
+            "initial_plan": conversation_state.get("initial_plan"),
         }
         Path(conversation_file).unlink(missing_ok=True)
     else:
@@ -411,11 +485,13 @@ def retry_coding_agent_local_real(
 
     backend = None
     retry_conversation_file = None
+    self_review = None
     try:
         agent_result = json.loads(result.stdout)
         print(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
         backend = agent_result.get("_meta", {}).get("backend")
         retry_conversation_file = agent_result.get("_conversation_file")
+        self_review = agent_result.get("self_review")
     except json.JSONDecodeError:
         print("El agente no devolvio un JSON valido en stdout en el segundo intento.")
 
@@ -426,7 +502,7 @@ def retry_coding_agent_local_real(
     if not status.strip():
         if retry_conversation_file:
             Path(retry_conversation_file).unlink(missing_ok=True)
-        return {"applied": False, "backend": backend}
+        return {"applied": False, "backend": backend, "self_review": self_review}
 
     subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
     subprocess.run(
@@ -436,7 +512,7 @@ def retry_coding_agent_local_real(
     # tercero) -- nadie mas va a consumir esta conversacion, se limpia aca.
     if retry_conversation_file:
         Path(retry_conversation_file).unlink(missing_ok=True)
-    return {"applied": True, "backend": backend}
+    return {"applied": True, "backend": backend, "self_review": self_review}
 
 
 @task(retries=0, name="output-guard")
@@ -497,6 +573,17 @@ def _resolve_single_repo(name_to_repo_url: dict) -> tuple:
     return True, next(iter(distinct)), ""
 
 
+def _format_conflicts_section(conflicts: list) -> str:
+    """Pure: convierte la lista de conflictos que epic_planner.py detecto
+    (antes se calculaba y se descartaba sin que nadie los viera) en la
+    seccion de texto que ve el coding agent en el prompt de la epica.
+    "" si no hay conflictos -- no agrega una seccion vacia al prompt.
+    """
+    if not conflicts:
+        return ""
+    return "\n--- Conflictos detectados por el planificador ---\n" + "\n".join(f"- {c}" for c in conflicts) + "\n"
+
+
 @task(retries=1, retry_delay_seconds=5, name="check-epic-single-repo")
 def check_epic_single_repo_task(component_names: list) -> str:
     """Queries Neo4j for repo_url of every component an epic's children
@@ -533,13 +620,32 @@ def check_epic_single_repo_task(component_names: list) -> str:
 
 
 @task(retries=1, name="judge-agent")
-def run_judge(ticket: dict, firewall_result: dict, change_source: str, change_description: str, test_summary: str) -> dict:
+def run_judge(
+    ticket: dict, firewall_result: dict, change_source: str, change_description: str, test_summary: str,
+    self_review: dict | None = None, falco_since: str | None = None, conflicts: list | None = None,
+    new_sonar_issues: list | None = None,
+) -> dict:
+    # Se busca Y se postea Falco ANTES de invocar al juez (no despues, como
+    # hacia antes check_falco_correlation() llamado por el caller) -- asi la
+    # evidencia de runtime real de ESTA corrida puede llegar al payload del
+    # juez que la audita, en vez de solo a un comentario de Jira que un
+    # humano lee despues de que el veredicto ya se decidio.
+    falco_summary = None
+    if falco_since:
+        falco_summary = get_falco_summary(falco_since)
+        if falco_summary:
+            check_falco_correlation(falco_since, ticket.get("ticket_id", "UNKNOWN"), summary=falco_summary)
+
     payload = {
         "ticket": ticket,
         "firewall": firewall_result,
         "change_source": change_source,
         "change_description": change_description,
         "test_summary": test_summary,
+        "self_review": self_review,
+        "falco_summary": falco_summary,
+        "conflicts": conflicts,
+        "new_sonar_issues": new_sonar_issues,
     }
     result = subprocess.run(
         ["python3", str(SCRIPT_DIR / "judge_agent.py")],
@@ -553,12 +659,13 @@ def run_judge(ticket: dict, firewall_result: dict, change_source: str, change_de
     return json.loads(result.stdout)
 
 
-@task(retries=0, name="falco-correlation")
-def check_falco_correlation(since_iso: str, ticket_id: str):
-    """Correlates logs/falco_alerts.jsonl (Falco already writes these in real
-    time, see falco/custom_rules.yaml) with this run's time window. Advisory
-    only -- never blocks the flow, just surfaces what Falco saw via a Jira
-    comment and, if configured, a webhook POST.
+@task(retries=0, name="falco-summary")
+def get_falco_summary(since_iso: str) -> dict | None:
+    """Pure fetch (no posting anywhere): runs scripts/check_falco_alerts.py
+    and returns the parsed summary ({"count":..., "alerts":[...]}), or None
+    if there's nothing to report or the script failed. check_falco_correlation()
+    and run_judge() both build on this so the same window is never queried
+    twice for the same run.
     """
     result = subprocess.run(
         ["python3", str(SCRIPT_DIR / "scripts" / "check_falco_alerts.py"), since_iso, str(SCRIPT_DIR / "logs" / "falco_alerts.jsonl")],
@@ -566,16 +673,30 @@ def check_falco_correlation(since_iso: str, ticket_id: str):
         text=True,
     )
     if not result.stdout.strip():
-        return
+        return None
     try:
         summary = json.loads(result.stdout)
     except json.JSONDecodeError:
+        return None
+    if not summary.get("count"):
+        return None
+    return summary
+
+
+@task(retries=0, name="falco-correlation")
+def check_falco_correlation(since_iso: str, ticket_id: str, summary: dict | None = None):
+    """Correlates logs/falco_alerts.jsonl (Falco already writes these in real
+    time, see falco/custom_rules.yaml) with this run's time window. Advisory
+    only -- never blocks the flow, just surfaces what Falco saw via a Jira
+    comment and, if configured, a webhook POST. If `summary` isn't passed
+    (already fetched by a caller, e.g. run_judge()), fetches it here.
+    """
+    if summary is None:
+        summary = get_falco_summary(since_iso)
+    if not summary:
         return
 
     count = summary.get("count", 0)
-    if not count:
-        return
-
     alert_lines = " ".join(f"- [{a['priority']}] {a['rule']}: {a['output']}" for a in summary["alerts"])
     comment_jira(
         f"🚨 Falco (monitoreo a nivel de sistema, automatizado, Prefect): se detectaron {count} alerta(s) durante esta corrida — {alert_lines}",
@@ -664,6 +785,7 @@ def _retry_local_diff(
     is_epic: bool,
     child_ticket_keys: list | None,
     falco_since: str,
+    conflicts: list | None = None,
 ) -> dict | None:
     """Le da al coding agent un segundo (y ultimo) intento cuando el primer
     veredicto fue FLAGGED con un policy_reference retryable -- reusa la
@@ -730,7 +852,13 @@ def _retry_local_diff(
         )
         raise PipelineBlocked("tests reales fallaron en el segundo intento")
 
-    return _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
+    new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
+
+    return _run_judge_safe(
+        jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
+        self_review=retry_result.get("self_review"), falco_since=falco_since, conflicts=conflicts,
+        new_sonar_issues=new_sonar_issues,
+    )
 
 
 def _handle_rejected(
@@ -787,11 +915,15 @@ def _deliver(
     target_repo_dir: str,
     is_epic: bool = False,
     child_ticket_keys: list | None = None,
+    conflicts: list | None = None,
 ) -> dict:
     """Etapa 5 en adelante: coding agent (nube o fallback local), testing
     agent, juez, correlacion de Falco. Compartido por ticket mode y epic
     mode -- ambos llegan aca con el firewall ya en APPROVED y jira_context
     armado a su manera (un ticket, o una epica + sus hijos combinados).
+    conflicts (solo modo epica): lo que epic_planner.py detecto entre
+    historias hijas -- se le manda al juez ademas de al coding agent, para
+    que verifique si el diff real los tuvo en cuenta.
     """
     sanitized = firewall_result["sanitized_prompt"]
     transition_jira(JIRA_IN_PROGRESS_STATUS, ticket_key=ticket_id)
@@ -808,6 +940,7 @@ def _deliver(
         judge_verdict = _run_judge_safe(
             jira_context, firewall_result, "issue_only", sanitized,
             "sin tests (coding agent en la nube, el PR aun no existe en el momento de esta corrida)",
+            falco_since=falco_since, conflicts=conflicts,
         )
         tests_status, tests_reason, branch, backend = "SKIPPED", None, None, "cloud"
     else:
@@ -868,7 +1001,13 @@ def _deliver(
                 )
                 raise PipelineBlocked("tests reales fallaron")
 
-            judge_verdict = _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
+            new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
+
+            judge_verdict = _run_judge_safe(
+                jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
+                self_review=agent_result.get("self_review"), falco_since=falco_since, conflicts=conflicts,
+                new_sonar_issues=new_sonar_issues,
+            )
             tests_status, tests_reason = "PASSED", None
 
             if (
@@ -883,7 +1022,7 @@ def _deliver(
                 retried_verdict = _retry_local_diff(
                     ticket_id, sanitized, target_repo_dir, agent_result, judge_verdict,
                     jira_context, firewall_result, components, summary,
-                    is_epic, child_ticket_keys, falco_since,
+                    is_epic, child_ticket_keys, falco_since, conflicts=conflicts,
                 )
                 if retried_verdict is not None:
                     judge_verdict = retried_verdict
@@ -893,7 +1032,10 @@ def _deliver(
                 f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio en esta corrida.",
                 ticket_key=ticket_id,
             )
-            judge_verdict = _run_judge_safe(jira_context, firewall_result, "issue_only", sanitized, "sin cambios aplicados")
+            judge_verdict = _run_judge_safe(
+                jira_context, firewall_result, "issue_only", sanitized, "sin cambios aplicados",
+                self_review=agent_result.get("self_review"), falco_since=falco_since, conflicts=conflicts,
+            )
             tests_status, tests_reason = "SKIPPED", None
 
     if judge_verdict is None:
@@ -905,8 +1047,34 @@ def _deliver(
     else:
         comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK. {judge_verdict['reasoning']}", ticket_key=ticket_id)
 
-    check_falco_correlation(falco_since, ticket_id)
+        # Solo con veredicto OK real (nunca con FLAGGED, que ya deja la rama
+        # marcada BLOCKED BY JUDGE) tiene sentido push+PR+avanzar el ticket
+        # a un estado de review -- antes esto no existia, un ticket exitoso
+        # se quedaba en In Progress con la rama sin pushear.
+        if branch:
+            pr_result = push_and_open_pr(
+                target_repo_dir, branch, agent_result.get("base_branch"), ticket_id, summary, sanitized
+            )
+            if pr_result["pr_url"]:
+                comment_jira(f"🔀 PR listo para review: {pr_result['pr_url']}", ticket_key=ticket_id)
+            elif pr_result["pushed"]:
+                comment_jira(
+                    f"🔀 Rama '{branch}' pusheada, pero no se pudo abrir el PR automaticamente "
+                    f"({pr_result['reason']}) — abrilo a mano.",
+                    ticket_key=ticket_id,
+                )
+            else:
+                comment_jira(
+                    f"🔀 El cambio quedo en la rama local '{branch}' — pusheala y abri el PR a mano "
+                    f"({pr_result['reason']}).",
+                    ticket_key=ticket_id,
+                )
+        transition_jira(JIRA_REVIEW_STATUS, ticket_key=ticket_id)
 
+    # Ya no hace falta un check_falco_correlation() aca -- run_judge() ya lo
+    # hizo internamente (fetch + post) ANTES de invocar al juez, para que la
+    # evidencia de Falco de esta misma corrida pudiera llegar a su payload
+    # en vez de solo a un comentario posterior al veredicto.
     record_run_in_graph(
         _build_graph_payload(
             ticket_id, summary, components, firewall_result,
@@ -1038,17 +1206,22 @@ def run_epic_pipeline(epic_key: str):
         logger.warning("plan-epic devolvio un orden incompleto -- se usa el orden original")
         ordered_children = children
     coordination_notes = plan_result.get("coordination_notes") or ""
+    conflicts = plan_result.get("conflicts") or []
+    if conflicts:
+        logger.warning(f"plan-epic detecto {len(conflicts)} conflicto(s) potencial(es) entre historias hijas: {conflicts}")
 
     children_text = "\n".join(
         f"- {c['ticket_id']} ({c['repository_origen']}): {c['summary']}\n  {c['description']}" for c in ordered_children
     )
     coordination_section = f"\n--- Notas de coordinacion del planificador ---\n{coordination_notes}" if coordination_notes else ""
+    conflicts_section = _format_conflicts_section(conflicts)
     prompt = (
         f"ESTO ES UNA EPICA con {len(children)} historias hijas. Resolvelas todas juntas, "
         "coordinando los cambios entre los componentes que toca cada una.\n\n"
         f"Epica {epic_key}: {epic['summary']}\n{epic['description']}\n\n"
         f"--- Historias hijas (orden sugerido por el planificador de epicas) ---\n{children_text}\n"
         f"{coordination_section}"
+        f"{conflicts_section}"
         f"--- Grafo de impacto (por componente) ---\n{chr(10).join(graph_parts)}\n"
         f"--- Hallazgos Sonar (reales, por componente) ---\n{chr(10).join(sonar_parts)}"
     )
@@ -1068,7 +1241,7 @@ def run_epic_pipeline(epic_key: str):
 
     result = _deliver(
         epic_key, epic["summary"], firewall_result, jira_context, target_repo_dir,
-        is_epic=True, child_ticket_keys=child_ticket_keys,
+        is_epic=True, child_ticket_keys=child_ticket_keys, conflicts=plan_result.get("conflicts"),
     )
 
     for child in children:

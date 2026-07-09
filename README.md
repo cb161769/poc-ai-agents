@@ -320,6 +320,8 @@ cat logs/judge_verdicts.jsonl
 ```
 Cada entrada trae `backend`, `latency_seconds`, `input_tokens`/`output_tokens` y `estimated_cost_usd` — ver §12.
 
+**Modo reference-grounded (implementado, sin dato real en el pipeline hoy)**: `judge_agent.py` acepta un campo opcional `reference_answer` en el payload — si viene seteado, el prompt le pide al juez comparar el cambio explícitamente contra esa respuesta de referencia ("gold standard") en vez de evaluarlo solo en abstracto (modo `pointwise`, el que se usa siempre hoy). Está probado (`tests/test_judge_agent.py`) pero **ningún caller real lo setea todavía**: se revisó `jira_client.py` y no trae ningún campo de criterio de aceptación estructurado por ticket, que es el dato que haría falta para poblarlo de verdad. Queda disponible para el día que Jira (o el sistema de tickets que uses) traiga ese campo — conectarlo es agregar `reference_answer` al payload que arman `run_poc_loop.sh`/`orchestration.py` antes de invocar al juez.
+
 ### 12. Evals: benchmarking del juez y precisión del coding agent
 
 **Precisión del agente juez** — un dataset fijo de casos etiquetados a mano (`evals/judge_eval_cases.jsonl`: tickets + decisión de firewall + diff, cada uno con el veredicto que *debería* dar un humano):

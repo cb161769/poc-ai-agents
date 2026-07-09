@@ -310,6 +310,67 @@ def test_run_coding_agent_writes_conversation_file_for_resume(monkeypatch, tmp_p
     conversation_path.unlink()
 
 
+def test_run_coding_agent_captures_initial_plan(monkeypatch, tmp_path):
+    """El primer turno que trae texto junto a una tool_use se captura como
+    initial_plan -- la instruccion "Plan: ..." del prompt le pide al modelo
+    ese texto antes de actuar, y hasta ahora nada lo guardaba.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [
+                {"type": "text", "text": "Plan: voy a leer existing.txt y despues ajustar el mensaje."},
+                {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}},
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["initial_plan"] == "Plan: voy a leer existing.txt y despues ajustar el mensaje."
+
+
+def test_run_coding_agent_initial_plan_survives_resume(monkeypatch, tmp_path):
+    """Un reintento no deberia perder el plan original -- resume_state lo
+    siembra, y si el segundo intento no vuelve a mandar texto libre en su
+    primer turno de tool_use, el plan sembrado se conserva.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        content = [{"type": "text", "text": '{"status": "done", "summary": "corregido", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(
+        ca.run_coding_agent(
+            "T-1",
+            "--- FEEDBACK DEL JUEZ ---\ncorregi el alcance",
+            str(tmp_path),
+            resume_messages=[{"role": "user", "content": "Ticket: T-1\n\narregla el boton"}],
+            resume_state={
+                "has_investigated": True,
+                "has_run_verification": True,
+                "initial_plan": "Plan original: ajustar el boton de login.",
+            },
+        )
+    )
+
+    assert result["initial_plan"] == "Plan original: ajustar el boton de login."
+
+
 def test_run_coding_agent_accepts_done_with_valid_self_review_no_extra_nudge(monkeypatch, tmp_path):
     """Si la respuesta final ya trae self_review completo (y ya investigo y
     verifico), no deberia pedir ningun empujon extra.

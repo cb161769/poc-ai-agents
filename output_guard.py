@@ -30,6 +30,12 @@ def scan_diff(diff_text: str, jira_context: dict = None) -> dict:
         "redactions_applied": redactions_applied,
         "jailbreak_reason": jailbreak_reason,
         "clean": redactions_applied == 0 and jailbreak_reason is None,
+        # El texto ya redactado -- lo usa Camino A (issue_body de GitHub, sin
+        # diff local) para republicar la version sin secretos, no solo para
+        # saber si los habia. _check_jailbreak no aplica a ese caso de uso
+        # (el issue_body es contenido para humanos, no una instruccion a un
+        # modelo) asi que jailbreak_reason ahi se ignora a proposito.
+        "redacted_text": sanitized,
     }
 
 

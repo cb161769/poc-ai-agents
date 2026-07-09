@@ -211,6 +211,68 @@ def test_build_user_prompt_includes_reference_grounded_context():
     assert "La forma correcta de resolver esto es X." in prompt
 
 
+def test_build_user_prompt_includes_self_review_when_present():
+    prompt = _build_user_prompt(
+        _base_judge_payload(
+            self_review={"scope_matches_ticket": True, "no_secrets_introduced": False, "tests_adequate": True}
+        )
+    )
+
+    assert "Autoevaluacion del coding agent" in prompt
+    assert "no_secrets_introduced: False" in prompt
+
+
+def test_build_user_prompt_omits_self_review_section_when_absent():
+    prompt = _build_user_prompt(_base_judge_payload())
+
+    assert "Autoevaluacion del coding agent" not in prompt
+
+
+def test_build_user_prompt_includes_falco_section_when_alerts_present():
+    prompt = _build_user_prompt(
+        _base_judge_payload(
+            falco_summary={"count": 1, "alerts": [{"priority": "Warning", "rule": "Write below binary dir", "output": "..."}]}
+        )
+    )
+
+    assert "Falco" in prompt
+    assert "Write below binary dir" in prompt
+
+
+def test_build_user_prompt_omits_falco_section_without_alerts():
+    prompt = _build_user_prompt(_base_judge_payload(falco_summary={"count": 0, "alerts": []}))
+
+    assert "DURANTE esta misma corrida" not in prompt
+
+
+def test_build_user_prompt_includes_conflicts_section_when_present():
+    prompt = _build_user_prompt(_base_judge_payload(conflicts=["AuthService y Frontend tocan el mismo endpoint"]))
+
+    assert "Conflictos" in prompt
+    assert "AuthService y Frontend tocan el mismo endpoint" in prompt
+
+
+def test_build_user_prompt_omits_conflicts_section_when_absent():
+    prompt = _build_user_prompt(_base_judge_payload())
+
+    assert "conflictos potenciales" not in prompt.lower() or "Conflictos" not in prompt
+
+
+def test_build_user_prompt_includes_new_sonar_issues_section_when_present():
+    prompt = _build_user_prompt(
+        _base_judge_payload(new_sonar_issues=["[MAJOR] rule:S123: algo nuevo (linea 42)"])
+    )
+
+    assert "re-escaneó" in prompt or "re-escaneo" in prompt.lower()
+    assert "[MAJOR] rule:S123: algo nuevo (linea 42)" in prompt
+
+
+def test_build_user_prompt_omits_new_sonar_issues_section_when_absent():
+    prompt = _build_user_prompt(_base_judge_payload())
+
+    assert "NO existían antes del diff" not in prompt
+
+
 def test_judge_system_prompt_embeds_policy_rubric():
     assert "scope-mismatch" in judge_agent.JUDGE_SYSTEM_PROMPT
     assert "graph-impact-unverified" in judge_agent.JUDGE_SYSTEM_PROMPT

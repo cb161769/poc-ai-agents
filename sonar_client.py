@@ -82,13 +82,18 @@ def fetch_resolved_history() -> list:
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(json.dumps({"error": "usage: sonar_client.py <project_key>"}), file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print(json.dumps({"error": "usage: sonar_client.py <project_key> [live]"}), file=sys.stderr)
         sys.exit(1)
 
     project_key = sys.argv[1]
+    # "live" bypasea el cache (cache_utils.py, TTL 300s) -- lo usa
+    # scripts/rescan_sonar.sh para leer el resultado del re-scan que acaba
+    # de terminar, en vez de un hallazgo pre-cambio que todavia este vigente
+    # en cache.
+    live = len(sys.argv) == 3 and sys.argv[2] == "live"
     try:
-        result = get_issues(project_key)
+        result = fetch_issues_live(project_key) if live else get_issues(project_key)
     except KeyError as exc:
         print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
         sys.exit(1)

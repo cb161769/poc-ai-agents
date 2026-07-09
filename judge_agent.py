@@ -274,6 +274,56 @@ Respuesta de referencia (gold standard) -- comparala explícitamente contra \
 el cambio real de abajo:
 {reference_answer}"""
 
+    self_review = payload.get("self_review")
+    self_review_section = ""
+    if isinstance(self_review, dict):
+        self_review_section = f"""
+
+Autoevaluacion del coding agent (ANTES de ver el diff real, es su propia \
+opinion sobre su trabajo -- contrastala contra el cambio real de abajo, no \
+la des por buena: si dice no_secrets_introduced=true pero ves un secreto, o \
+tests_adequate=true sin tests nuevos relevantes, señalalo explicitamente en \
+tu razonamiento):
+scope_matches_ticket: {self_review.get('scope_matches_ticket')}
+no_secrets_introduced: {self_review.get('no_secrets_introduced')}
+tests_adequate: {self_review.get('tests_adequate')}"""
+
+    falco_summary = payload.get("falco_summary")
+    falco_section = ""
+    if isinstance(falco_summary, dict) and falco_summary.get("count"):
+        alert_lines = "\n".join(f"- [{a['priority']}] {a['rule']}: {a['output']}" for a in falco_summary.get("alerts", []))
+        falco_section = f"""
+
+Evidencia de runtime real (Falco) capturada DURANTE esta misma corrida -- no \
+es contexto de una corrida distinta, es lo que el sistema realmente hizo \
+mientras el coding agent trabajaba. Considerala en tu razonamiento:
+{alert_lines}"""
+
+    conflicts = payload.get("conflicts")
+    conflicts_section = ""
+    if conflicts:
+        conflicts_list = "\n".join(f"- {c}" for c in conflicts)
+        conflicts_section = f"""
+
+El planificador de la épica detectó estos conflictos potenciales entre las \
+historias hijas antes de que el coding agent empezara. Verificá explícitamente \
+en tu razonamiento si el cambio real los tuvo en cuenta -- si no hay evidencia \
+de que se haya considerado, marcá FLAGGED citando el policy_reference que \
+mejor aplique (probablemente scope-mismatch o graph-impact-unverified):
+{conflicts_list}"""
+
+    new_sonar_issues = payload.get("new_sonar_issues")
+    new_sonar_issues_section = ""
+    if new_sonar_issues:
+        issues_list = "\n".join(f"- {i}" for i in new_sonar_issues)
+        new_sonar_issues_section = f"""
+
+SonarQube se re-escaneó DESPUÉS de aplicar este cambio (no es el análisis \
+previo usado como contexto -- estos hallazgos NO existían antes del diff, \
+los introdujo el cambio real). Considerálos como evidencia real, no como \
+deuda técnica preexistente del repo:
+{issues_list}"""
+
     return f"""Modo de evaluación: {evaluation_mode}
 
 Ticket: {payload['ticket'].get('ticket_id')} — {payload['ticket'].get('summary')}
@@ -293,7 +343,7 @@ Resultado del testing agent (build/test real del modulo, ya corrio ANTES que \
 vos — si llego a esta etapa es porque paso, pero fijate si el alcance de los \
 tests es suficiente para el cambio real, no asumas que "paso" significa \
 "esta bien probado"):
-{payload.get('test_summary', 'sin tests corridos para esta corrida')}{reference_section}"""
+{payload.get('test_summary', 'sin tests corridos para esta corrida')}{self_review_section}{falco_section}{conflicts_section}{new_sonar_issues_section}{reference_section}"""
 
 
 async def judge_with_tools(payload: dict) -> dict:
@@ -303,8 +353,10 @@ async def judge_with_tools(payload: dict) -> dict:
     start_time = time.monotonic()
     total_input_tokens = 0
     total_output_tokens = 0
+    consulted_risk_graph = False
 
     def _finalize(verdict: dict) -> dict:
+        verdict["consulted_risk_graph"] = consulted_risk_graph
         verdict["_meta"] = {
             "backend": backend,
             "latency_seconds": round(time.monotonic() - start_time, 2),
@@ -358,6 +410,8 @@ async def judge_with_tools(payload: dict) -> dict:
                             if name in JUDGE_LOCAL_TOOLS:
                                 output = JUDGE_LOCAL_TOOLS[name]["fn"](**tool_input)
                             else:
+                                if name.startswith("neo4j-cypher__"):
+                                    consulted_risk_graph = True
                                 output = await _call_mcp_tool(sessions, name, tool_input)
                         except Exception as exc:
                             output = f"error llamando a la herramienta: {exc}"

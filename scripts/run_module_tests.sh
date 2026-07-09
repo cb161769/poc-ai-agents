@@ -36,34 +36,55 @@ fi
 # necesitar un caso por framework.
 IMAGE=""
 TEST_CMD=""
+# LINT_CMD queda vacio si no se detecta config de lint en el repo objetivo --
+# es un gate ADVISORY (nunca afecta EXIT_CODE, ver mas abajo), asi que solo
+# corre cuando hay algo real que ejecutar. go vet/cargo clippy son la
+# excepcion: son parte del toolchain, no necesitan config, asi que corren
+# siempre.
+LINT_CMD=""
 
 if [ -f "${MODULE_PATH}/pom.xml" ]; then
   IMAGE="maven:3.9-eclipse-temurin-17"
   TEST_CMD="mvn -B -q test"
+  if grep -qE 'checkstyle|spotless' "${MODULE_PATH}/pom.xml" 2>/dev/null; then
+    LINT_CMD="mvn -B -q verify -DskipTests"
+  fi
 
 elif [ -n "$(find "${MODULE_PATH}" -maxdepth 2 -name '*.csproj' -print -quit 2>/dev/null)" ] || [ -n "$(find "${MODULE_PATH}" -maxdepth 1 -name '*.sln' -print -quit 2>/dev/null)" ]; then
   IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
   TEST_CMD="dotnet test"
+  LINT_CMD="dotnet format --verify-no-changes"
 
 elif [ -f "${MODULE_PATH}/go.mod" ]; then
   IMAGE="golang:1.22"
   TEST_CMD="go test ./..."
+  LINT_CMD="go vet ./..."
 
 elif [ -f "${MODULE_PATH}/Gemfile" ]; then
   IMAGE="ruby:3.3"
   TEST_CMD="bundle install --quiet && bundle exec rspec"
+  if [ -f "${MODULE_PATH}/.rubocop.yml" ]; then
+    LINT_CMD="bundle exec rubocop"
+  fi
 
 elif [ -f "${MODULE_PATH}/Cargo.toml" ]; then
   IMAGE="rust:1.78"
   TEST_CMD="cargo test"
+  LINT_CMD="cargo clippy --quiet -- -D warnings"
 
 elif [ -f "${MODULE_PATH}/Pipfile" ]; then
   IMAGE="python:3.10-slim"
   TEST_CMD="pip install --quiet pipenv && pipenv install --dev --skip-lock --quiet && pipenv run pytest -q"
+  if [ -f "${MODULE_PATH}/ruff.toml" ] || grep -q '\[tool.ruff\]' "${MODULE_PATH}/pyproject.toml" 2>/dev/null; then
+    LINT_CMD="pip install --quiet ruff && ruff check ."
+  fi
 
 elif [ -f "${MODULE_PATH}/requirements.txt" ]; then
   IMAGE="python:3.10-slim"
   TEST_CMD="pip install --quiet -r requirements.txt && pip install --quiet pytest && pytest -q"
+  if [ -f "${MODULE_PATH}/ruff.toml" ] || grep -q '\[tool.ruff\]' "${MODULE_PATH}/pyproject.toml" 2>/dev/null; then
+    LINT_CMD="pip install --quiet ruff && ruff check ."
+  fi
 
 elif [ -f "${MODULE_PATH}/package.json" ]; then
   # Imagen oficial de Playwright: trae Node + navegadores headless con
@@ -79,6 +100,9 @@ elif [ -f "${MODULE_PATH}/package.json" ]; then
   if [ -d "${MODULE_PATH}/tests" ] || [ -f "${MODULE_PATH}/playwright.config.ts" ]; then
     TEST_CMD="${TEST_CMD} && npx playwright test"
   fi
+  if [ -f "${MODULE_PATH}/.eslintrc.json" ] || [ -f "${MODULE_PATH}/.eslintrc.js" ] || [ -f "${MODULE_PATH}/.eslintrc.cjs" ] || [ -f "${MODULE_PATH}/eslint.config.js" ] || [ -f "${MODULE_PATH}/eslint.config.mjs" ]; then
+    LINT_CMD="npx eslint ."
+  fi
 
 else
   fail_json "no se pudo detectar el stack en ${MODULE_PATH} (sin pom.xml/*.csproj/go.mod/Gemfile/Cargo.toml/Pipfile/requirements.txt/package.json). Agrega el archivo de proyecto estandar de tu ecosistema, o un caso manual en este script."
@@ -86,11 +110,23 @@ fi
 
 echo "Stack detectado en ${MODULE_PATH}: imagen=${IMAGE}"
 
+# Lint es ADVISORY -- nunca decide EXIT_CODE. Se captura el exit code de
+# TEST_CMD explicitamente adentro del contenedor, se corre el lint (si hay
+# uno detectado) despues, y se re-emite el exit code de TEST_CMD al final --
+# asi un fallo de lint (deuda tecnica preexistente del repo objetivo, no
+# necesariamente causada por este cambio) nunca bloquea la corrida, pero su
+# output SI queda en el mismo texto que ya llega al juez como test_summary.
+if [ -n "${LINT_CMD}" ]; then
+  COMBINED_CMD="${TEST_CMD}; __test_exit=\$?; echo; echo '--- LINT (advisory, no bloquea) ---'; ${LINT_CMD} || echo '(lint fallo o encontro hallazgos -- no bloquea la corrida)'; exit \${__test_exit}"
+else
+  COMBINED_CMD="${TEST_CMD}"
+fi
+
 OUTPUT=$(docker run --rm \
   -v "${MODULE_PATH}:/work" \
   -w /work \
   "${IMAGE}" \
-  sh -c "${TEST_CMD}" 2>&1)
+  sh -c "${COMBINED_CMD}" 2>&1)
 EXIT_CODE=$?
 
 if [ "${EXIT_CODE}" -eq 0 ]; then

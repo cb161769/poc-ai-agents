@@ -50,10 +50,24 @@ CONTRIBUTION_LOG="${SCRIPT_DIR}/logs/copilot_contribution.jsonl"
 # Historias hijas de la epica actual, para record_run_in_graph() -- solo se
 # llena en modo --epic (run_epic_etapas()); en modo ticket normal queda "[]".
 CHILD_TICKET_KEYS_JSON="[]"
+# Conflictos que epic_planner.py detecto entre historias hijas -- solo se
+# llena en modo --epic; run_judge() los manda al juez (ademas de al prompt
+# del coding agent) para que verifique si el diff real los tuvo en cuenta.
+CONFLICTS_JSON="[]"
 # Path al archivo temporal con la conversacion del coding agent (Camino B1),
 # para que retry_coding_agent_with_feedback() pueda continuarla en vez de
 # re-investigar desde cero. Vacio si todavia no corrio el coding agent.
 CONVERSATION_FILE=""
+# Autocritica JSON del coding agent (self_review: scope_matches_ticket,
+# no_secrets_introduced, tests_adequate) de la ultima corrida -- run_judge()
+# la manda al juez para que la contraste contra el diff real. "" si no corrio
+# el coding agent local (Camino A / B2 no la generan).
+SELF_REVIEW_JSON=""
+# Timestamp UTC desde donde run_judge() correlaciona logs/falco_alerts.jsonl
+# ANTES de llamar al juez (no solo despues, como antes) -- "" en rutas donde
+# no corrio nada ejecutable todavia (ej. firewall_rejected), asi run_judge()
+# se salta el chequeo de Falco solo.
+FALCO_SINCE_TS=""
 
 fail() {
   echo "ERROR: $1" >&2
@@ -280,6 +294,7 @@ ${feedback_text}"
   echo "Resultado del segundo intento: $(echo "${retry_agent_result_json}" | jq -r '.status') — $(echo "${retry_agent_result_json}" | jq -r '.summary')"
   AGENT_BACKEND=$(echo "${retry_agent_result_json}" | jq -r '._meta.backend // "unknown"')
   CONVERSATION_FILE=$(echo "${retry_agent_result_json}" | jq -r '._conversation_file // ""')
+  SELF_REVIEW_JSON=$(echo "${retry_agent_result_json}" | jq -c '.self_review // empty')
 
   if [ -z "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
     echo "El segundo intento no produjo cambios nuevos."
@@ -333,6 +348,34 @@ run_judge() {
     tests_status_for_graph="FAILED"
   fi
 
+  # Se busca Y se postea Falco ANTES de invocar al juez (no despues, como se
+  # hacia antes) -- asi la evidencia de runtime real de ESTA corrida puede
+  # llegar al payload del juez que la audita, en vez de solo a un comentario
+  # de Jira que un humano lee cuando el veredicto ya se decidio.
+  # FALCO_SINCE_TS vacio (ej. firewall_rejected, nada ejecuto todavia) se
+  # salta el chequeo solo.
+  local falco_result="" falco_summary_json="null"
+  if [ -n "${FALCO_SINCE_TS:-}" ]; then
+    falco_result=$(fetch_falco_summary "${FALCO_SINCE_TS}")
+    if [ -n "${falco_result}" ] && [ "$(echo "${falco_result}" | jq -r '.count // 0' 2>/dev/null)" != "0" ]; then
+      falco_summary_json="${falco_result}"
+      check_falco_correlation "${FALCO_SINCE_TS}" "${falco_result}"
+    fi
+  fi
+
+  # sonar_client.py (consultado al principio de la corrida, como contexto)
+  # solo LEE analisis ya existentes -- nada volvia a escanear DESPUES del
+  # cambio real, asi que un hallazgo nuevo que el propio coding agent
+  # introdujera era invisible. Solo tiene sentido re-escanear si hubo un
+  # diff real (local_diff) -- best-effort, rescan_sonar.sh nunca bloquea.
+  local new_sonar_issues_json="[]"
+  if [ "${change_source}" = "local_diff" ]; then
+    local rescan_result
+    rescan_result=$(bash "${SCRIPT_DIR}/scripts/rescan_sonar.sh" "${TARGET_REPO_DIR}" "${REPO_ORIGEN%%,*}" 2>/dev/null) \
+      && new_sonar_issues_json=$(echo "${rescan_result}" | jq -c '.new_issues // []' 2>/dev/null) \
+      || new_sonar_issues_json="[]"
+  fi
+
   judge_payload=$(jq -n \
     --argjson ticket "${JIRA_CONTEXT}" \
     --arg status "${STATUS}" \
@@ -341,7 +384,11 @@ run_judge() {
     --arg change_source "${change_source}" \
     --arg change_description "${change_description}" \
     --arg test_summary "${test_summary}" \
-    '{ticket: $ticket, firewall: {status: $status, reason: $reason, redactions_applied: $redactions}, change_source: $change_source, change_description: $change_description, test_summary: $test_summary}')
+    --argjson self_review "${SELF_REVIEW_JSON:-null}" \
+    --argjson falco_summary "${falco_summary_json}" \
+    --argjson conflicts "${CONFLICTS_JSON:-[]}" \
+    --argjson new_sonar_issues "${new_sonar_issues_json:-[]}" \
+    '{ticket: $ticket, firewall: {status: $status, reason: $reason, redactions_applied: $redactions}, change_source: $change_source, change_description: $change_description, test_summary: $test_summary, self_review: $self_review, falco_summary: $falco_summary, conflicts: $conflicts, new_sonar_issues: $new_sonar_issues}')
 
   if ! verdict_json=$(echo "${judge_payload}" | python3 "${SCRIPT_DIR}/judge_agent.py" 2>/dev/null); then
     echo "El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad). Continua sin veredicto."
@@ -404,6 +451,16 @@ run_judge() {
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): OK, el rechazo del firewall fue correcto. ${reasoning}"
   else
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): OK. ${reasoning}"
+
+    # Solo con veredicto OK real y una rama local con cambios (change_source
+    # local_diff) tiene sentido push+PR+avanzar el ticket a review -- antes
+    # esto no existia, un ticket exitoso se quedaba en In Progress con la
+    # rama sin pushear.
+    if [ "${change_source}" = "local_diff" ] && [ -n "${branch}" ]; then
+      push_and_open_pr "${branch}"
+    fi
+    JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_REVIEW_STATUS:-Code Review}" >/dev/null 2>&1 \
+      || echo "(no se pudo mover el ticket a '${JIRA_REVIEW_STATUS:-Code Review}' — ajusta JIRA_REVIEW_STATUS a un nombre real de tu workflow)"
   fi
 
   record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "${tests_status_for_graph}" "" "${verdict}" "${reasoning}" "${policy_ref}"
@@ -509,14 +566,60 @@ run_tests_gate() {
   return 1
 }
 
+# Camino B1 (coding agent local) nunca pasaba de un commit local -- code
+# review y merge quedaban 100% manuales, sin ningun artefacto reviewable en
+# GitHub. Best-effort: si el repo objetivo no tiene un remote real (o git/gh
+# fallan), se omite sin bloquear la corrida -- el veredicto del juez ya fue
+# OK, la rama sigue intacta para pushear a mano.
+push_and_open_pr() {
+  local branch="$1"
+
+  if ! git -C "${TARGET_REPO_DIR}" remote get-url origin >/dev/null 2>&1; then
+    echo "🔀 El repo objetivo no tiene un remote 'origin' configurado — la rama '${branch}' queda local, pusheala a mano."
+    return 0
+  fi
+
+  if ! git -C "${TARGET_REPO_DIR}" push -u origin "${branch}" 2>&1; then
+    echo "🔀 git push fallo — la rama '${branch}' queda local, pusheala a mano."
+    return 0
+  fi
+
+  local pr_body pr_url
+  pr_body="${SANITIZED}
+
+---
+Generado automaticamente por poc-ai-agents (run_poc_loop.sh) para el ticket Jira ${TICKET_ID} -- paso firewall, tests reales, y el agente juez independiente antes de llegar aca."
+
+  # cwd = TARGET_REPO_DIR (sin --repo explicito) para que gh auto-detecte el
+  # owner/repo del remote local.
+  if pr_url=$(cd "${TARGET_REPO_DIR}" && gh pr create --title "${SUMMARY}" --body "${pr_body}" --base "${base_branch}" --head "${branch}" 2>&1); then
+    echo "🔀 PR listo para review: ${pr_url}"
+    post_jira_comment "🔀 PR listo para review: ${pr_url}"
+  else
+    echo "🔀 Rama '${branch}' pusheada, pero no se pudo abrir el PR automaticamente — abrilo a mano."
+    post_jira_comment "🔀 Rama '${branch}' pusheada, pero no se pudo abrir el PR automaticamente — abrilo a mano."
+  fi
+}
+
+# Corre scripts/check_falco_alerts.py y devuelve el JSON crudo por stdout,
+# sin postear nada -- separado de check_falco_correlation() para que
+# run_judge() pueda pedirlo UNA vez y reusarlo (fetch + post), en vez de
+# correr el script dos veces para la misma ventana.
+fetch_falco_summary() {
+  local since="$1"
+  python3 "${SCRIPT_DIR}/scripts/check_falco_alerts.py" "${since}" "${SCRIPT_DIR}/logs/falco_alerts.jsonl" 2>/dev/null
+}
+
 # Correlaciona logs/falco_alerts.jsonl (que Falco ya viene escribiendo en
 # tiempo real, ver falco/custom_rules.yaml) con la ventana de esta corrida
 # del pipeline. Puramente informativo: nunca bloquea la corrida, solo la
-# deja en evidencia en Jira y, si esta configurado, en un webhook.
+# deja en evidencia en Jira y, si esta configurado, en un webhook. Si no se
+# le pasa un resultado ya obtenido (2do parametro), lo busca el mismo.
 check_falco_correlation() {
   local since="$1"
-  local result count
-  result=$(python3 "${SCRIPT_DIR}/scripts/check_falco_alerts.py" "${since}" "${SCRIPT_DIR}/logs/falco_alerts.jsonl" 2>/dev/null)
+  local result="${2:-}"
+  local count
+  [ -z "${result}" ] && result=$(fetch_falco_summary "${since}")
   count=$(echo "${result}" | jq -r '.count // 0' 2>/dev/null)
 
   if [ -z "${count}" ] || [ "${count}" = "0" ]; then
@@ -673,6 +776,17 @@ $(echo "${s}" | jq -r '.issues[] | "- [\(.severity)] \(.rule): \(.message) (line
     echo "Planificador de epicas no disponible o sin resultado valido -- se usa el orden mecanico original."
   fi
 
+  local conflicts_text=""
+  CONFLICTS_JSON="[]"
+  if [ -n "${planner_result:-}" ]; then
+    conflicts_text=$(echo "${planner_result}" | jq -r '(.conflicts // [])[]' 2>/dev/null | sed 's/^/- /')
+    if [ -n "${conflicts_text}" ]; then
+      echo "Planificador de epicas: conflictos potenciales detectados entre historias hijas:"
+      echo "${conflicts_text}"
+      CONFLICTS_JSON=$(echo "${planner_result}" | jq -c '.conflicts // []')
+    fi
+  fi
+
   PROMPT=$(cat <<EOF
 ESTO ES UNA EPICA con ${child_count} historias hijas. Resolvelas todas juntas, coordinando los cambios entre los componentes que toca cada una.
 
@@ -683,6 +797,8 @@ ${epic_description}
 ${children_text}
 $([ -n "${coordination_notes}" ] && echo "--- Notas de coordinacion del planificador ---
 ${coordination_notes}")
+$([ -n "${conflicts_text}" ] && echo "--- Conflictos detectados por el planificador ---
+${conflicts_text}")
 --- Grafo de impacto (por componente) ---
 ${GRAPH_RESULT}
 --- Hallazgos Sonar (reales, por componente) ---
@@ -791,6 +907,7 @@ run_pipeline_delivery() {
 
     local falco_since_ts
     falco_since_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    FALCO_SINCE_TS="${falco_since_ts}"
 
     # --- Camino A: agente real. Si hay un repo real configurado, se crea un
     # Issue con el contexto ya armado (ticket + impacto de grafo + hallazgos
@@ -803,7 +920,7 @@ run_pipeline_delivery() {
       echo " ETAPA 5/5 — Asignando el ticket a GitHub Copilot coding agent (${GITHUB_REPO})"
       echo "=================================================================="
 
-      local issue_body issue_url
+      local issue_body issue_url issue_guard_result issue_redactions
       issue_body=$(cat <<EOF
 ${SANITIZED}
 
@@ -811,6 +928,19 @@ ${SANITIZED}
 Generado automaticamente por poc-ai-agents desde el ticket Jira ${TICKET_ID}.
 EOF
 )
+
+      # Camino A no tiene diff local -- output_guard.py (pensado para el diff
+      # de Camino B1) igual se reusa aca solo por su redaccion de secretos
+      # (redacted_text), no por el chequeo de jailbreak: el issue_body es
+      # contenido para humanos, no una instruccion a un modelo, y puede
+      # terminar en un issue publico de GitHub.
+      issue_guard_result=$(jq -n --arg diff "${issue_body}" '{diff_text: $diff, jira_context: {}}' \
+        | python3 "${SCRIPT_DIR}/output_guard.py" 2>/dev/null) || issue_guard_result=""
+      issue_redactions=$(echo "${issue_guard_result}" | jq -r '.redactions_applied // 0' 2>/dev/null || echo 0)
+      if [ -n "${issue_guard_result}" ] && [ "${issue_redactions}" != "0" ]; then
+        echo "output_guard (Camino A): ${issue_redactions} redaccion(es) aplicada(s) al issue_body antes de publicarlo."
+        issue_body=$(echo "${issue_guard_result}" | jq -r '.redacted_text')
+      fi
 
       issue_url=$(gh issue create --repo "${GITHUB_REPO}" --title "${SUMMARY}" --body "${issue_body}") \
         || fail "no se pudo crear el issue en ${GITHUB_REPO}. Revisa que el repo exista y tengas permisos."
@@ -830,8 +960,11 @@ EOF
         post_jira_comment "🤖 GitHub Copilot coding agent (automatizado): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Se creo ${issue_url} pero no se pudo asignar al coding agent — revisar configuracion del repo."
         log_contribution "APPROVED" "${REDACTIONS}" true false "issue:${issue_url}"
         record_run_in_graph "" "cloud" "SKIPPED" "" "SKIPPED" "no se pudo asignar el issue al coding agent" ""
+        # Esta rama no llega a llamar a run_judge() (no se pudo asignar el
+        # agente) -- a diferencia del "if" de arriba, donde run_judge() ya
+        # corre Falco internamente, aca hay que hacerlo explicito.
+        check_falco_correlation "${falco_since_ts}"
       fi
-      check_falco_correlation "${falco_since_ts}"
       exit 0
     fi
 
@@ -877,8 +1010,10 @@ EOF
       # cero si el juez pide un segundo intento. "" si el agente no lo genero
       # (ej. sin backend disponible).
       CONVERSATION_FILE=$(echo "${agent_result_json}" | jq -r '._conversation_file // ""')
+      SELF_REVIEW_JSON=$(echo "${agent_result_json}" | jq -c '.self_review // empty')
     else
       CONVERSATION_FILE=""
+      SELF_REVIEW_JSON=""
       # --- Camino B2 (fallback): gh copilot suggest, sugerencia de un solo
       # tiro sin loop ni acceso a los MCP — ver PLAN.md.
       echo "Sin ANTHROPIC_API_KEY ni Ollama alcanzable — usando gh copilot suggest como fallback (sugerencia puntual, no un agente)."
@@ -901,10 +1036,19 @@ EOF
         tests_gate_result=$?
         log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "${TEST_PASSED}"
         if [ "${tests_gate_result}" -eq 0 ]; then
+          # run_judge() ya corre Falco internamente (fetch + post), antes de
+          # invocar al juez -- no hace falta un check_falco_correlation aparte.
           run_judge "local_diff" "${diff_text}" "rama '${branch}' de ${TARGET_REPO_DIR}" "${branch}" "" "${TEST_OUTPUT}"
+        else
+          # Los tests bloquearon antes de llegar al juez -- run_judge() nunca
+          # corrio, asi que Falco no se disparo solo, hay que pedirlo aca.
+          check_falco_correlation "${falco_since_ts}"
         fi
       else
         log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"
+        # La guardia de salida bloqueo antes de llegar al juez -- mismo
+        # criterio que arriba, Falco no se disparo solo.
+        check_falco_correlation "${falco_since_ts}"
       fi
     else
       git -C "${TARGET_REPO_DIR}" checkout "${base_branch}" >/dev/null 2>&1
@@ -915,7 +1059,6 @@ EOF
       log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"
       run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"
     fi
-    check_falco_correlation "${falco_since_ts}"
     exit 0
   fi
 
