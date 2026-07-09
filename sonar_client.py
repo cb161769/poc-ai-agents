@@ -14,6 +14,7 @@ import httpx
 from dotenv import load_dotenv
 
 from cache_utils import cached_call
+from retry_utils import retry_call
 
 load_dotenv()
 
@@ -28,13 +29,17 @@ def _auth():
 
 
 def fetch_issues_live(project_key: str) -> dict:
-    resp = httpx.get(
-        f"{_sonar_url()}/api/issues/search",
-        auth=_auth(),
-        params={"componentKeys": project_key, "resolved": "false", "ps": 100},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _fetch():
+        r = httpx.get(
+            f"{_sonar_url()}/api/issues/search",
+            auth=_auth(),
+            params={"componentKeys": project_key, "resolved": "false", "ps": 100},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_fetch)
     data = resp.json()
     issues = [
         {
@@ -60,13 +65,17 @@ def get_issues(project_key: str) -> dict:
 def fetch_resolved_history() -> list:
     """Real, previously-resolved issues across all scanned projects — used to
     seed the sonar_history_resolved Qdrant collection (see index_rag_corpus.py)."""
-    resp = httpx.get(
-        f"{_sonar_url()}/api/issues/search",
-        auth=_auth(),
-        params={"resolved": "true", "ps": 100},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _fetch():
+        r = httpx.get(
+            f"{_sonar_url()}/api/issues/search",
+            auth=_auth(),
+            params={"resolved": "true", "ps": 100},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_fetch)
     data = resp.json()
     return data.get("issues", [])
 

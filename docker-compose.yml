@@ -4,6 +4,7 @@ services:
   neo4j:
     image: neo4j:5.12.0-community
     container_name: poc-neo4j
+    restart: unless-stopped
     ports:
       - "7474:7474"
       - "7687:7687"
@@ -41,6 +42,7 @@ services:
   sonarqube:
     image: sonarqube:10.6-community
     container_name: poc-sonarqube
+    restart: unless-stopped
     ports:
       - "9000:9000"
     environment:
@@ -78,6 +80,7 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: poc-qdrant
+    restart: unless-stopped
     ports:
       - "6333:6333"
     volumes:
@@ -115,6 +118,7 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: poc-ollama
+    restart: unless-stopped
     ports:
       - "11434:11434"
     volumes:
@@ -178,6 +182,7 @@ services:
       context: .
       dockerfile: Dockerfile.firewall
     container_name: poc-ai-firewall
+    restart: unless-stopped
     depends_on:
       neo4j:
         condition: service_healthy

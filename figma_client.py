@@ -20,6 +20,7 @@ import httpx
 from dotenv import load_dotenv
 
 from cache_utils import cached_call
+from retry_utils import retry_call
 
 load_dotenv()
 
@@ -75,13 +76,17 @@ def _summarize_node(node: dict, depth: int = 0) -> dict:
 
 
 def fetch_node_live(file_key: str, node_id: str) -> dict:
-    resp = httpx.get(
-        f"{_figma_url()}/files/{file_key}/nodes",
-        headers=_auth_headers(),
-        params={"ids": node_id},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _fetch():
+        r = httpx.get(
+            f"{_figma_url()}/files/{file_key}/nodes",
+            headers=_auth_headers(),
+            params={"ids": node_id},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_fetch)
     data = resp.json()
 
     node_entry = (data.get("nodes") or {}).get(node_id)

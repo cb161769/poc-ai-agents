@@ -29,6 +29,7 @@ import httpx
 from dotenv import load_dotenv
 
 from cache_utils import cached_call
+from retry_utils import retry_call
 
 load_dotenv()
 
@@ -119,13 +120,17 @@ def _fetch_rovo_attachment_context(jira_url: str, headers: dict, ticket_key: str
 
     attachment_names = [a.get("filename", "unknown") for a in attachments]
 
-    resp = httpx.get(
-        f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
-        headers=headers,
-        params={"orderBy": "created"},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _fetch():
+        r = httpx.get(
+            f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
+            headers=headers,
+            params={"orderBy": "created"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_fetch)
     comments = resp.json().get("comments", [])
 
     rovo_texts = [
@@ -178,13 +183,17 @@ def fetch_ticket_live() -> dict:
     ticket_key = os.environ["JIRA_TICKET_KEY"]
     headers = _auth_headers()
 
-    resp = httpx.get(
-        f"{jira_url}/rest/api/3/issue/{ticket_key}",
-        headers=headers,
-        params={"fields": "summary,description,labels,status,attachment,components"},
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _fetch():
+        r = httpx.get(
+            f"{jira_url}/rest/api/3/issue/{ticket_key}",
+            headers=headers,
+            params={"fields": "summary,description,labels,status,attachment,components"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_fetch)
     issue = resp.json()
 
     fields = issue.get("fields", {})
@@ -221,13 +230,17 @@ def fetch_epic_with_children(epic_key: str) -> dict:
     jira_url = os.environ["JIRA_URL"].rstrip("/")
     headers = _auth_headers()
 
-    epic_resp = httpx.get(
-        f"{jira_url}/rest/api/3/issue/{epic_key}",
-        headers=headers,
-        params={"fields": "summary,description,labels,status,components"},
-        timeout=15.0,
-    )
-    epic_resp.raise_for_status()
+    def _fetch_epic():
+        r = httpx.get(
+            f"{jira_url}/rest/api/3/issue/{epic_key}",
+            headers=headers,
+            params={"fields": "summary,description,labels,status,components"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    epic_resp = retry_call(_fetch_epic)
     epic_issue = epic_resp.json()
     epic_fields = epic_issue.get("fields", {})
     epic = {
@@ -239,13 +252,17 @@ def fetch_epic_with_children(epic_key: str) -> dict:
 
     jql_template = os.environ.get("JIRA_EPIC_LINK_JQL", 'parent = "{epic_key}"')
     jql = jql_template.format(epic_key=epic_key)
-    search_resp = httpx.get(
-        f"{jira_url}/rest/api/3/search",
-        headers=headers,
-        params={"jql": jql, "fields": "summary,description,labels,components"},
-        timeout=15.0,
-    )
-    search_resp.raise_for_status()
+    def _search():
+        r = httpx.get(
+            f"{jira_url}/rest/api/3/search",
+            headers=headers,
+            params={"jql": jql, "fields": "summary,description,labels,components"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    search_resp = retry_call(_search)
     children = [
         {
             "ticket_id": issue.get("key"),
@@ -368,12 +385,16 @@ def transition_ticket(ticket_key: str, target_status_name: str) -> dict:
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
 
-    resp = httpx.get(
-        f"{jira_url}/rest/api/3/issue/{ticket_key}/transitions",
-        headers=headers,
-        timeout=15.0,
-    )
-    resp.raise_for_status()
+    def _list_transitions():
+        r = httpx.get(
+            f"{jira_url}/rest/api/3/issue/{ticket_key}/transitions",
+            headers=headers,
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        return r
+
+    resp = retry_call(_list_transitions)
     transitions = resp.json().get("transitions", [])
 
     match = next(

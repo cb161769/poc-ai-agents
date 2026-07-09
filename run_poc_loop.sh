@@ -53,6 +53,47 @@ fail() {
   exit 1
 }
 
+# Bounded retry (2 reintentos, backoff 1s/2s) para comandos que le pegan a
+# servicios reales (curl al firewall, cypher-shell a Neo4j) -- mismo criterio
+# que ya usa orchestration.py por task de Prefect y retry_utils.py del lado
+# Python. Antes de esto, run_poc_loop.sh no reintentaba nada: un solo blip
+# transitorio (Neo4j reiniciando, una conexion que se corta) tiraba abajo
+# toda la corrida. "$@" es el comando completo a ejecutar.
+retry_cmd() {
+  local max_retries=2 backoff=(1 2) attempt=0
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if [ "${attempt}" -ge "${max_retries}" ]; then
+      return 1
+    fi
+    sleep "${backoff[${attempt}]}"
+    attempt=$((attempt + 1))
+  done
+}
+
+# Circuit breaker simple por servicio: si Neo4j ya fallo (tras agotar los
+# reintentos de retry_cmd) una vez en esta corrida, las siguientes consultas
+# al grafo fallan rapido con un mensaje claro en vez de volver a intentar y
+# esperar el mismo timeout de nuevo.
+NEO4J_DOWN=false
+
+# Wrapper de cypher-shell con retry + circuit breaker. Usage:
+#   cypher_query "<query cypher>" -> stdout con el resultado, o falla.
+cypher_query() {
+  local query="$1"
+  if [ "${NEO4J_DOWN}" = "true" ]; then
+    echo "ERROR: Neo4j ya fallo en esta corrida, se omite este intento (circuit breaker abierto)." >&2
+    return 1
+  fi
+  if ! retry_cmd cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain "${query}"; then
+    NEO4J_DOWN=true
+    echo "ERROR: no se pudo consultar Neo4j tras reintentar -- se omiten mas consultas al grafo en esta corrida." >&2
+    return 1
+  fi
+}
+
 # Detects the real repo you're standing in (the cwd you ran this script
 # from, not SCRIPT_DIR where the tool itself lives) and refuses to continue
 # if it's dirty — the pipeline is about to create a branch and commit to it,
@@ -263,8 +304,7 @@ check_epic_single_repo() {
   quoted_list=$(echo "${component_names}" | sed "s/.*/'&'/" | paste -sd, -)
 
   query="MATCH (n) WHERE n.name IN [${quoted_list}] RETURN n.name + '|' + coalesce(n.repo_url, '') AS row"
-  rows=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain "${query}" 2>/dev/null \
-    | tail -n +2 | tr -d '"')
+  rows=$(cypher_query "${query}" 2>/dev/null | tail -n +2 | tr -d '"')
 
   expected_count=$(echo "${component_names}" | grep -c . || true)
   found_count=$(echo "${rows}" | grep -c . || true)
@@ -357,8 +397,7 @@ run_epic_etapas() {
   local component g s
   while IFS= read -r component; do
     [ -z "${component}" ] && continue
-    g=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain \
-      "MATCH (origin {name: '${component}'})<-[:DEPENDS_ON]-(dependent) RETURN dependent.name AS servicio, dependent.language AS lenguaje" 2>/dev/null)
+    g=$(cypher_query "MATCH (origin {name: '${component}'})<-[:DEPENDS_ON]-(dependent) RETURN dependent.name AS servicio, dependent.language AS lenguaje" 2>/dev/null)
     GRAPH_RESULT="${GRAPH_RESULT}
 --- ${component} ---
 ${g}"
@@ -426,10 +465,17 @@ run_pipeline_delivery() {
   fi
 
   local response http_code body
-  response=$(curl -s -w '\n%{http_code}' -X POST "${FIREWALL_URL}/evaluate" \
-    -H "Content-Type: application/json" \
-    "${firewall_auth_header[@]}" \
-    -d "${payload}")
+  # curl solo devuelve exit != 0 si no pudo hablar con el firewall (host
+  # caido, timeout, conexion rechazada) -- un 401/403 real sigue siendo
+  # exit 0 con body, asi que retry_cmd solo reintenta fallos de red, nunca
+  # una decision legitima del firewall.
+  _call_firewall() {
+    response=$(curl -s -w '\n%{http_code}' -X POST "${FIREWALL_URL}/evaluate" \
+      -H "Content-Type: application/json" \
+      "${firewall_auth_header[@]}" \
+      -d "${payload}")
+  }
+  retry_cmd _call_firewall || fail "no se pudo contactar al AI Firewall en ${FIREWALL_URL} tras reintentar. Revisa que 'docker compose up' este corriendo."
 
   http_code=$(echo "${response}" | tail -n1)
   body=$(echo "${response}" | sed '$d')
@@ -605,8 +651,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 no esta instalado."
 # se mantenga sincronizada a mano. Best-effort: si Neo4j no esta disponible
 # o el grafo esta vacio, se deja lo que ya haya en .env sin tocar nada.
 if command -v cypher-shell >/dev/null 2>&1; then
-  DISCOVERED_COMPONENTS=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain \
-    "MATCH (n) RETURN DISTINCT n.name AS name" 2>/dev/null | tail -n +2 | tr -d '"' | paste -sd, -)
+  DISCOVERED_COMPONENTS=$(cypher_query "MATCH (n) RETURN DISTINCT n.name AS name" 2>/dev/null | tail -n +2 | tr -d '"' | paste -sd, -)
   if [ -n "${DISCOVERED_COMPONENTS}" ]; then
     export JIRA_KNOWN_COMPONENTS="${DISCOVERED_COMPONENTS}"
     echo "Componentes conocidos derivados del grafo Neo4j: ${JIRA_KNOWN_COMPONENTS}"
@@ -665,9 +710,8 @@ echo
 echo "=================================================================="
 echo " ETAPA 2/5 — Consulta real de impacto en el grafo Neo4j"
 echo "=================================================================="
-GRAPH_RESULT=$(cypher-shell -a "${NEO4J_URI}" -u "${NEO4J_USERNAME}" -p "${NEO4J_PASSWORD}" --format plain \
-  "MATCH (origin {name: '${REPO_ORIGEN}'})<-[:DEPENDS_ON]-(dependent) RETURN dependent.name AS servicio, dependent.language AS lenguaje" \
-  2>/dev/null) || fail "no se pudo consultar Neo4j. Revisa que 'docker compose up' este corriendo."
+GRAPH_RESULT=$(cypher_query "MATCH (origin {name: '${REPO_ORIGEN}'})<-[:DEPENDS_ON]-(dependent) RETURN dependent.name AS servicio, dependent.language AS lenguaje") \
+  || fail "no se pudo consultar Neo4j tras reintentar. Revisa que 'docker compose up' este corriendo."
 
 if [ -z "$(echo "${GRAPH_RESULT}" | tail -n +2)" ]; then
   echo "ALERTA: ningun servicio depende de '${REPO_ORIGEN}' segun el grafo actual."
