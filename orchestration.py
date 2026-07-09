@@ -38,6 +38,7 @@ Usage:
 run_poc_loop.sh is kept as-is for anyone who prefers a plain bash run
 without standing up Prefect — both drive the exact same scripts underneath.
 """
+import asyncio
 import json
 import os
 import shutil
@@ -51,7 +52,9 @@ import httpx
 from dotenv import load_dotenv
 from prefect import flow, get_run_logger, task
 
+import epic_planner
 import graph_writer
+import output_guard
 
 load_dotenv()
 
@@ -336,10 +339,12 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         payload_file.unlink(missing_ok=True)
 
     agent_backend = None
+    conversation_file = None
     try:
         agent_result = json.loads(result.stdout)
         print(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
         agent_backend = agent_result.get("_meta", {}).get("backend")
+        conversation_file = agent_result.get("_conversation_file")
     except json.JSONDecodeError:
         print("El agente no devolvio un JSON valido en stdout.")
 
@@ -350,27 +355,50 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
         subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
-        return {"applied": True, "branch": branch, "base_branch": base_branch, "backend": agent_backend}
+        return {
+            "applied": True,
+            "branch": branch,
+            "base_branch": base_branch,
+            "backend": agent_backend,
+            "conversation_file": conversation_file,
+        }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
-    return {"applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend}
+    if conversation_file:
+        Path(conversation_file).unlink(missing_ok=True)
+    return {"applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend, "conversation_file": None}
 
 
 @task(retries=0, name="coding-agent-local-real-retry")
-def retry_coding_agent_local_real(ticket_id: str, augmented_prompt: str, target_repo_dir: str) -> dict:
+def retry_coding_agent_local_real(
+    ticket_id: str, feedback_text: str, target_repo_dir: str, conversation_file: str | None = None
+) -> dict:
     """Segundo pase de Camino B1 tras un veredicto FLAGGED retryable --
     reusa la rama que el primer intento ya dejo checked out (NO crea una
-    rama nueva), y solo le pide a coding_agent.py que reintente con el
-    feedback del juez ya incluido en el prompt. Espeja
-    run_coding_agent_local_real() sin el paso de checkout -b.
+    rama nueva). Si conversation_file esta disponible, CONTINUA la misma
+    conversacion (resume_messages/resume_state leidos de ese archivo, que
+    se borra despues de usarse) en vez de mandar el ticket completo de
+    nuevo -- evita repagar la investigacion ya hecha. Sin conversation_file
+    (corrida vieja o el primer intento no la genero), cae al comportamiento
+    anterior: manda el prompt original + feedback desde cero.
     """
+    payload = {"ticket_id": ticket_id, "target_repo_dir": target_repo_dir}
+    if conversation_file and Path(conversation_file).exists():
+        conversation_state = json.loads(Path(conversation_file).read_text(encoding="utf-8"))
+        payload["sanitized_prompt"] = feedback_text
+        payload["resume_messages"] = conversation_state.get("messages", [])
+        payload["resume_state"] = {
+            "has_investigated": conversation_state.get("has_investigated", False),
+            "has_run_verification": conversation_state.get("has_run_verification", False),
+        }
+        Path(conversation_file).unlink(missing_ok=True)
+    else:
+        payload["sanitized_prompt"] = feedback_text
+
     payload_file = SCRIPT_DIR / "logs" / f".coding_agent_retry_payload_{ticket_id}_{int(time.time())}.json"
     payload_file.parent.mkdir(parents=True, exist_ok=True)
-    payload_file.write_text(
-        json.dumps({"ticket_id": ticket_id, "sanitized_prompt": augmented_prompt, "target_repo_dir": target_repo_dir}),
-        encoding="utf-8",
-    )
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
     try:
         result = subprocess.run(
             ["python3", str(SCRIPT_DIR / "coding_agent.py"), str(payload_file)],
@@ -382,10 +410,12 @@ def retry_coding_agent_local_real(ticket_id: str, augmented_prompt: str, target_
         payload_file.unlink(missing_ok=True)
 
     backend = None
+    retry_conversation_file = None
     try:
         agent_result = json.loads(result.stdout)
         print(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
         backend = agent_result.get("_meta", {}).get("backend")
+        retry_conversation_file = agent_result.get("_conversation_file")
     except json.JSONDecodeError:
         print("El agente no devolvio un JSON valido en stdout en el segundo intento.")
 
@@ -394,13 +424,31 @@ def retry_coding_agent_local_real(ticket_id: str, augmented_prompt: str, target_
     ).stdout
 
     if not status.strip():
+        if retry_conversation_file:
+            Path(retry_conversation_file).unlink(missing_ok=True)
         return {"applied": False, "backend": backend}
 
     subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
     subprocess.run(
         ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
     )
+    # Este es el ultimo intento posible (_retry_local_diff no encadena un
+    # tercero) -- nadie mas va a consumir esta conversacion, se limpia aca.
+    if retry_conversation_file:
+        Path(retry_conversation_file).unlink(missing_ok=True)
     return {"applied": True, "backend": backend}
+
+
+@task(retries=0, name="output-guard")
+def run_output_guard(diff_text: str, jira_context: dict) -> dict:
+    """El AI Firewall (firewall_proxy.py) audita el prompt que ENTRA al
+    coding agent, pero nadie volvia a auditar el diff que efectivamente
+    produce. Corre las MISMAS reglas (output_guard.py, que reusa
+    firewall_proxy._redact()/_check_jailbreak() directo) sobre el diff real,
+    antes del testing agent -- si encuentra algo, es tan serio como un test
+    fallido: bloquea, y el juez ni se llama.
+    """
+    return output_guard.scan_diff(diff_text, jira_context)
 
 
 @task(retries=0, name="testing-agent")
@@ -419,6 +467,16 @@ def run_tests(target_repo_dir: str) -> dict:
 @task(retries=1, retry_delay_seconds=5, name="fetch-epic")
 def fetch_epic(epic_key: str) -> dict:
     return json.loads(_run(["python3", "jira_client.py", "fetch-epic", epic_key]))
+
+
+@task(retries=0, name="plan-epic")
+def plan_epic_task(epic: dict, children: list) -> dict:
+    """Reordena las historias hijas por dependencia real en vez del orden
+    mecanico que devolvio el JQL (epic_planner.py, best-effort: si no hay
+    backend disponible o falla, epic_planner.plan_epic ya cae sola al orden
+    mecanico original -- nunca bloquea el modo epica).
+    """
+    return asyncio.run(epic_planner.plan_epic(epic, children))
 
 
 def _resolve_single_repo(name_to_repo_url: dict) -> tuple:
@@ -551,6 +609,8 @@ def _build_graph_payload(
     backend: str | None,
     is_epic: bool = False,
     child_ticket_keys: list | None = None,
+    output_guard_status: str = "SKIPPED",
+    output_guard_reason: str | None = None,
 ) -> dict:
     judge_status = "SKIPPED"
     judge_reason = None
@@ -572,6 +632,7 @@ def _build_graph_payload(
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "decisions": [
             {"stage": "firewall", "status": firewall_result.get("status"), "reason": firewall_result.get("reason"), "policy_reference": None},
+            {"stage": "output_guard", "status": output_guard_status, "reason": output_guard_reason, "policy_reference": None},
             {"stage": "tests", "status": tests_status, "reason": tests_reason, "policy_reference": None},
             {"stage": "judge", "status": judge_status, "reason": judge_reason, "policy_reference": policy_reference},
         ],
@@ -614,14 +675,45 @@ def _retry_local_diff(
     que el primer intento) en vez de devolver un veredicto.
     """
     reasoning = judge_verdict.get("reasoning", "")
-    augmented_prompt = f"{sanitized}\n\n--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+    feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+    # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
+    # a mandar sanitized + feedback desde cero (compatibilidad con corridas
+    # que no lo generaron).
+    if not agent_result.get("conversation_file"):
+        feedback_text = f"{sanitized}\n\n{feedback_text}"
 
-    retry_result = retry_coding_agent_local_real(ticket_id, augmented_prompt, target_repo_dir)
+    retry_result = retry_coding_agent_local_real(
+        ticket_id, feedback_text, target_repo_dir, conversation_file=agent_result.get("conversation_file")
+    )
     if not retry_result["applied"]:
         print("El segundo intento no produjo cambios nuevos -- se mantiene el veredicto FLAGGED original.")
         return None
 
     branch = agent_result["branch"]
+    diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{branch}"])
+
+    guard_result = run_output_guard(diff_text, jira_context)
+    if not guard_result["clean"]:
+        reason = f"redacciones={guard_result['redactions_applied']}, jailbreak={guard_result['jailbreak_reason']}"
+        comment_jira(
+            f"🛡️ Guardia de salida (Prefect): el diff del segundo intento contiene evidencia real de fuga de "
+            f"datos o manipulacion ({reason}). Bloqueado antes del testing agent.",
+            ticket_key=ticket_id,
+        )
+        post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id} (segundo intento): {reason}")
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
+        check_falco_correlation(falco_since, ticket_id)
+        record_run_in_graph(
+            _build_graph_payload(
+                ticket_id, summary, components, firewall_result,
+                tests_status="SKIPPED", tests_reason=None,
+                judge_verdict=None, branch=branch, backend=retry_result.get("backend"),
+                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+                output_guard_status="FAILED", output_guard_reason=reason,
+            )
+        )
+        raise PipelineBlocked(f"guardia de salida bloqueo el segundo intento: {reason}")
+
     test_result = run_tests(target_repo_dir)
     if not test_result["passed"]:
         comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON en el segundo intento de '{branch}'.", ticket_key=ticket_id)
@@ -638,7 +730,6 @@ def _retry_local_diff(
         )
         raise PipelineBlocked("tests reales fallaron en el segundo intento")
 
-    diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{branch}"])
     return _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
 
 
@@ -735,6 +826,32 @@ def _deliver(
                 f"pendiente de revision humana (no en '{agent_result['base_branch']}').",
                 ticket_key=ticket_id,
             )
+            diff_text = _run([
+                "git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{agent_result['branch']}"
+            ])
+
+            guard_result = run_output_guard(diff_text, jira_context)
+            if not guard_result["clean"]:
+                reason = f"redacciones={guard_result['redactions_applied']}, jailbreak={guard_result['jailbreak_reason']}"
+                comment_jira(
+                    f"🛡️ Guardia de salida (Prefect): el diff generado por el coding agent contiene evidencia "
+                    f"real de fuga de datos o manipulacion ({reason}). Bloqueado antes del testing agent.",
+                    ticket_key=ticket_id,
+                )
+                post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id}: {reason}")
+                transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
+                check_falco_correlation(falco_since, ticket_id)
+                record_run_in_graph(
+                    _build_graph_payload(
+                        ticket_id, summary, components, firewall_result,
+                        tests_status="SKIPPED", tests_reason=None,
+                        judge_verdict=None, branch=branch, backend=backend,
+                        is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+                        output_guard_status="FAILED", output_guard_reason=reason,
+                    )
+                )
+                raise PipelineBlocked(f"guardia de salida bloqueo el diff generado: {reason}")
+
             test_result = run_tests(target_repo_dir)
             if not test_result["passed"]:
                 comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON en '{agent_result['branch']}'.", ticket_key=ticket_id)
@@ -751,9 +868,6 @@ def _deliver(
                 )
                 raise PipelineBlocked("tests reales fallaron")
 
-            diff_text = _run([
-                "git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{agent_result['branch']}"
-            ])
             judge_verdict = _run_judge_safe(jira_context, firewall_result, "local_diff", diff_text, test_result["output"])
             tests_status, tests_reason = "PASSED", None
 
@@ -917,14 +1031,24 @@ def run_epic_pipeline(epic_key: str):
         )
         sonar_errors.extend(i["message"] for i in sonar_result["issues"])
 
+    plan_result = plan_epic_task(epic, children)
+    children_by_id = {c["ticket_id"]: c for c in children}
+    ordered_children = [children_by_id[cid] for cid in plan_result["ordered_children"] if cid in children_by_id]
+    if len(ordered_children) != len(children):
+        logger.warning("plan-epic devolvio un orden incompleto -- se usa el orden original")
+        ordered_children = children
+    coordination_notes = plan_result.get("coordination_notes") or ""
+
     children_text = "\n".join(
-        f"- {c['ticket_id']} ({c['repository_origen']}): {c['summary']}\n  {c['description']}" for c in children
+        f"- {c['ticket_id']} ({c['repository_origen']}): {c['summary']}\n  {c['description']}" for c in ordered_children
     )
+    coordination_section = f"\n--- Notas de coordinacion del planificador ---\n{coordination_notes}" if coordination_notes else ""
     prompt = (
         f"ESTO ES UNA EPICA con {len(children)} historias hijas. Resolvelas todas juntas, "
         "coordinando los cambios entre los componentes que toca cada una.\n\n"
         f"Epica {epic_key}: {epic['summary']}\n{epic['description']}\n\n"
-        f"--- Historias hijas ---\n{children_text}\n"
+        f"--- Historias hijas (orden sugerido por el planificador de epicas) ---\n{children_text}\n"
+        f"{coordination_section}"
         f"--- Grafo de impacto (por componente) ---\n{chr(10).join(graph_parts)}\n"
         f"--- Hallazgos Sonar (reales, por componente) ---\n{chr(10).join(sonar_parts)}"
     )

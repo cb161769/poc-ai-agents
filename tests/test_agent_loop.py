@@ -10,7 +10,13 @@ import httpx
 import pytest
 
 import agent_loop
-from agent_loop import JSON_CORRECTION_MESSAGE, _final_text_with_json_retry, _post_with_retry, call_with_fallback
+from agent_loop import (
+    JSON_CORRECTION_MESSAGE,
+    _final_text_with_json_retry,
+    _post_with_retry,
+    call_with_fallback,
+    compact_old_tool_results,
+)
 
 
 def _fake_response(status_code: int) -> MagicMock:
@@ -61,6 +67,64 @@ def test_select_backend_respects_custom_priority_order(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND_PRIORITY", "ollama,anthropic")
     monkeypatch.setattr(agent_loop.httpx, "get", MagicMock(return_value=_fake_response(200)))
     assert agent_loop._select_backend() == "ollama"
+
+
+def test_call_model_turn_anthropic_marks_system_and_tools_cacheable(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 5, "output_tokens": 2, "cache_read_input_tokens": 100},
+        }
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    tools = [
+        {"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}},
+        {"name": "grep_search", "description": "busca texto", "input_schema": {"type": "object"}},
+    ]
+
+    blocks, stop_reason, usage = asyncio.run(
+        agent_loop._call_model_turn(client, "anthropic", [{"role": "user", "content": "hola"}], tools, "system prompt real")
+    )
+
+    assert captured["json"]["system"] == [
+        {"type": "text", "text": "system prompt real", "cache_control": {"type": "ephemeral"}}
+    ]
+    # Solo el ULTIMO tool lleva cache_control (Anthropic cachea el prefijo
+    # completo hasta el ultimo breakpoint marcado, no hace falta marcar cada uno).
+    assert "cache_control" not in captured["json"]["tools"][0]
+    assert captured["json"]["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert usage["cache_read_input_tokens"] == 100
+
+
+def test_call_model_turn_anthropic_skips_tools_cache_control_when_no_tools(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"content": [], "stop_reason": "end_turn", "usage": {}}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    asyncio.run(agent_loop._call_model_turn(client, "anthropic", [], [], "system prompt real"))
+
+    assert "tools" not in captured["json"]
 
 
 def test_post_with_retry_retries_on_503_then_succeeds(monkeypatch):
@@ -159,6 +223,64 @@ def test_call_with_fallback_raises_when_no_backend_available(monkeypatch):
 
     with pytest.raises(RuntimeError, match="ningun backend"):
         asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
+
+
+def _make_turn(turn_index: int, tool_name: str) -> tuple:
+    tool_id = f"call_{turn_index}"
+    assistant = {"role": "assistant", "content": [{"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}}]}
+    user = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": f"resultado real del turno {turn_index}"}]}
+    return assistant, user
+
+
+def _tool_result_contents(messages: list) -> list:
+    return [
+        block["content"]
+        for m in messages
+        if m.get("role") == "user" and isinstance(m.get("content"), list)
+        for block in m["content"]
+        if block.get("type") == "tool_result"
+    ]
+
+
+def test_compact_old_tool_results_collapses_old_read_only_results():
+    messages = [{"role": "user", "content": "prompt inicial"}]
+    for i in range(5):
+        assistant, user = _make_turn(i, "read_file")
+        messages.append(assistant)
+        messages.append(user)
+
+    compact_old_tool_results(messages, {"read_file"}, keep_last_n_turns=3)
+
+    contents = _tool_result_contents(messages)
+    assert "colapsado" in contents[0]
+    assert "colapsado" in contents[1]
+    assert contents[2] == "resultado real del turno 2"
+    assert contents[3] == "resultado real del turno 3"
+    assert contents[4] == "resultado real del turno 4"
+
+
+def test_compact_old_tool_results_never_touches_write_tools():
+    messages = [{"role": "user", "content": "prompt inicial"}]
+    for i in range(5):
+        assistant, user = _make_turn(i, "write_file")
+        messages.append(assistant)
+        messages.append(user)
+
+    compact_old_tool_results(messages, {"read_file"}, keep_last_n_turns=3)
+
+    assert all("colapsado" not in c for c in _tool_result_contents(messages))
+
+
+def test_compact_old_tool_results_noop_when_not_enough_turns_yet():
+    messages = [{"role": "user", "content": "prompt inicial"}]
+    for i in range(2):
+        assistant, user = _make_turn(i, "read_file")
+        messages.append(assistant)
+        messages.append(user)
+
+    compact_old_tool_results(messages, {"read_file"}, keep_last_n_turns=3)
+
+    assert all("colapsado" not in c for c in _tool_result_contents(messages))
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):

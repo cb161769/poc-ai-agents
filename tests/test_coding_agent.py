@@ -8,7 +8,9 @@ verify-before-done) by mocking _call_model_turn/_connect_mcp_servers -- no
 real model backend or MCP server involved.
 """
 import asyncio
+import json
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -131,6 +133,18 @@ def test_tool_run_shell_command_skips_when_rejected(tmp_path, monkeypatch):
     assert "rechazo" in result
 
 
+def test_build_user_prompt_does_not_precargar_root_listing(tmp_path):
+    """El listado de la raiz del repo ya no viaja precargado en el prompt
+    inicial -- el modelo lo pide el mismo con list_directory si le hace
+    falta. Antes esto se pagaba en TODAS las corridas.
+    """
+    (tmp_path / "unique_marker_file.txt").write_text("x")
+
+    prompt = ca._build_user_prompt("T-1", "hace algo", str(tmp_path))
+
+    assert "unique_marker_file.txt" not in prompt
+
+
 def test_run_coding_agent_blocks_write_before_investigation(monkeypatch, tmp_path):
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
@@ -199,7 +213,10 @@ def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypa
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
-    assert call_count["n"] == 2, "deberia haber recibido el empujon de verificacion y llamado al modelo una vez mas"
+    # 3 llamados: original -> empujon de verificacion -> empujon de self_review
+    # (ninguno de los dos se completa nunca en esta respuesta fija, asi que
+    # cada uno se da UNA sola vez y despues se acepta igual).
+    assert call_count["n"] == 3, "deberia haber recibido ambos empujones (verificacion y self_review) y llamado al modelo dos veces mas"
     assert result["status"] == "done"
     assert result["self_verified"] is False
 
@@ -222,6 +239,146 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
 
     assert result["status"] == "blocked"
     assert result["summary"] == "recuperado"
+
+
+def test_run_coding_agent_resume_skips_reinvestigation(monkeypatch, tmp_path):
+    """Con resume_messages/resume_state (reintento tras feedback del juez),
+    no deberia hacer falta investigar de nuevo -- has_investigated ya viene
+    sembrado en True, asi que un write_file directo no se rechaza.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [
+                {"type": "tool_use", "id": "call_1", "name": "write_file", "input": {"path": "x.txt", "content": "hola"}}
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        final = {
+            "status": "done",
+            "summary": "corregido",
+            "files_changed": ["x.txt"],
+            "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+        }
+        return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    prior_messages = [
+        {"role": "user", "content": "Ticket: T-1\n\narregla el boton"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Plan: listo"}]},
+    ]
+
+    result = asyncio.run(
+        ca.run_coding_agent(
+            "T-1",
+            "--- FEEDBACK DEL JUEZ ---\ncorregi el alcance",
+            str(tmp_path),
+            resume_messages=prior_messages,
+            resume_state={"has_investigated": True, "has_run_verification": True},
+        )
+    )
+
+    assert result["status"] == "done"
+    assert (tmp_path / "x.txt").exists(), "el write_file no deberia haberse rechazado -- ya veniamos investigados"
+    assert result["self_verified"] is True
+
+
+def test_run_coding_agent_writes_conversation_file_for_resume(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert "_conversation_file" in result
+    conversation_path = Path(result["_conversation_file"])
+    assert conversation_path.exists()
+    saved = json.loads(conversation_path.read_text(encoding="utf-8"))
+    assert "messages" in saved
+    assert "has_investigated" in saved
+    conversation_path.unlink()
+
+
+def test_run_coding_agent_accepts_done_with_valid_self_review_no_extra_nudge(monkeypatch, tmp_path):
+    """Si la respuesta final ya trae self_review completo (y ya investigo y
+    verifico), no deberia pedir ningun empujon extra.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo verificado"}}
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        final = {
+            "status": "done",
+            "summary": "listo",
+            "files_changed": [],
+            "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+        }
+        return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert call_count["n"] == 3, "no deberia haber recibido ningun empujon extra"
+    assert result["status"] == "done"
+    assert result["self_review"]["scope_matches_ticket"] is True
+
+
+def test_run_coding_agent_nudges_once_for_missing_self_review(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo ok"}}
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        # Ya investigo y verifico (has_run_verification=True), pero nunca
+        # completa self_review -- deberia recibir el empujon una sola vez y
+        # aceptarse igual despues.
+        content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert call_count["n"] == 4, "deberia haber recibido un solo empujon de self_review y aceptado despues"
+    assert result["status"] == "done"
+    assert "self_review" not in result or result.get("self_review") is None
 
 
 # --- Robustez de las tools individuales ---

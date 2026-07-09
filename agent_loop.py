@@ -185,14 +185,27 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
     which is free/local so cost tracking doesn't apply the same way).
     """
     if backend == "anthropic":
+        # Prompt caching: system_prompt y tools son estaticos dentro de una
+        # corrida (se repiten identicos en cada uno de los hasta
+        # MAX_TOOL_TURNS turnos), asi que se marcan como prefijo cacheable
+        # -- Anthropic cachea todo hasta el ultimo breakpoint marcado, asi
+        # que el cache_control en el ultimo elemento de tools cubre
+        # system+tools juntos. Anthropic exige un minimo (~1024 tokens para
+        # Sonnet/Opus) para que el cache aplique -- el system prompt solo
+        # puede quedar justo debajo de eso en algun agente, pero el bloque
+        # combinado con tools normalmente lo supera. La rama ollama no tiene
+        # un mecanismo de caching equivalente en la API que ya se usa, asi
+        # que queda sin cambios.
         request_body = {
             "model": ANTHROPIC_MODEL,
             "max_tokens": MODEL_LIMITS["anthropic"]["max_tokens"],
-            "system": system_prompt,
+            "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
         }
         if tools:
-            request_body["tools"] = tools
+            tools_with_cache = [dict(t) for t in tools]
+            tools_with_cache[-1] = {**tools_with_cache[-1], "cache_control": {"type": "ephemeral"}}
+            request_body["tools"] = tools_with_cache
 
         resp = await _post_with_retry(
             client,
@@ -211,7 +224,12 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
         return (
             data["content"],
             data.get("stop_reason", "end_turn"),
-            {"input_tokens": usage.get("input_tokens", 0), "output_tokens": usage.get("output_tokens", 0)},
+            {
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0),
+            },
         )
 
     if backend == "ollama":
@@ -291,6 +309,49 @@ async def _final_text_with_json_retry(
     messages.append({"role": "assistant", "content": content})
     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
     return final_text, usage
+
+
+_COMPACTED_TOOL_RESULT_TEMPLATE = (
+    "[resultado de '{tool_name}' colapsado por limite de contexto -- volvé a llamarla si lo necesitás de nuevo]"
+)
+
+
+def compact_old_tool_results(messages: list, read_only_tool_names: set, keep_last_n_turns: int = 3) -> None:
+    """Cada turno reenvia TODO el historial acumulado -- sin esto, un loop
+    largo (coding_agent.py llega a 15 turnos) paga de nuevo, en cada turno,
+    el costo completo de cada read_file/grep_search/etc ya hecho. Esto muta
+    `messages` in-place: cualquier tool_result que corresponda (por
+    tool_use_id) a una tool de SOLO LECTURA en `read_only_tool_names`, y que
+    quede a mas de `keep_last_n_turns` turnos de asistente del final, se
+    reemplaza por un placeholder corto. Los resultados de tools de
+    escritura (write_file/edit_file/run_shell_command) NUNCA se tocan --
+    representan efectos reales que el modelo tiene que recordar con
+    precision, no contexto descartable.
+    """
+    assistant_indices = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    if len(assistant_indices) <= keep_last_n_turns:
+        return
+
+    boundary_index = assistant_indices[-keep_last_n_turns]
+
+    tool_name_by_id = {}
+    for i in assistant_indices:
+        for block in messages[i].get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_name_by_id[block.get("id")] = block.get("name")
+
+    for i, message in enumerate(messages):
+        if i >= boundary_index or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_name = tool_name_by_id.get(block.get("tool_use_id"))
+            if tool_name in read_only_tool_names:
+                block["content"] = _COMPACTED_TOOL_RESULT_TEMPLATE.format(tool_name=tool_name)
 
 
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: str = "agente") -> dict:

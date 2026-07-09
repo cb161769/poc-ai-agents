@@ -36,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -55,6 +56,7 @@ from agent_loop import (
     _normalize_tool_schema,
     _select_backend,
     call_with_fallback,
+    compact_old_tool_results,
 )
 from log_utils import get_logger
 
@@ -68,12 +70,30 @@ RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
 MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "15"))
 
 # Limites defensivos de las tools locales: un archivo/salida/listado gigante
-# no debe reventar el contexto del modelo ni colgar el loop.
-_MAX_READ_BYTES = 200_000
+# no debe reventar el contexto del modelo ni colgar el loop. _MAX_READ_BYTES
+# bajo de 200_000 a 60_000 (~15k tokens estimados) -- el valor anterior
+# permitia que UN SOLO read_file consumiera ~50k tokens antes de truncar,
+# la mayor fuga individual de contexto de todas las tools. Configurable
+# para quien necesite leer archivos mas grandes a proposito.
+_MAX_READ_BYTES = int(os.environ.get("CODING_AGENT_MAX_READ_BYTES", "60000"))
 _MAX_GREP_FILE_BYTES = 2_000_000
 _MAX_GREP_FILES_SCANNED = 5_000
 _MAX_LIST_ENTRIES = 500
 _MAX_SHELL_OUTPUT_CHARS = 10_000
+
+# Tools de solo lectura cuyos resultados viejos se compactan
+# (agent_loop.compact_old_tool_results) despues de unos turnos -- nunca
+# incluye write_file/edit_file/run_shell_command, esos representan efectos
+# reales que el modelo tiene que seguir recordando con precision.
+_READ_ONLY_TOOL_NAMES = {
+    "read_file",
+    "list_directory",
+    "grep_search",
+    "git_diff",
+    "git_log",
+    "detect_project_stack",
+    "query_sonar",
+}
 
 # Variables de entorno que nunca deben llegar a un comando de shell que
 # corre el agente -- el proceso de coding_agent.py las tiene cargadas
@@ -101,6 +121,21 @@ VERIFY_BEFORE_DONE_MESSAGE = (
     "con run_shell_command y contame el resultado en el summary."
 )
 
+SELF_REVIEW_NUDGE_MESSAGE = (
+    'Tu respuesta final necesita el campo "self_review" completo -- {"scope_matches_ticket": bool, '
+    '"no_secrets_introduced": bool, "tests_adequate": bool} -- respondé de nuevo con el JSON completo, '
+    "contestando cada campo con honestidad segun tu propio cambio."
+)
+
+_SELF_REVIEW_FIELDS = ("scope_matches_ticket", "no_secrets_introduced", "tests_adequate")
+
+
+def _has_valid_self_review(result: dict) -> bool:
+    self_review = result.get("self_review")
+    if not isinstance(self_review, dict):
+        return False
+    return all(isinstance(self_review.get(field), bool) for field in _SELF_REVIEW_FIELDS)
+
 CODING_AGENT_SYSTEM_PROMPT = """Sos un agente de codigo real, trabajando sobre un repositorio git real que \
 ya esta parado en una rama nueva (nunca la rama base) creada especificamente para este cambio.
 
@@ -110,6 +145,12 @@ propio diff y el historial de commits, detectar el stack del proyecto, y consult
 Sonar -- todas confinadas a este repo, nunca fuera de el. Tambien tenes acceso al grafo de dependencias \
 (Neo4j) y a codigo/historico indexado (Qdrant) si estan disponibles, para verificar el impacto real de \
 tu cambio antes de aplicarlo.
+
+Antes de escribir el cambio, usa ese acceso para contexto histórico real, no solo impacto estructural: \
+consulta Qdrant-rag por incidentes o código similar ya resuelto en este repo, y consulta el grafo por \
+nodos :Risk que ya afectaron a este componente (`MATCH (svc:Service {name: "X"})<-[:AFFECTS]-(r:Risk) \
+RETURN r`, cambiando X por tu componente) -- si este componente ya causó un `scope-mismatch` o \
+`insufficient-test-coverage` en una corrida anterior, es información real para no repetir el mismo error.
 
 Preferi edit_file sobre write_file cuando modifiques un archivo EXISTENTE -- edit_file cambia solo el \
 fragmento exacto que indiques (como un str_replace), en vez de reescribir el archivo entero; reserva \
@@ -125,6 +166,10 @@ va a rechazar el llamado y vas a perder un turno. Investiga primero, siempre.
 Cada escritura, edicion, o comando de shell tambien requieren confirmacion humana antes de ejecutarse -- \
 si el usuario rechaza uno, no insistas con el mismo cambio, ajusta tu plan.
 
+Antes de tu primer llamado a write_file/edit_file/run_shell_command, tu respuesta de texto tiene que \
+incluir un bloque corto "Plan: " con los pasos concretos que vas a seguir -- no es opcional, es lo que \
+te obliga a pensar el cambio antes de tocar el repo, y queda auditado junto al resultado final.
+
 Hace el cambio MAS CHICO Y SEGURO que resuelva el ticket. No inventes archivos ni asumas estructura que \
 no verificaste -- si justificas un cambio citando el codigo existente, citalo con ruta:linea real, no de memoria.
 
@@ -134,7 +179,12 @@ solo si genuinamente no hay como verificar (explicalo en el summary si es el cas
 
 Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
 objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \
-"summary": "que hiciste, que verificaste, o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...]}"""
+"summary": "que hiciste, que verificaste, o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...], \
+"self_review": {"scope_matches_ticket": true o false, "no_secrets_introduced": true o false, \
+"tests_adequate": true o false}}. self_review es tu propia autocritica ANTES de declararte "done" -- \
+contestala con honestidad, no la completes con true por defecto: "scope_matches_ticket" es false si tu \
+diff toca algo que el ticket no pidio, "no_secrets_introduced" es false si escribiste algo que se parezca \
+a un secreto real, "tests_adequate" es false si lo que corriste no cubre genuinamente el cambio."""
 
 MCP_SERVERS = {
     "neo4j-cypher": StdioServerParameters(
@@ -557,17 +607,32 @@ def _local_tools_to_anthropic_format() -> list:
 
 
 def _build_user_prompt(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> str:
-    root_listing = tool_list_directory(target_repo_dir, ".")
+    # No se precarga el listado de la raiz del repo (antes se pagaba ese
+    # costo en TODAS las corridas, aunque el ticket no lo necesitara) -- el
+    # modelo puede llamar list_directory(".") el mismo si le hace falta, lo
+    # que ya cuenta como investigacion para la regla obligatoria.
     return f"""Ticket: {ticket_id}
 Repo objetivo: {target_repo_dir}
-
---- Contenido de la raiz del repo (ya listado, no hace falta pedirlo) ---
-{root_listing}
 
 {sanitized_prompt}"""
 
 
-async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
+async def run_coding_agent(
+    ticket_id: str,
+    sanitized_prompt: str,
+    target_repo_dir: str,
+    resume_messages: list = None,
+    resume_state: dict = None,
+) -> dict:
+    """Si resume_messages viene seteado (reintento tras un veredicto FLAGGED
+    retryable del juez -- ver retry_coding_agent_with_feedback() en
+    run_poc_loop.sh / _retry_local_diff() en orchestration.py), la
+    conversacion CONTINUA en vez de arrancar de cero: sanitized_prompt pasa
+    a ser solo el feedback del juez (un turno de usuario nuevo), no el
+    ticket completo -- evita repagar la investigacion (listar el repo, leer
+    archivos) ya hecha en el primer intento. resume_state siembra
+    has_investigated/has_run_verification con lo ya alcanzado.
+    """
     backend = _select_backend()
     logger.info(f"coding agent: usando backend '{backend}'")
     if backend == "none":
@@ -576,9 +641,11 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
     start_time = time.monotonic()
     total_input_tokens = 0
     total_output_tokens = 0
-    has_investigated = False
-    has_run_verification = False
+    resume_state = resume_state or {}
+    has_investigated = bool(resume_state.get("has_investigated"))
+    has_run_verification = bool(resume_state.get("has_run_verification"))
     verification_nudge_given = False
+    self_review_nudge_given = False
 
     def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
@@ -589,6 +656,19 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
             "output_tokens": total_output_tokens,
             "estimated_cost_usd": round(_estimate_cost_usd(backend, ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6),
         }
+        # Se guarda en un archivo temporal (no en stdout/el log JSONL) para
+        # no inflar logs/coding_agent_runs.jsonl con la conversacion
+        # completa en cada corrida normal -- solo un reintento la necesita.
+        conversation_state = {
+            "messages": messages,
+            "has_investigated": has_investigated,
+            "has_run_verification": has_run_verification,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="coding_agent_conversation_", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(conversation_state, f, ensure_ascii=False)
+            result["_conversation_file"] = f.name
         return result
 
     async with AsyncExitStack() as stack:
@@ -602,7 +682,11 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
             except Exception as exc:
                 logger.warning(f"coding agent: no se pudieron listar tools de '{name}': {exc}")
 
-        messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
+        if resume_messages:
+            messages = list(resume_messages)
+            messages.append({"role": "user", "content": sanitized_prompt})
+        else:
+            messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
@@ -637,6 +721,15 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
                         messages.append({"role": "user", "content": VERIFY_BEFORE_DONE_MESSAGE})
                         continue
 
+                    if result.get("status") == "done" and not _has_valid_self_review(result) and not self_review_nudge_given:
+                        # Mismo criterio de un solo empujon que la verificacion:
+                        # si tampoco completa self_review la segunda vez, se
+                        # acepta igual (queda trazado como faltante en el log,
+                        # no se bloquea infinito).
+                        self_review_nudge_given = True
+                        messages.append({"role": "user", "content": SELF_REVIEW_NUDGE_MESSAGE})
+                        continue
+
                     return _finalize(result)
 
                 tool_results = []
@@ -663,6 +756,7 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
                         output = f"error llamando a la herramienta: {exc}"
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
                 messages.append({"role": "user", "content": tool_results})
+                compact_old_tool_results(messages, _READ_ONLY_TOOL_NAMES)
 
     return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
 
@@ -698,7 +792,15 @@ def main():
     ticket_id = payload["ticket_id"]
 
     try:
-        result = asyncio.run(run_coding_agent(ticket_id, payload["sanitized_prompt"], payload["target_repo_dir"]))
+        result = asyncio.run(
+            run_coding_agent(
+                ticket_id,
+                payload["sanitized_prompt"],
+                payload["target_repo_dir"],
+                resume_messages=payload.get("resume_messages"),
+                resume_state=payload.get("resume_state"),
+            )
+        )
     except KeyError as exc:
         print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
         sys.exit(1)

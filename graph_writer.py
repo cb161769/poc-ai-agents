@@ -40,7 +40,7 @@ NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "test_password_local")
 
-_VALID_STAGES = {"firewall", "tests", "judge"}
+_VALID_STAGES = {"firewall", "output_guard", "tests", "judge"}
 
 # The root ticket node is either a :Story (normal ticket run) or an :Epic
 # (--epic mode: the ticket BEING delivered IS the epic itself, combining all

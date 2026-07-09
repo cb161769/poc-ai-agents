@@ -50,6 +50,10 @@ CONTRIBUTION_LOG="${SCRIPT_DIR}/logs/copilot_contribution.jsonl"
 # Historias hijas de la epica actual, para record_run_in_graph() -- solo se
 # llena en modo --epic (run_epic_etapas()); en modo ticket normal queda "[]".
 CHILD_TICKET_KEYS_JSON="[]"
+# Path al archivo temporal con la conversacion del coding agent (Camino B1),
+# para que retry_coding_agent_with_feedback() pueda continuarla en vez de
+# re-investigar desde cero. Vacio si todavia no corrio el coding agent.
+CONVERSATION_FILE=""
 
 fail() {
   echo "ERROR: $1" >&2
@@ -169,13 +173,14 @@ transition_jira_ticket() {
 }
 
 # Registra esta corrida en el grafo de conocimiento de Neo4j (graph_writer.py)
-# -- Story/Epic, Run, una Decision por etapa (firewall/tests/judge), y un
-# Risk si el juez cito un policy_reference real (evals/JUDGE_POLICY.md).
+# -- Story/Epic, Run, una Decision por etapa (firewall/output_guard/tests/judge),
+# y un Risk si el juez cito un policy_reference real (evals/JUDGE_POLICY.md).
 # Best-effort SIEMPRE: graph_writer.py ya maneja fallos de conexion
 # internamente y nunca devuelve exit != 0 por eso, pero igual no dejamos que
 # esto frene la corrida si algo mas raro pasa (jq roto, etc).
 record_run_in_graph() {
   local branch="$1" backend="$2" tests_status="$3" tests_reason="$4" judge_status="$5" judge_reason="$6" judge_policy_ref="$7"
+  local og_status="${8:-SKIPPED}" og_reason="${9:-}"
 
   local components_json is_epic_json decisions_json payload run_id
   components_json=$(echo "${REPO_ORIGEN}" | tr ',' '\n' | jq -R . | jq -s .)
@@ -188,11 +193,13 @@ record_run_in_graph() {
 
   decisions_json=$(jq -n \
     --arg fw_status "${STATUS}" --arg fw_reason "${REASON:-}" \
+    --arg og_status "${og_status}" --arg og_reason "${og_reason}" \
     --arg tests_status "${tests_status}" --arg tests_reason "${tests_reason}" \
     --arg judge_status "${judge_status}" --arg judge_reason "${judge_reason}" \
     --arg judge_policy_ref "${judge_policy_ref}" \
     '[
       {stage: "firewall", status: $fw_status, reason: (if $fw_reason == "" then null else $fw_reason end), policy_reference: null},
+      {stage: "output_guard", status: $og_status, reason: (if $og_reason == "" then null else $og_reason end), policy_reference: null},
       {stage: "tests", status: $tests_status, reason: (if $tests_reason == "" then null else $tests_reason end), policy_reference: null},
       {stage: "judge", status: $judge_status, reason: (if $judge_reason == "" then null else $judge_reason end), policy_reference: (if $judge_policy_ref == "" or $judge_policy_ref == "null" then null else $judge_policy_ref end)}
     ]')
@@ -220,6 +227,17 @@ record_run_in_graph() {
 # son de seguridad o ambiguos, nunca se reintentan automaticamente.
 RETRYABLE_POLICY_REFS=(scope-mismatch insufficient-test-coverage graph-impact-unverified)
 
+# Borra el archivo temporal de conversacion del coding agent (Camino B1) si
+# todavia esta ahi -- se llama en cada punto donde una corrida llega a un
+# resultado final y nadie mas lo va a consumir (si ya se consumio en un
+# reintento, el archivo ya no existe y esto es un no-op).
+cleanup_conversation_file() {
+  if [ -n "${CONVERSATION_FILE:-}" ] && [ -f "${CONVERSATION_FILE}" ]; then
+    rm -f "${CONVERSATION_FILE}"
+    CONVERSATION_FILE=""
+  fi
+}
+
 # Le da al coding agent un segundo intento (UNA sola vez) cuando el juez
 # marco un problema potencialmente corregible. Reusa la MISMA rama (no crea
 # una nueva), le agrega el feedback del juez al prompt original, y si
@@ -231,20 +249,37 @@ RETRYABLE_POLICY_REFS=(scope-mismatch insufficient-test-coverage graph-impact-un
 retry_coding_agent_with_feedback() {
   local branch="$1" reasoning="$2"
   local retry_payload_file retry_agent_result_json retry_diff_text retry_tests_gate_result
-
-  local augmented_prompt="${SANITIZED}
-
---- FEEDBACK DEL JUEZ (corregir antes de continuar) ---
+  local feedback_text="--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---
 ${reasoning}"
 
   retry_payload_file=$(mktemp)
-  jq -n --arg ticket_id "${TICKET_ID}" --arg sanitized "${augmented_prompt}" --arg repo "${TARGET_REPO_DIR}" \
-    '{ticket_id: $ticket_id, sanitized_prompt: $sanitized, target_repo_dir: $repo}' > "${retry_payload_file}"
+  if [ -n "${CONVERSATION_FILE:-}" ] && [ -f "${CONVERSATION_FILE}" ]; then
+    # Continua la MISMA conversacion en vez de arrancar de cero -- evita
+    # repagar la investigacion (listar el repo, leer archivos) que el
+    # primer intento ya hizo. sanitized_prompt pasa a ser solo el feedback,
+    # no el ticket completo de nuevo.
+    jq -n --arg ticket_id "${TICKET_ID}" --arg feedback "${feedback_text}" --arg repo "${TARGET_REPO_DIR}" \
+      --slurpfile conv "${CONVERSATION_FILE}" \
+      '{ticket_id: $ticket_id, sanitized_prompt: $feedback, target_repo_dir: $repo,
+        resume_messages: $conv[0].messages,
+        resume_state: {has_investigated: $conv[0].has_investigated, has_run_verification: $conv[0].has_run_verification}}' \
+      > "${retry_payload_file}"
+    rm -f "${CONVERSATION_FILE}"
+  else
+    # Sin conversacion previa disponible (corrida vieja, o el primer intento
+    # no llego a generarla) -- cae al comportamiento anterior, prompt desde cero.
+    local augmented_prompt="${SANITIZED}
+
+${feedback_text}"
+    jq -n --arg ticket_id "${TICKET_ID}" --arg sanitized "${augmented_prompt}" --arg repo "${TARGET_REPO_DIR}" \
+      '{ticket_id: $ticket_id, sanitized_prompt: $sanitized, target_repo_dir: $repo}' > "${retry_payload_file}"
+  fi
 
   retry_agent_result_json=$(python3 "${SCRIPT_DIR}/coding_agent.py" "${retry_payload_file}")
   rm -f "${retry_payload_file}"
   echo "Resultado del segundo intento: $(echo "${retry_agent_result_json}" | jq -r '.status') — $(echo "${retry_agent_result_json}" | jq -r '.summary')"
   AGENT_BACKEND=$(echo "${retry_agent_result_json}" | jq -r '._meta.backend // "unknown"')
+  CONVERSATION_FILE=$(echo "${retry_agent_result_json}" | jq -r '._conversation_file // ""')
 
   if [ -z "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
     echo "El segundo intento no produjo cambios nuevos."
@@ -255,6 +290,11 @@ ${reasoning}"
   git -C "${TARGET_REPO_DIR}" commit -m "Coding agent retry for ${TICKET_ID} (feedback del juez)" >/dev/null
 
   retry_diff_text=$(git -C "${TARGET_REPO_DIR}" diff "${base_branch}..${branch}")
+
+  if ! run_output_guard "${retry_diff_text}" "${branch}"; then
+    return 0
+  fi
+
   run_tests_gate "${REPO_ORIGEN}" "${branch}"
   retry_tests_gate_result=$?
   log_contribution "APPROVED" "${REDACTIONS}" true true "${branch}" "${TEST_PASSED}"
@@ -306,6 +346,7 @@ run_judge() {
   if ! verdict_json=$(echo "${judge_payload}" | python3 "${SCRIPT_DIR}/judge_agent.py" 2>/dev/null); then
     echo "El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad). Continua sin veredicto."
     record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "${tests_status_for_graph}" "" "SKIPPED" "sin backend de modelo disponible" ""
+    cleanup_conversation_file
     return
   fi
 
@@ -366,6 +407,57 @@ run_judge() {
   fi
 
   record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "${tests_status_for_graph}" "" "${verdict}" "${reasoning}" "${policy_ref}"
+
+  # Este veredicto es el final para esta corrida (no hay mas reintentos
+  # despues de esto) -- limpiamos el archivo temporal de conversacion si
+  # todavia esta ahi (nadie mas lo va a consumir).
+  cleanup_conversation_file
+}
+
+# Guardia de salida: el AI Firewall (firewall_proxy.py) audita el prompt que
+# ENTRA al coding agent, pero nadie volvia a auditar el diff que efectivamente
+# produce -- si el agente escribia un secreto real al "arreglar" algo, nada lo
+# atrapaba hasta Sonar (si cubria ese patron) o el juez (si lo notaba). Esto
+# corre las MISMAS reglas del firewall (output_guard.py, que reusa
+# firewall_proxy._redact()/_check_jailbreak() directo) sobre el diff real,
+# ANTES del testing agent -- si encuentra algo, bloquea con la misma severidad
+# que un test fallido: comentario fuerte, transicion a bloqueado, commit
+# marcador, y el juez ni se llama (no tiene sentido pedirle opinion a algo
+# que ya se bloqueo por evidencia dura).
+run_output_guard() {
+  local diff_text="$1" branch="$2"
+  local guard_payload guard_result redactions jailbreak_reason
+
+  guard_payload=$(jq -n --arg diff "${diff_text}" --argjson ticket "${JIRA_CONTEXT}" '{diff_text: $diff, jira_context: $ticket}')
+  guard_result=$(echo "${guard_payload}" | python3 "${SCRIPT_DIR}/output_guard.py" 2>/dev/null) || guard_result='{"clean": true}'
+
+  redactions=$(echo "${guard_result}" | jq -r '.redactions_applied // 0')
+  jailbreak_reason=$(echo "${guard_result}" | jq -r '.jailbreak_reason // empty')
+
+  if [ "${redactions}" = "0" ] && [ -z "${jailbreak_reason}" ]; then
+    return 0
+  fi
+
+  echo
+  echo "🚫 LA GUARDIA DE SALIDA DETECTO UN PROBLEMA EN EL DIFF GENERADO — rama '${branch}'"
+  echo "Redacciones: ${redactions} — Jailbreak: ${jailbreak_reason:-ninguno}"
+
+  local og_reason="redacciones=${redactions}, jailbreak=${jailbreak_reason:-ninguno}"
+  post_jira_comment "🛡️ Guardia de salida (automatizada): el diff generado por el coding agent contiene evidencia real de fuga de datos o manipulacion (${og_reason}). Bloqueado antes de llegar al testing agent — requiere revision humana."
+  post_alert_webhook "🛡️ Guardia de salida BLOCKED en ${TICKET_ID:-UNKNOWN}: ${og_reason}"
+
+  JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
+    || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
+
+  if [ -n "${branch}" ]; then
+    git -C "${TARGET_REPO_DIR}" commit --allow-empty -m "BLOCKED BY OUTPUT GUARD: ${og_reason}" >/dev/null 2>&1
+    echo "Rama '${branch}' marcada como bloqueada en su propio historial de git — no la mergees sin revision."
+  fi
+
+  record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "SKIPPED" "" "SKIPPED" "no se llego a llamar al juez, la guardia de salida bloqueo antes" "" "FAILED" "${og_reason}"
+  cleanup_conversation_file
+
+  return 1
 }
 
 # Testing agent (deterministic, not an LLM): corre el test suite real del
@@ -412,6 +504,7 @@ run_tests_gate() {
   fi
 
   record_run_in_graph "${branch}" "${AGENT_BACKEND:-}" "FAILED" "el test suite real fallo" "SKIPPED" "no se llego a llamar al juez, los tests bloquearon antes" ""
+  cleanup_conversation_file
 
   return 1
 }
@@ -559,8 +652,26 @@ $(echo "${s}" | jq -r '.issues[] | "- [\(.severity)] \(.rule): \(.message) (line
     fi
   done <<< "${distinct_components}"
 
-  local children_text
+  # Planificador de epicas (epic_planner.py, best-effort): reordena las
+  # historias hijas por dependencia real en vez del orden mecanico que
+  # devolvio el JQL, y suma notas de coordinacion si el modelo encuentra
+  # algo relevante. Si no hay backend disponible o falla, cae al orden
+  # mecanico de siempre -- nunca bloquea el modo epica por esto.
+  local children_text coordination_notes="" planner_payload planner_result ordered_children_json
   children_text=$(echo "${epic_json}" | jq -r '.children[] | "- \(.ticket_id) (\(.repository_origen)): \(.summary)\n  \(.description)"')
+
+  planner_payload=$(echo "${epic_json}" | jq '{epic: .epic, children: .children}')
+  if planner_result=$(echo "${planner_payload}" | python3 "${SCRIPT_DIR}/epic_planner.py" 2>/dev/null) \
+    && ordered_children_json=$(echo "${planner_result}" | jq -e '.ordered_children' 2>/dev/null); then
+    coordination_notes=$(echo "${planner_result}" | jq -r '.coordination_notes // ""')
+    children_text=$(jq -n --argjson children "$(echo "${epic_json}" | jq '.children')" --argjson order "${ordered_children_json}" -r '
+      ($children | map({(.ticket_id): .}) | add) as $by_id |
+      $order | map($by_id[.]) | map("- \(.ticket_id) (\(.repository_origen)): \(.summary)\n  \(.description)") | join("\n")
+    ')
+    echo "Planificador de epicas: orden real aplicado ($(echo "${ordered_children_json}" | jq -r 'join(", ")'))."
+  else
+    echo "Planificador de epicas no disponible o sin resultado valido -- se usa el orden mecanico original."
+  fi
 
   PROMPT=$(cat <<EOF
 ESTO ES UNA EPICA con ${child_count} historias hijas. Resolvelas todas juntas, coordinando los cambios entre los componentes que toca cada una.
@@ -568,8 +679,10 @@ ESTO ES UNA EPICA con ${child_count} historias hijas. Resolvelas todas juntas, c
 Epica ${EPIC_KEY}: ${SUMMARY}
 ${epic_description}
 
---- Historias hijas ---
+--- Historias hijas (orden sugerido por el planificador de epicas) ---
 ${children_text}
+$([ -n "${coordination_notes}" ] && echo "--- Notas de coordinacion del planificador ---
+${coordination_notes}")
 --- Grafo de impacto (por componente) ---
 ${GRAPH_RESULT}
 --- Hallazgos Sonar (reales, por componente) ---
@@ -758,7 +871,14 @@ EOF
       rm -f "${payload_file}"
       echo "Resultado del agente: $(echo "${agent_result_json}" | jq -r '.status') — $(echo "${agent_result_json}" | jq -r '.summary')"
       AGENT_BACKEND=$(echo "${agent_result_json}" | jq -r '._meta.backend // "unknown"')
+      # Path al archivo temporal con la conversacion completa (mensajes +
+      # estado de investigacion/verificacion) -- retry_coding_agent_with_feedback()
+      # lo usa para continuar la conversacion en vez de re-investigar desde
+      # cero si el juez pide un segundo intento. "" si el agente no lo genero
+      # (ej. sin backend disponible).
+      CONVERSATION_FILE=$(echo "${agent_result_json}" | jq -r '._conversation_file // ""')
     else
+      CONVERSATION_FILE=""
       # --- Camino B2 (fallback): gh copilot suggest, sugerencia de un solo
       # tiro sin loop ni acceso a los MCP — ver PLAN.md.
       echo "Sin ANTHROPIC_API_KEY ni Ollama alcanzable — usando gh copilot suggest como fallback (sugerencia puntual, no un agente)."
@@ -775,11 +895,16 @@ EOF
       echo "Revisalo con: git -C \"${TARGET_REPO_DIR}\" diff ${base_branch}..${branch}"
       post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot aplico un cambio en la rama '${branch}' de tu repo, pendiente de revision humana antes de mergear."
       diff_text=$(git -C "${TARGET_REPO_DIR}" diff "${base_branch}..${branch}")
-      run_tests_gate "${REPO_ORIGEN}" "${branch}"
-      tests_gate_result=$?
-      log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "${TEST_PASSED}"
-      if [ "${tests_gate_result}" -eq 0 ]; then
-        run_judge "local_diff" "${diff_text}" "rama '${branch}' de ${TARGET_REPO_DIR}" "${branch}" "" "${TEST_OUTPUT}"
+
+      if run_output_guard "${diff_text}" "${branch}"; then
+        run_tests_gate "${REPO_ORIGEN}" "${branch}"
+        tests_gate_result=$?
+        log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "${TEST_PASSED}"
+        if [ "${tests_gate_result}" -eq 0 ]; then
+          run_judge "local_diff" "${diff_text}" "rama '${branch}' de ${TARGET_REPO_DIR}" "${branch}" "" "${TEST_OUTPUT}"
+        fi
+      else
+        log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"
       fi
     else
       git -C "${TARGET_REPO_DIR}" checkout "${base_branch}" >/dev/null 2>&1

@@ -48,8 +48,12 @@ _AGENT_RESULT = {"branch": "copilot/T-1-123", "base_branch": "main"}
 _FLAGGED_RETRYABLE = {"verdict": "FLAGGED", "reasoning": "alcance raro", "policy_reference": "scope-mismatch"}
 
 
+_CLEAN_GUARD_RESULT = {"redactions_applied": 0, "jailbreak_reason": None, "clean": True}
+
+
 def test_retry_local_diff_returns_new_verdict_when_retry_applies_changes(monkeypatch):
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "anthropic"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
@@ -77,6 +81,8 @@ def test_retry_local_diff_returns_none_when_no_new_changes(monkeypatch):
 
 def test_retry_local_diff_blocks_when_retry_tests_fail(monkeypatch):
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "anthropic"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
@@ -90,6 +96,83 @@ def test_retry_local_diff_blocks_when_retry_tests_fail(monkeypatch):
             {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
             False, None, "2026-01-01T00:00:00Z",
         )
+
+
+def test_retry_local_diff_blocks_when_output_guard_finds_a_leak(monkeypatch):
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "anthropic"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text con un secreto")
+    monkeypatch.setattr(
+        orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 1, "jailbreak_reason": None, "clean": False}
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    with pytest.raises(PipelineBlocked, match="guardia de salida"):
+        _retry_local_diff(
+            "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+            {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+            False, None, "2026-01-01T00:00:00Z",
+        )
+
+
+def test_retry_local_diff_passes_conversation_file_when_present(monkeypatch):
+    """Si el primer intento genero un conversation_file, _retry_local_diff
+    tiene que pasarselo a retry_coding_agent_local_real() para que la
+    conversacion continue en vez de repagar la investigacion.
+    """
+    captured = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        captured["feedback_text"] = feedback_text
+        captured["conversation_file"] = conversation_file
+        return {"applied": True, "backend": "anthropic"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
+
+    agent_result_with_conversation = {**_AGENT_RESULT, "conversation_file": "/tmp/some_conversation.json"}
+
+    _retry_local_diff(
+        "T-1", "prompt original", "/repo", agent_result_with_conversation, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert captured["conversation_file"] == "/tmp/some_conversation.json"
+    # Sin conversation_file, el feedback iria prefijado con el prompt
+    # original completo -- CON conversation_file, es solo el feedback.
+    assert "prompt original" not in captured["feedback_text"]
+    assert "alcance raro" in captured["feedback_text"]
+
+
+def test_retry_local_diff_falls_back_to_full_prompt_without_conversation_file(monkeypatch):
+    captured = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        captured["feedback_text"] = feedback_text
+        captured["conversation_file"] = conversation_file
+        return {"applied": True, "backend": "anthropic"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
+
+    _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert captured["conversation_file"] is None
+    assert "prompt original" in captured["feedback_text"]
 
 
 def test_retryable_policy_references_matches_judge_agent():
