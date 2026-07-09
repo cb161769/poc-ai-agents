@@ -55,8 +55,11 @@ from agent_loop import (
     _mcp_tools_to_anthropic_format,
     _select_backend,
 )
+from log_utils import get_logger
 
 load_dotenv()
+
+logger = get_logger(__name__)
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
@@ -565,7 +568,7 @@ Repo objetivo: {target_repo_dir}
 
 async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
     backend = _select_backend()
-    print(f"(coding agent: usando backend '{backend}')", file=sys.stderr)
+    logger.info(f"coding agent: usando backend '{backend}'")
     if backend == "none":
         return {"status": "blocked", "summary": "ni ANTHROPIC_API_KEY ni Ollama disponibles", "files_changed": [], "_meta": {}}
 
@@ -600,7 +603,7 @@ async def run_coding_agent(ticket_id: str, sanitized_prompt: str, target_repo_di
                 listed = await session.list_tools()
                 tools.extend(_mcp_tools_to_anthropic_format(name, listed.tools))
             except Exception as exc:
-                print(f"(coding agent: no se pudieron listar tools de '{name}': {exc})", file=sys.stderr)
+                logger.warning(f"coding agent: no se pudieron listar tools de '{name}': {exc}")
 
         messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
 

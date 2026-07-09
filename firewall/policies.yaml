@@ -1,0 +1,58 @@
+# Reglas reales del AI Firewall (firewall_proxy.py), versionadas y
+# auditables por separado del codigo Python -- antes vivian como listas
+# hardcodeadas en el modulo. tests/test_firewall_proxy.py valida el
+# comportamiento cargando este mismo archivo, no una copia duplicada.
+#
+# jailbreak_rules: ingress -- si matchean, la solicitud se RECHAZA (403) y
+# nunca llega a egress/redaccion.
+# redaction_rules: egress -- si matchean, el texto encontrado se reemplaza
+# por REDACTED_TOKEN antes de que el prompt pueda llegar al agente.
+#
+# pattern es un regex de Python (re.IGNORECASE siempre aplicado).
+
+jailbreak_rules:
+  - id: ignore-previous-instructions-en
+    pattern: 'ignore previous instructions'
+    severity: high
+    description: Intento de prompt injection en ingles pidiendo ignorar instrucciones previas.
+
+  - id: ignore-all-previous-instructions-en
+    pattern: 'ignore all previous instructions'
+    severity: high
+    description: Variante mas enfatica del intento anterior.
+
+  - id: ignore-previous-instructions-es
+    pattern: 'olvida las instrucciones anteriores'
+    severity: high
+    description: Intento de prompt injection en espanol.
+
+  - id: disregard-prior-instructions-en
+    pattern: 'disregard prior instructions'
+    severity: high
+    description: Otra variante en ingles del mismo intento de injection.
+
+  - id: destructive-shell-rm-rf
+    pattern: 'rm\s+-rf\b'
+    severity: critical
+    description: Comando destructivo de borrado recursivo pedido dentro del prompt.
+
+  - id: destructive-sql-drop-table
+    pattern: 'drop\s+table\b'
+    severity: critical
+    description: Comando SQL destructivo pedido dentro del prompt.
+
+redaction_rules:
+  - id: password-assignment
+    pattern: 'password\s*=\s*\S+'
+    severity: high
+    description: Password en claro, forma password=valor.
+
+  - id: secret-key-assignment
+    pattern: 'secret_key\s*=\s*\S+'
+    severity: high
+    description: Secret key en claro, forma secret_key=valor.
+
+  - id: azure-style-account-key
+    pattern: '(?:account)?key\s*[:=]\s*[A-Za-z0-9+/]{40,88}={0,2}'
+    severity: critical
+    description: Blob base64 con forma de account key de Azure Storage.

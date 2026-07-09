@@ -138,6 +138,23 @@ post_jira_comment() {
     || echo "(no se pudo dejar el comentario de auditoria en Jira — revisa credenciales)"
 }
 
+# Posts a plain-text alert to ALERT_WEBHOOK_URL (formato compatible con un
+# incoming webhook de Slack: {"text": "..."}) si esta configurado -- antes
+# solo Falco tenia esta capacidad (FALCO_ALERT_WEBHOOK_URL); ahora tambien
+# se usa cuando el juez marca FLAGGED o el testing agent bloquea una corrida,
+# asi alguien recibe una alerta activa en vez de tener que leer Jira/JSONL.
+# Retrocompatible: si ALERT_WEBHOOK_URL no esta seteada, cae a
+# FALCO_ALERT_WEBHOOK_URL para no romper a quien ya la tenia configurada.
+post_alert_webhook() {
+  local text="$1"
+  local webhook_url="${ALERT_WEBHOOK_URL:-${FALCO_ALERT_WEBHOOK_URL:-}}"
+  [ -z "${webhook_url}" ] && return 0
+  curl -s -X POST "${webhook_url}" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg text "${text}" '{text: $text}')" \
+    >/dev/null 2>&1 || echo "(no se pudo postear al webhook de alertas)"
+}
+
 # Moves the real ticket in Jira to JIRA_IN_PROGRESS_STATUS (default
 # "In Progress") so its status reflects that an agent is working on it,
 # without a human having to drag it across the board by hand. Best-effort:
@@ -197,6 +214,7 @@ run_judge() {
     echo "🚫 EL JUEZ MARCO ESTA CORRIDA COMO PROBLEMATICA — ${location_label}"
 
     post_jira_comment "🧑‍⚖️ Agente juez (automatizado): FLAGGED. ${reasoning} — ${location_label} bloqueado, requiere revision humana antes de continuar."
+    post_alert_webhook "🧑‍⚖️ Juez FLAGGED en ${TICKET_ID:-UNKNOWN} (${location_label}): ${reasoning}"
 
     JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
       || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
@@ -251,6 +269,7 @@ run_tests_gate() {
   echo "🚫 EL TESTING AGENT MARCO ESTA CORRIDA COMO FALLIDA — rama '${branch}'"
 
   post_jira_comment "🧪 Testing agent (automatizado): los tests reales de '${component}' FALLARON en la rama '${branch}'. Bloqueado antes de llegar al juez — requiere revision humana."
+  post_alert_webhook "🧪 Testing agent BLOCKED en ${TICKET_ID:-UNKNOWN}: los tests reales de '${component}' fallaron en la rama '${branch}'."
 
   JIRA_TICKET_KEY="${TICKET_ID:-${JIRA_TICKET_KEY:-}}" python3 "${SCRIPT_DIR}/jira_client.py" transition "${JIRA_BLOCKED_STATUS:-Blocked}" >/dev/null 2>&1 \
     || echo "(no se pudo mover el ticket a '${JIRA_BLOCKED_STATUS:-Blocked}' — ajusta JIRA_BLOCKED_STATUS a un nombre real de tu workflow)"
@@ -284,13 +303,7 @@ check_falco_correlation() {
   local summary
   summary=$(echo "${result}" | jq -r '.alerts[] | "- [\(.priority)] \(.rule): \(.output)"' | tr '\n' ' ')
   post_jira_comment "🚨 Falco (monitoreo a nivel de sistema, automatizado): se detectaron ${count} alerta(s) durante esta corrida — ${summary}"
-
-  if [ -n "${FALCO_ALERT_WEBHOOK_URL:-}" ]; then
-    curl -s -X POST "${FALCO_ALERT_WEBHOOK_URL}" \
-      -H "Content-Type: application/json" \
-      -d "$(jq -n --arg text "🚨 Falco detecto ${count} alerta(s) en la corrida de ${TICKET_ID:-UNKNOWN}: ${summary}" '{text: $text}')" \
-      >/dev/null 2>&1 || echo "(no se pudo postear al webhook de Falco)"
-  fi
+  post_alert_webhook "🚨 Falco detecto ${count} alerta(s) en la corrida de ${TICKET_ID:-UNKNOWN}: ${summary}"
 }
 
 # Dado un listado (uno por linea) de nombres de componente distintos, chequea

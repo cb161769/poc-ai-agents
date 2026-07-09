@@ -9,9 +9,11 @@ import pytest
 
 import judge_agent
 from judge_agent import (
+    JUDGE_POLICY_IDS,
     _estimate_cost_usd,
     _extract_json,
     _messages_to_ollama,
+    _normalize_policy_reference,
     _ollama_response_to_blocks,
     _redact_payload_for_logging,
 )
@@ -146,6 +148,30 @@ def test_redact_payload_for_logging_leaves_clean_text_untouched():
 
     assert redacted["ticket"]["description"] == payload["ticket"]["description"]
     assert redacted["change_description"] == payload["change_description"]
+
+
+def test_normalize_policy_reference_sets_null_for_ok_verdict():
+    verdict = _normalize_policy_reference({"verdict": "OK", "reasoning": "todo bien"})
+    assert verdict["policy_reference"] is None
+
+
+def test_normalize_policy_reference_keeps_valid_id_for_flagged_verdict():
+    verdict = _normalize_policy_reference({"verdict": "FLAGGED", "policy_reference": "scope-mismatch"})
+    assert verdict["policy_reference"] == "scope-mismatch"
+
+
+def test_normalize_policy_reference_falls_back_to_other_when_missing():
+    verdict = _normalize_policy_reference({"verdict": "FLAGGED"})
+    assert verdict["policy_reference"] == "other"
+
+
+def test_normalize_policy_reference_falls_back_to_other_when_invalid_id():
+    verdict = _normalize_policy_reference({"verdict": "FLAGGED", "policy_reference": "made-up-id"})
+    assert verdict["policy_reference"] == "other"
+
+
+def test_judge_policy_ids_include_other_as_fallback():
+    assert "other" in JUDGE_POLICY_IDS
 
 
 def test_judge_tool_query_sonar_formats_issues():

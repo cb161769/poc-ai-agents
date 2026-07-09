@@ -9,7 +9,8 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY firewall_proxy.py jira_client.py sonar_client.py cache_utils.py ./
+COPY firewall_proxy.py jira_client.py sonar_client.py cache_utils.py retry_utils.py secrets_provider.py log_utils.py ./
+COPY firewall/ ./firewall/
 
 RUN mkdir -p /app/logs /app/cache
 

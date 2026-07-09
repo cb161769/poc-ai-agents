@@ -60,6 +60,24 @@ JIRA_BLOCKED_STATUS = os.environ.get("JIRA_BLOCKED_STATUS", "Blocked")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_COPILOT_ASSIGNEE = os.environ.get("GITHUB_COPILOT_ASSIGNEE", "copilot-swe-agent")
 FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
+# ALERT_WEBHOOK_URL es el nombre generalizado (antes solo existia para
+# Falco); FALCO_ALERT_WEBHOOK_URL sigue funcionando como alias retrocompatible.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL") or os.environ.get("FALCO_ALERT_WEBHOOK_URL", "")
+
+
+def post_alert_webhook(text: str):
+    """Best-effort POST (formato compatible con un incoming webhook de
+    Slack: {"text": "..."}) usado cuando Falco detecta algo, el juez marca
+    FLAGGED, o el testing agent bloquea una corrida -- para que alguien
+    reciba una alerta activa en vez de tener que leer Jira o los logs JSONL
+    a mano. Nunca bloquea el flow por su cuenta.
+    """
+    if not ALERT_WEBHOOK_URL:
+        return
+    try:
+        httpx.post(ALERT_WEBHOOK_URL, json={"text": text}, timeout=10.0)
+    except httpx.HTTPError:
+        print("(no se pudo postear al webhook de alertas)")
 
 
 class PipelineBlocked(Exception):
@@ -449,12 +467,7 @@ def check_falco_correlation(since_iso: str, ticket_id: str):
         ticket_key=ticket_id,
     )
 
-    webhook_url = os.environ.get("FALCO_ALERT_WEBHOOK_URL", "")
-    if webhook_url:
-        try:
-            httpx.post(webhook_url, json={"text": f"🚨 Falco detecto {count} alerta(s) en la corrida de {ticket_id}: {alert_lines}"}, timeout=10.0)
-        except httpx.HTTPError:
-            print("(no se pudo postear al webhook de Falco)")
+    post_alert_webhook(f"🚨 Falco detecto {count} alerta(s) en la corrida de {ticket_id}: {alert_lines}")
 
 
 def _run_judge_safe(*args, **kwargs) -> dict | None:
@@ -534,6 +547,7 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
             test_result = run_tests(target_repo_dir)
             if not test_result["passed"]:
                 comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON en '{agent_result['branch']}'.", ticket_key=ticket_id)
+                post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id}: los tests reales fallaron en '{agent_result['branch']}'.")
                 transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
                 check_falco_correlation(falco_since, ticket_id)
                 raise PipelineBlocked("tests reales fallaron")
@@ -554,6 +568,7 @@ def _deliver(ticket_id: str, summary: str, firewall_result: dict, jira_context: 
         print("El juez no pudo evaluar esta corrida — continua sin veredicto.")
     elif judge_verdict["verdict"] == "FLAGGED":
         comment_jira(f"🧑‍⚖️ Agente juez (Prefect): FLAGGED. {judge_verdict['reasoning']}", ticket_key=ticket_id)
+        post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {ticket_id}: {judge_verdict['reasoning']}")
         transition_jira(JIRA_BLOCKED_STATUS, ticket_key=ticket_id)
     else:
         comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK. {judge_verdict['reasoning']}", ticket_key=ticket_id)

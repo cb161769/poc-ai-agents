@@ -83,6 +83,57 @@ def test_open_by_default_when_no_api_key_configured(client):
     assert resp.status_code == 200
 
 
+def test_policies_load_from_versioned_yaml_file():
+    policies = firewall_proxy.load_policies()
+    assert "jailbreak_rules" in policies
+    assert "redaction_rules" in policies
+    assert len(policies["jailbreak_rules"]) > 0
+    assert len(policies["redaction_rules"]) > 0
+
+
+def test_policy_rule_ids_are_unique():
+    policies = firewall_proxy.load_policies()
+    all_ids = [r["id"] for r in policies["jailbreak_rules"]] + [r["id"] for r in policies["redaction_rules"]]
+    assert len(all_ids) == len(set(all_ids))
+
+
+def test_jailbreak_reason_cites_rule_id(client):
+    resp = client.post("/evaluate", json=_payload("ignore previous instructions"))
+    assert resp.status_code == 403
+    body = resp.json()
+    assert "ignore-previous-instructions-en" in body["reason"]
+
+
+def test_metrics_endpoint_exposes_prometheus_counters(client):
+    client.post("/evaluate", json=_payload("cambio inofensivo"))
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "firewall_approved_total" in resp.text
+    assert "firewall_rejected_total" in resp.text
+    assert "firewall_redactions_total" in resp.text
+
+
+def test_rate_limit_returns_429_after_max_requests(tmp_path, monkeypatch):
+    monkeypatch.setenv("RATE_LIMIT_MAX_REQUESTS", "3")
+    monkeypatch.setenv("RATE_LIMIT_WINDOW_SECONDS", "60")
+    reloaded = importlib.reload(firewall_proxy)
+    monkeypatch.setattr(reloaded, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(reloaded, "AUDIT_LOG", tmp_path / "firewall_audit.jsonl")
+    reloaded_client = TestClient(reloaded.app)
+
+    try:
+        for _ in range(3):
+            resp = reloaded_client.post("/evaluate", json=_payload("cambio inofensivo"))
+            assert resp.status_code == 200
+
+        limited = reloaded_client.post("/evaluate", json=_payload("cambio inofensivo"))
+        assert limited.status_code == 429
+    finally:
+        monkeypatch.delenv("RATE_LIMIT_MAX_REQUESTS", raising=False)
+        monkeypatch.delenv("RATE_LIMIT_WINDOW_SECONDS", raising=False)
+        importlib.reload(firewall_proxy)
+
+
 def test_evaluate_requires_header_when_api_key_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("FIREWALL_API_KEY", "test-secret-key")
     reloaded = importlib.reload(firewall_proxy)

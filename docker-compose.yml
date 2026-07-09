@@ -132,6 +132,23 @@ services:
     networks:
       - poc-net
 
+  # Init container de un solo uso: descarga el modelo de tool-calling que
+  # necesitan el agente juez / coding_agent.py contra el servidor "ollama" ya
+  # levantado, para que "docker exec poc-ollama ollama pull llama3.1" ya no
+  # sea un paso manual del README (§11). Se conecta via OLLAMA_HOST, no baja
+  # nada localmente -- el modelo queda en el volumen ollama_models real.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: poc-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "ollama:11434"
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-llama3.1}"]
+    networks:
+      - poc-net
+
   prefect-server:
     image: prefecthq/prefect:2-latest
     container_name: poc-prefect-server

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vista de Sprint · Copilot como copiloto operativo</title>
+  <style>
+    :root {
+      --bg:#f7f4ec;
+      --surface:#ffffff;
+      --ink:#0c0d10;
+      --ink-dim:#4b4d52;
+      --ink-faint:#87878a;
+      --border:#e6e0d0;
+      --border-strong:#cfc6ac;
+      --primary:#1f4e8c;
+      --primary-soft:#1f4e8c0f;
+      --gold:#d9a52c;
+      --gold-soft:#d9a52c1a;
+      --danger:#b23a3a;
+      --danger-soft:#b23a3a0f;
+      --ok:#1f7a54;
+      --ok-soft:#1f7a540f;
+      --warn:#a9740a;
+      --warn-soft:#a9740a0f;
+      --serif: Georgia, "Iowan Old Style", "Palatino Linotype", ui-serif, serif;
+      --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background: radial-gradient(800px 400px at 5% -10%, #1f4e8c10, transparent 60%), var(--bg);
+      line-height: 1.6;
+      padding: 0 24px 80px;
+    }
+    a { color: var(--primary); }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .hero {
+      padding: 42px 0 28px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 36px;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: .14em;
+      font-size: 11px;
+      color: var(--ink-faint);
+      font-family: var(--mono);
+      margin-bottom: 10px;
+    }
+    h1 {
+      font-family: var(--serif);
+      font-size: clamp(30px, 4.2vw, 44px);
+      margin: 0 0 12px;
+      line-height: 1.15;
+    }
+    .lede {
+      font-size: 17px;
+      color: var(--ink-dim);
+      max-width: 80ch;
+      margin: 0;
+    }
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--ink-dim);
+    }
+    section { margin-top: 38px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px 20px 22px;
+      box-shadow: 0 12px 28px -24px rgba(12,13,16,.4);
+    }
+    h2 {
+      font-family: var(--serif);
+      font-size: 24px;
+      margin: 0 0 6px;
+    }
+    .sub { color: var(--ink-faint); margin: 0 0 16px; }
+    .board {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .column {
+      background: linear-gradient(180deg, var(--surface), #fbf8f2);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 260px;
+    }
+    .column h3 {
+      font-size: 14px;
+      margin: 0 0 10px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      font-family: var(--mono);
+      color: var(--ink-faint);
+    }
+    .step {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: 12px;
+      padding: 10px 11px;
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: var(--ink-dim);
+    }
+    .step strong { color: var(--ink); display: block; margin-bottom: 3px; }
+    .step.ok { border-color: #b9daba; background: var(--ok-soft); }
+    .step.warn { border-color: #f0d79f; background: var(--warn-soft); }
+    .step.danger { border-color: #e7b7b7; background: var(--danger-soft); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 10px;
+      align-items: start;
+      margin-top: 10px;
+    }
+    .agent-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 170px;
+    }
+    .agent-card .label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin-bottom: 8px;
+    }
+    .agent-card h3 { margin: 0 0 6px; font-size: 16px; }
+    .agent-card p { margin: 0; font-size: 13px; color: var(--ink-dim); }
+    .arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      color: var(--ink-faint);
+      padding-top: 70px;
+    }
+    .timeline {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .time-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+    }
+    .time-block .t { font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); }
+    .time-block h4 { margin: 6px 0 6px; font-size: 15px; }
+    .time-block p { margin: 0; color: var(--ink-dim); font-size: 13px; }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .list { margin: 0; padding-left: 16px; color: var(--ink-dim); }
+    .list li { margin-bottom: 8px; }
+    .qa {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .mini-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+    }
+    .mini-card h4 { margin: 0 0 6px; font-size: 15px; }
+    .mini-card p { margin: 0; color: var(--ink-dim); font-size: 13px; }
+    .footer { margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--ink-faint); font-size: 12px; }
+    @media (max-width: 1000px) {
+      .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .arrow { display: none; }
+      .timeline, .qa { grid-template-columns: 1fr; }
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      body { padding: 0 14px 60px; }
+      .board { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="hero">
+      <div class="eyebrow">visión ejecutiva · sprint</div>
+      <h1>Así se ve este diseño en un sprint real</h1>
+      <p class="lede">No es una herramienta aislada en el editor. Es un flujo de trabajo que acompaña la historia desde que entra al sprint hasta que queda validada, revisada y con evidencia para el equipo.</p>
+      <div class="chip-row">
+        <span class="chip">Ticket → contexto → acción → validación</span>
+        <span class="chip">Firewall + tests + juez</span>
+        <span class="chip">Evidencia por corrida</span>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Vista del sprint: cómo se mueve una historia</h2>
+      <p class="sub">Cada historia atraviesa una secuencia visible y controlada. El equipo ve el progreso, el riesgo y la evidencia sin tener que reconstruirlo manualmente.</p>
+      <div class="board">
+        <div class="column">
+          <h3>Backlog</h3>
+          <div class="step"><strong>Solicitud</strong>El ticket entra desde Jira como una historia o bug.</div>
+          <div class="step"><strong>Contexto</strong>Se enlaza con componente, dependencia y riesgo.</div>
+        </div>
+        <div class="column">
+          <h3>Refinamiento</h3>
+          <div class="step"><strong>Triage</strong>Se clasifica el problema y se extrae el alcance.</div>
+          <div class="step"><strong>Impacto</strong>Se consulta el grafo de dependencias y el contexto técnico.</div>
+        </div>
+        <div class="column">
+          <h3>Control</h3>
+          <div class="step warn"><strong>Firewall</strong>Rechaza manipulaciones y elimina secretos.</div>
+          <div class="step"><strong>Seguridad</strong>Se filtran hallazgos sensibles antes de seguir.</div>
+        </div>
+        <div class="column">
+          <h3>Trabajo</h3>
+          <div class="step ok"><strong>Copilot</strong>Recibe la historia completa y propone la solución.</div>
+          <div class="step"><strong>Rama</strong>El cambio queda en una rama preparada para revisión.</div>
+        </div>
+        <div class="column">
+          <h3>Validación</h3>
+          <div class="step ok"><strong>Tests reales</strong>Se corren pruebas del componente en un entorno descartable.</div>
+          <div class="step"><strong>Juez</strong>Evalúa si el cambio y la decisión tienen sentido.</div>
+        </div>
+        <div class="column">
+          <h3>Entrega</h3>
+          <div class="step"><strong>PR / revisión</strong>Se deja evidencia clara para el equipo.</div>
+          <div class="step"><strong>Jira</strong>Se comenta el resultado y se avanza el estado.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>El ciclo de agentes dentro del sprint</h2>
+      <p class="sub">No es un agente único. Es una cadena de agentes de responsabilidad distinta, todos conectados por el mismo ticket.</p>
+      <div class="flow">
+        <div class="agent-card">
+          <div class="label">1</div>
+          <h3>Agente de Triage</h3>
+          <p>Recibe el ticket y lo convierte en un contexto claro para el sprint.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">2</div>
+          <h3>Agente de Impacto</h3>
+          <p>Consulta Neo4j y detecta qué otros servicios o equipos podrían verse afectados.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">3</div>
+          <h3>Agente de Seguridad</h3>
+          <p>Evalúa el contenido, filtra secretos y bloquea intentos de manipulación.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">4</div>
+          <h3>Agente de Implementación</h3>
+          <p>Propone y aplica la solución en una rama de revisión.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">5</div>
+          <h3>Agente de Validación</h3>
+          <p>Corre tests, revisa el diff y deja una segunda opinión independiente.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Cómo se ve en el día a día del equipo</h2>
+      <div class="timeline">
+        <div class="time-block">
+          <div class="t">Inicio del día</div>
+          <h4>Se toma la historia</h4>
+          <p>El ticket entra en el flujo con contexto y sin trabajo manual de recolección.</p>
+        </div>
+        <div class="time-block">
+          <div class="t">Mitad del día</div>
+          <h4>El agente trabaja</h4>
+          <p>Propone cambios, consulta impacto y deja una propuesta lista para revisar.</p>
+        </div>
+        <div class="time-block">
+          <div class="t">Tarde</div>
+          <h4>Validación real</h4>
+          <p>Se ejecutan pruebas y se rechaza o aprueba según evidencia, no según intuición.</p>
+        </div>
+        <div class="time-block">
+          <div class="t">Cierre</div>
+          <h4>Revisión y evidencia</h4>
+          <p>El equipo ve qué hizo el agente, por qué y qué pasó en cada paso.</p>
+        </div>
+        <div class="time-block">
+          <div class="t">Aprendizaje</div>
+          <h4>Mejora del proceso</h4>
+          <p>Lo que falló se convierte en mejora de reglas, prompts, o políticas del sistema.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card">
+        <h2>Qué ve el desarrollador en el sprint</h2>
+        <ul class="list">
+          <li>La historia ya viene con contexto de negocio y tecnológicamente relevante.</li>
+          <li>El agente no empieza desde cero: ya sabe qué componente afecta y qué riesgo lleva.</li>
+          <li>Antes de enviar nada, el sistema filtra datos sensibles y bloquea instrucciones peligrosas.</li>
+          <li>El cambio queda registrado y se puede revisar con prueba y evidencia.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Qué ve el líder o PM en el sprint</h2>
+        <ul class="list">
+          <li>Cuántas historias se movieron con ayuda del agente.</li>
+          <li>Qué decisiones del sistema fueron aprobadas o bloqueadas.</li>
+          <li>Cuánto tiempo se ahorra en contextos manuales y recolección de información.</li>
+          <li>Qué nivel de riesgo operativo se está asumiendo.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Gates visibles del sprint</h2>
+      <div class="qa">
+        <div class="mini-card">
+          <h4>Gate 1 · Entrada</h4>
+          <p>El ticket se convierte en contexto ejecutable para el agente.</p>
+        </div>
+        <div class="mini-card">
+          <h4>Gate 2 · Seguridad</h4>
+          <p>Se bloquea o redirige el contenido que no debe llegar al modelo.</p>
+        </div>
+        <div class="mini-card">
+          <h4>Gate 3 · Validación</h4>
+          <p>El cambio solo avanza si las pruebas reales lo respaldan.</p>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer">
+      <span>Vista conceptual para un sprint operativo · preparada para ser usada como referencia visual</span>
+    </div>
+  </div>
+</body>
+</html>

@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 
 from cache_utils import cached_call
 from retry_utils import retry_call
+from secrets_provider import require_secret
 
 load_dotenv()
 
@@ -172,8 +173,8 @@ def _resolve_repository_origen(fields: dict) -> str | None:
 
 
 def _auth_headers() -> dict:
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
+    email = require_secret("JIRA_EMAIL")
+    token = require_secret("JIRA_API_TOKEN")
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
@@ -323,8 +324,8 @@ def _build_smoke_ticket_payload(component: str) -> dict:
 
 def create_smoke_ticket(component: str) -> str:
     jira_url = os.environ["JIRA_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
+    email = require_secret("JIRA_EMAIL")
+    token = require_secret("JIRA_API_TOKEN")
 
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
@@ -345,8 +346,8 @@ def post_audit_comment(ticket_key: str, text: str) -> dict:
     Jira's own comment history — not just in the local logs/*.jsonl files.
     """
     jira_url = os.environ["JIRA_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
+    email = require_secret("JIRA_EMAIL")
+    token = require_secret("JIRA_API_TOKEN")
 
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
@@ -379,8 +380,8 @@ def transition_ticket(ticket_key: str, target_status_name: str) -> dict:
     hardcoding an id.
     """
     jira_url = os.environ["JIRA_URL"].rstrip("/")
-    email = os.environ["JIRA_EMAIL"]
-    token = os.environ["JIRA_API_TOKEN"]
+    email = require_secret("JIRA_EMAIL")
+    token = require_secret("JIRA_API_TOKEN")
 
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}

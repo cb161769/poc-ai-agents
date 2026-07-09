@@ -16,23 +16,20 @@ El camino más corto para ver el pipeline correr una vez, sin entrar todavía en
 
 ```bash
 # 1. Prerrequisitos: Docker, jq, curl, gh CLI (con gh-copilot), Python 3.10+
-cp .env.example .env
-# editá .env: como mínimo JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_TICKET_KEY
 
-# 2. Levantar infraestructura (Neo4j, SonarQube + scan real, Qdrant, firewall)
-docker compose up -d --build
-docker compose logs sonar-scanner | grep SONAR_TOKEN   # copiar a SONAR_TOKEN en .env
-docker compose restart ai-firewall
+# 2. Un solo comando: crea .env si no existe, levanta Neo4j/SonarQube+scan
+#    real/Qdrant/firewall/Ollama, aplica el SONAR_TOKEN real y espera el
+#    modelo de Ollama -- ver scripts/setup.sh
+./scripts/setup.sh
+# editá .env con tus credenciales reales: como mínimo JIRA_URL, JIRA_EMAIL,
+# JIRA_API_TOKEN, JIRA_TICKET_KEY
 
-# 3. Verificar que todo esté arriba
-./scripts/check_prereqs.sh
-
-# 4. Pararte en el repo real al que corresponde el ticket, y correr
+# 3. Pararte en el repo real al que corresponde el ticket, y correr
 cd /ruta/a/tu-proyecto-real
 /ruta/a/poc-ai-agents/run_poc_loop.sh   # o con un ticket puntual: run_poc_loop.sh JIRA-123
 ```
 
-Esto alcanza para ver el flujo completo (firewall → grafo/Sonar → agente → tests → juez) con la infraestructura mínima. La [guía paso a paso](#guía-completa-paso-a-paso) más abajo cubre cada pieza opcional: sync del grafo desde Azure DevOps, Figma, épicas, Falco, evals, Prefect.
+Esto alcanza para ver el flujo completo (firewall → grafo/Sonar → agente → tests → juez) con la infraestructura mínima. `scripts/setup.sh` es idempotente (correrlo de nuevo no rompe nada) y reemplaza los pasos manuales de copiar el `SONAR_TOKEN` a mano y bajar el modelo de Ollama a mano — si preferís hacerlo paso a paso (o `setup.sh` no puede confirmar algún paso), la [guía completa](#guía-completa-paso-a-paso) más abajo tiene el detalle manual de cada uno. También cubre cada pieza opcional: sync del grafo desde Azure DevOps, Figma, épicas, Falco, evals, Prefect.
 
 ## Arquitectura
 
@@ -77,7 +74,9 @@ figma_client.py                      Specs de Figma vía REST cuando el ticket t
 cache_utils.py                       Cache genérico con TTL usado por los clientes reales
 
 scripts/
+  setup.sh                           Un solo comando: .env + infra + SONAR_TOKEN real + modelo Ollama
   check_prereqs.sh                   Valida que la infraestructura esté arriba
+  health_check.sh --json             Monitoreo continuo (cron/systemd) de los mismos servicios, postea a ALERT_WEBHOOK_URL si algo cae
   smoke_test.sh                      Corre el pipeline real de punta a punta con datos descartables
   run_module_tests.sh                Testing agent: auto-detecta stack y corre el test suite real
   report_sprint_metrics.py           Agrega logs/copilot_contribution.jsonl en métricas de sprint
@@ -145,6 +144,7 @@ docker compose logs sonar-scanner | grep SONAR_TOKEN
 # copia el valor a SONAR_TOKEN= en tu .env, luego:
 docker compose restart ai-firewall
 ```
+(`./scripts/setup.sh` hace estos dos pasos automáticamente — ver Quick Start.)
 
 Opcional pero recomendado: seteá `FIREWALL_API_KEY` en `.env` antes de levantar `ai-firewall` para que `/evaluate` exija el header `X-Firewall-Key` (401 sin él) — sin esto, cualquiera que llegue a `FIREWALL_URL` puede pegarle al firewall directo, sin pasar por Jira. `run_poc_loop.sh`/`orchestration.py` mandan el header automáticamente si la variable está seteada.
 
@@ -303,7 +303,7 @@ A diferencia del coding agent (que corre en la nube de GitHub y no puede tocar t
 ```bash
 docker exec poc-ollama ollama pull llama3.1
 ```
-Si cambiás `OLLAMA_MODEL` en `.env`, descargá ese modelo en su lugar. Sin `ANTHROPIC_API_KEY` ni Ollama alcanzable (o ante cualquier falla de red al llamarlos), el juez se omite y la corrida sigue sin veredicto — nunca frena el pipeline por su ausencia.
+Si cambiás `OLLAMA_MODEL` en `.env`, descargá ese modelo en su lugar. (`./scripts/setup.sh`/el servicio `ollama-pull` del `docker-compose.yml` hacen esto automáticamente.) Sin `ANTHROPIC_API_KEY` ni Ollama alcanzable (o ante cualquier falla de red al llamarlos), el juez se omite y la corrida sigue sin veredicto — nunca frena el pipeline por su ausencia.
 
 **Sobre una corrida `APPROVED`**, si marca `FLAGGED` tiene poder real de bloqueo:
 - Deja un comentario fuerte en el ticket de Jira.

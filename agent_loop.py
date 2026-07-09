@@ -18,7 +18,6 @@ Model backend, in order of preference (same for both callers):
 import asyncio
 import json
 import os
-import sys
 from contextlib import AsyncExitStack
 
 import httpx
@@ -26,7 +25,11 @@ from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from log_utils import get_logger
+
 load_dotenv()
+
+logger = get_logger(__name__)
 
 # Bounded retry for transient backend failures (529 overloaded, timeouts,
 # connection resets) -- a network blip shouldn't kill the whole run. Non-
@@ -236,7 +239,7 @@ async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: 
             await session.initialize()
             sessions[name] = session
         except Exception as exc:
-            print(f"({label}: no se pudo conectar al MCP '{name}', se omite: {exc})", file=sys.stderr)
+            logger.warning(f"{label}: no se pudo conectar al MCP '{name}', se omite: {exc}")
     return sessions
 
 

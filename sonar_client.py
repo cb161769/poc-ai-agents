@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from cache_utils import cached_call
 from retry_utils import retry_call
+from secrets_provider import require_secret
 
 load_dotenv()
 
@@ -24,7 +25,7 @@ def _sonar_url() -> str:
 
 
 def _auth():
-    token = os.environ["SONAR_TOKEN"]
+    token = require_secret("SONAR_TOKEN")
     return (token, "")
 
 

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Visión de Producto y Arquitectura de Agentes</title>
+  <style>
+    :root {
+      --bg: #f7f4ec;
+      --surface: #ffffff;
+      --ink: #0c0d10;
+      --ink-dim: #4b4d52;
+      --ink-faint: #87878a;
+      --border: #e6e0d0;
+      --border-strong: #cfc6ac;
+      --primary: #1f4e8c;
+      --primary-soft: #1f4e8c0f;
+      --gold: #d9a52c;
+      --gold-soft: #d9a52c1a;
+      --ok: #1f7a54;
+      --ok-soft: #1f7a540f;
+      --warn: #a9740a;
+      --warn-soft: #a9740a0f;
+      --danger: #b23a3a;
+      --danger-soft: #b23a3a0f;
+      --serif: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+      --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background: radial-gradient(700px 350px at 5% -10%, #1f4e8c10, transparent 60%), var(--bg);
+      line-height: 1.6;
+      padding: 0 24px 80px;
+    }
+    .container { max-width: 1180px; margin: 0 auto; }
+    .hero {
+      padding: 42px 0 28px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 36px;
+    }
+    .eyebrow {
+      text-transform: uppercase;
+      letter-spacing: .14em;
+      font-size: 11px;
+      color: var(--ink-faint);
+      font-family: var(--mono);
+      margin-bottom: 10px;
+    }
+    h1 {
+      font-family: var(--serif);
+      font-size: clamp(30px, 4.2vw, 44px);
+      margin: 0 0 12px;
+      line-height: 1.15;
+    }
+    .lede {
+      font-size: 17px;
+      color: var(--ink-dim);
+      max-width: 82ch;
+      margin: 0;
+    }
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--ink-dim);
+    }
+    section { margin-top: 34px; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px 20px 24px;
+      box-shadow: 0 12px 28px -24px rgba(12,13,16,.42);
+    }
+    h2 {
+      font-family: var(--serif);
+      font-size: 24px;
+      margin: 0 0 8px;
+    }
+    .sub { color: var(--ink-faint); margin: 0 0 16px; }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px 15px;
+      background: linear-gradient(180deg, var(--surface), #fbf8f2);
+    }
+    .panel h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+    .panel p, .panel li { color: var(--ink-dim); font-size: 14px; }
+    .list { margin: 0; padding-left: 18px; }
+    .list li { margin-bottom: 7px; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .agent-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 180px;
+    }
+    .agent-card .label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin-bottom: 8px;
+    }
+    .agent-card h3 { margin: 0 0 6px; font-size: 16px; }
+    .agent-card p { margin: 0; color: var(--ink-dim); font-size: 13px; }
+    .arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      color: var(--ink-faint);
+      padding-top: 70px;
+    }
+    .quote {
+      border-left: 3px solid var(--gold);
+      padding: 12px 14px;
+      background: var(--gold-soft);
+      color: var(--ink-dim);
+      border-radius: 0 10px 10px 0;
+      margin-top: 14px;
+    }
+    .footer {
+      margin-top: 40px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      color: var(--ink-faint);
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      .grid-2, .flow { grid-template-columns: 1fr; }
+      .arrow { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header class="hero">
+      <div class="eyebrow">visión de producto · arquitectura de agentes</div>
+      <h1>Copiloto operativo para convertir épicas en entregas reales</h1>
+      <p class="lede">La propuesta no es reemplazar Scrum, sino darle al equipo un sistema de asistencia que convierta una épica en trabajo accionable, trazable y verificable, con supervisión humana y evidencia operativa.</p>
+      <div class="chip-row">
+        <span class="chip">Épica → historias → implementación</span>
+        <span class="chip">Contexto + validación + auditoría</span>
+        <span class="chip">Humano en los puntos críticos</span>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Visión de producto</h2>
+      <p class="sub">Un copiloto operativo para equipos de software que reduce la fricción entre negocio, desarrollo y validación.</p>
+      <div class="grid-2">
+        <div class="panel">
+          <h3>Qué resuelve</h3>
+          <ul class="list">
+            <li>Convierte una épica en historias, dependencias y tareas ejecutables.</li>
+            <li>Reduce el tiempo perdido en interpretar requisitos y contexto.</li>
+            <li>Mejora la trazabilidad desde la idea hasta la entrega.</li>
+            <li>Genera evidencia útil para revisión, auditoría y seguimiento.</li>
+          </ul>
+        </div>
+        <div class="panel">
+          <h3>Qué no debe hacer</h3>
+          <ul class="list">
+            <li>No reemplaza la decisión de negocio ni la priorización final.</li>
+            <li>No sustituye la responsabilidad humana en la entrega.</li>
+            <li>No debe actuar como autoridad final sobre calidad o aceptación.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="quote">
+        <strong>Visión corta:</strong> un sistema de agentes que ayuda a transformar una épica en trabajo accionable, ejecución asistida, validación automática y trazabilidad operativa.
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Arquitectura de agentes</h2>
+      <p class="sub">Una arquitectura en capas donde un orquestador dirige a agentes especializados y el humano conserva el control en los puntos críticos.</p>
+      <div class="flow">
+        <div class="agent-card">
+          <div class="label">1</div>
+          <h3>Orquestador</h3>
+          <p>Coordina el flujo completo, gestiona estados, dependencias y decide cuándo pedir aprobación.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">2</div>
+          <h3>Intake y contexto</h3>
+          <p>Recibe la épica, la documentación, los criterios y el contexto del sistema.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">3</div>
+          <h3>Planificador de épica</h3>
+          <p>Desglosa la iniciativa en historias, riesgos, dependencias y propuesta de orden por sprint.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">4</div>
+          <h3>Ejecutor técnico</h3>
+          <p>Asiste en la implementación, inspección del código, pruebas y preparación del cambio.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">5</div>
+          <h3>Validador y auditor</h3>
+          <p>Revisa calidad, cumplimiento, seguridad y deja evidencia operativa para la revisión final.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Flujo recomendado</h2>
+      <div class="grid-2">
+        <div class="panel">
+          <h3>Secuencia de trabajo</h3>
+          <ol class="list">
+            <li>Entrada de la épica y contexto inicial.</li>
+            <li>Comprensión del negocio y del sistema.</li>
+            <li>Desglose en historias y dependencias.</li>
+            <li>Priorización y secuenciación propuesta.</li>
+            <li>Ejecución asistida y validación automática.</li>
+            <li>Revisión humana y registro de evidencia.</li>
+          </ol>
+        </div>
+        <div class="panel">
+          <h3>Rol humano</h3>
+          <ul class="list">
+            <li>Aprobar la propuesta de planificación.</li>
+            <li>Validar cambios sensibles o de alto impacto.</li>
+            <li>Confirmar aceptación y cierre del trabajo.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer">
+      Documento de visión para presentar el concepto como copiloto operativo, no como sustituto del proceso Scrum.
+    </div>
+  </div>
+</body>
+</html>
