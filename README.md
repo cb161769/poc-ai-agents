@@ -8,7 +8,7 @@ Un ticket de Jira dispara un pipeline que: lee el ticket real, evalúa su conten
 
 El problema que resuelve: mostrar, con servicios reales y sin mocks, qué hace falta para que un agente de código autónomo sea *auditable* — quién decidió qué, con qué evidencia, y quién puede frenarlo — en vez de solo demostrar que "un LLM puede escribir código".
 
-Ver [PLAN.md](PLAN.md) para el diseño completo y [design.html](design.html) para el esquema visual.
+Ver [PLAN.md](PLAN.md) para el diseño completo, [design.html](design.html) para el esquema visual de arquitectura, y [pitch.html](pitch.html) para el pitch ejecutivo (problema, cadena de evidencia, decisiones de arquitectura, prueba real).
 
 ## Quick start
 

@@ -10,4 +10,11 @@ sentence-transformers==3.0.1
 python-dotenv==1.0.1
 mcp==1.12.4
 prefect~=2.19
+# mcp>=1.12 exige anyio>=4.5; prefect 2.20.x declara soportar anyio<5.0 pero
+# su GatherTaskGroup interno no implementa create_task, un metodo abstracto
+# que anyio agrego a TaskGroup en un release 4.x posterior -- sin este pin,
+# pip resuelve una version de anyio demasiado nueva y orchestration.py
+# crashea con "Can't instantiate abstract class GatherTaskGroup with
+# abstract method create_task" al primer flow run real.
+anyio>=4.5,<4.7
 pytest==8.2.2

@@ -1,0 +1,488 @@
+<title>Pitch — Agente de código auditable</title>
+<meta name="description" content="Por qué esta PoC importa: un agente de código con firewall, juez independiente y memoria de riesgo real." />
+<style>
+  :root{
+    --bg:#0b0f14;
+    --surface:#121922;
+    --surface-2:#182230;
+    --border:#28323f;
+    --border-soft:#1d2731;
+    --border-strong:#3a4759;
+    --text:#e7edf3;
+    --text-dim:#8b9aab;
+    --text-faint:#5b6b7d;
+    --accent:#5b8cff;
+    --accent-soft:#5b8cff26;
+    --violet:#a685ff;
+    --violet-soft:#a685ff20;
+    --ok:#3fb96a;
+    --ok-soft:#3fb96a1f;
+    --danger:#f0555a;
+    --danger-soft:#f0555a1f;
+    --warn:#e0a63c;
+    --warn-soft:#e0a63c1f;
+    --redact:#050708;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --cond: "Roboto Condensed", "Arial Narrow", var(--sans);
+  }
+  *{box-sizing:border-box;}
+  @media (prefers-reduced-motion: no-preference){
+    .reveal{ opacity:0; transform:translateY(14px); transition:opacity .6s ease, transform .6s ease; }
+    .reveal.in{ opacity:1; transform:none; }
+    .pillar, .stat, .stage-card, .proof-row{ transition:border-color .15s ease, background-color .15s ease, transform .15s ease; }
+    .redact-toggle{ transition:letter-spacing .3s ease; }
+  }
+  html{ scroll-behavior:smooth; }
+  @media (prefers-reduced-motion: reduce){ html{ scroll-behavior:auto; } }
+  body{
+    background:
+      radial-gradient(720px 360px at 12% -8%, #5b8cff14, transparent 60%),
+      radial-gradient(560px 320px at 92% 4%, #a685ff10, transparent 55%),
+      var(--bg);
+    color:var(--text);
+    font-family:var(--sans);
+    line-height:1.6;
+    font-size:15.5px;
+    margin:0;
+  }
+  ::selection{background:var(--accent-soft);}
+  a{color:var(--accent);}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+  .wrap{max-width:1080px; margin:0 auto; padding:0 32px 120px;}
+
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:12px;
+    letter-spacing:.14em;
+    text-transform:uppercase;
+    color:var(--accent);
+    display:flex;
+    align-items:center;
+    gap:10px;
+  }
+  .eyebrow::before{
+    content:"";
+    width:7px;height:7px;
+    background:var(--accent);
+    display:inline-block;
+    flex:none;
+  }
+  .eyebrow.violet{ color:var(--violet); }
+  .eyebrow.violet::before{ background:var(--violet); }
+
+  /* ---------- Hero ---------- */
+  .hero{
+    padding:96px 0 64px;
+    border-bottom:1px solid var(--border-soft);
+  }
+  h1{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:clamp(34px,5.2vw,58px);
+    line-height:1.05;
+    letter-spacing:-.015em;
+    text-wrap:balance;
+    margin:20px 0 24px;
+  }
+  h1 .redact-toggle{
+    background:var(--redact);
+    color:var(--redact);
+    border-radius:2px;
+    cursor:default;
+    letter-spacing:.02em;
+  }
+  h1 .redact-toggle:hover, h1 .redact-toggle:focus-visible{
+    color:var(--warn);
+    background:transparent;
+    outline:1px dashed var(--warn);
+    outline-offset:3px;
+  }
+  .hero .lede{
+    color:var(--text-dim);
+    max-width:62ch;
+    font-size:18px;
+  }
+  .hero .lede strong{ color:var(--text); font-weight:600; }
+
+  .stat-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:36px;
+    margin-top:44px;
+    padding-top:28px;
+    border-top:1px solid var(--border-soft);
+  }
+  .stat{ display:flex; flex-direction:column; gap:3px; }
+  .stat .num{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:30px;
+    font-variant-numeric:tabular-nums;
+  }
+  .stat .lbl{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--text-faint);
+    text-transform:uppercase;
+    letter-spacing:.06em;
+  }
+
+  section{ margin-top:88px; scroll-margin-top:32px; }
+  h2{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:26px;
+    letter-spacing:-.008em;
+    margin:0 0 8px;
+    text-wrap:balance;
+  }
+  .h2-sub{
+    color:var(--text-dim);
+    font-size:15px;
+    max-width:64ch;
+    margin:0 0 32px;
+  }
+  code, .mono{ font-family:var(--mono); }
+
+  /* ---------- Problem ---------- */
+  .problem-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
+    gap:1px;
+    background:var(--border);
+    border:1px solid var(--border);
+  }
+  .problem-card{
+    background:var(--surface);
+    padding:24px 22px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .problem-card .q{
+    font-family:var(--mono);
+    font-size:11px;
+    color:var(--danger);
+    letter-spacing:.05em;
+    text-transform:uppercase;
+  }
+  .problem-card h3{
+    font-family:var(--cond);
+    font-size:17px;
+    font-weight:700;
+    margin:0;
+  }
+  .problem-card p{ color:var(--text-dim); font-size:13.5px; margin:0; }
+
+  /* ---------- Pipeline (evidence chain) ---------- */
+  .chain{ display:flex; flex-direction:column; }
+  .chain-stage{
+    display:grid;
+    grid-template-columns:88px 1fr;
+    gap:20px;
+    padding:18px 0;
+    border-top:1px solid var(--border-soft);
+  }
+  .chain-stage:last-child{ border-bottom:1px solid var(--border-soft); }
+  .chain-num{
+    font-family:var(--mono);
+    font-size:12px;
+    color:var(--text-faint);
+    padding-top:3px;
+  }
+  .chain-body{ display:flex; flex-direction:column; gap:4px; }
+  .chain-title{
+    font-family:var(--cond);
+    font-weight:700;
+    font-size:16.5px;
+    display:flex;
+    align-items:baseline;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+  .chain-title .stamp{
+    font-family:var(--mono);
+    font-size:10px;
+    letter-spacing:.08em;
+    text-transform:uppercase;
+    padding:2px 8px;
+    border:1px solid currentColor;
+  }
+  .stamp.gate{ color:var(--warn); }
+  .stamp.block{ color:var(--danger); }
+  .stamp.verify{ color:var(--violet); }
+  .chain-desc{ color:var(--text-dim); font-size:13.5px; max-width:70ch; }
+
+  /* ---------- Pillars ---------- */
+  .pillar-grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));
+    gap:16px;
+  }
+  .pillar{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-top:3px solid var(--pillar-color, var(--accent));
+    padding:22px 20px 20px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .pillar:hover{ background:var(--surface-2); border-color:var(--border-strong); transform:translateY(-1px); }
+  .pillar .n{ font-family:var(--mono); font-size:11px; color:var(--text-faint); }
+  .pillar h3{ font-family:var(--cond); font-size:17.5px; font-weight:700; margin:0; }
+  .pillar p{ color:var(--text-dim); font-size:13.5px; margin:0; }
+
+  /* ---------- Proof ---------- */
+  .proof-note{
+    color:var(--text-dim);
+    font-size:14.5px;
+    max-width:70ch;
+    margin:0 0 24px;
+  }
+  .proof-list{
+    display:flex;
+    flex-direction:column;
+    border:1px solid var(--border);
+    background:var(--surface);
+  }
+  .proof-row{
+    display:grid;
+    grid-template-columns:1fr auto;
+    gap:16px;
+    align-items:center;
+    padding:13px 18px;
+    border-bottom:1px solid var(--border-soft);
+    font-size:13.5px;
+  }
+  .proof-row:last-child{ border-bottom:none; }
+  .proof-row:hover{ background:var(--surface-2); }
+  .proof-row .desc{ color:var(--text-dim); }
+  .proof-row .desc b{ color:var(--text); font-weight:600; }
+  .proof-row .fixed{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:.05em;
+    text-transform:uppercase;
+    color:var(--ok);
+    white-space:nowrap;
+  }
+
+  /* ---------- Ask ---------- */
+  .ask-box{
+    border:1px solid var(--border-strong);
+    background:linear-gradient(160deg, var(--accent-soft), transparent 60%), var(--surface);
+    padding:36px 32px;
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+  }
+  .ask-box h2{ margin-bottom:0; }
+  .ask-list{
+    display:grid;
+    grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));
+    gap:18px;
+    margin-top:8px;
+  }
+  .ask-item{ display:flex; flex-direction:column; gap:4px; }
+  .ask-item .k{ font-family:var(--mono); font-size:11px; color:var(--accent); text-transform:uppercase; letter-spacing:.05em; }
+  .ask-item .v{ font-size:13.5px; color:var(--text-dim); }
+  .ask-cta{
+    margin-top:8px;
+    font-family:var(--mono);
+    font-size:13px;
+    color:var(--text);
+    background:var(--bg);
+    border:1px solid var(--border);
+    padding:14px 16px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px;
+    flex-wrap:wrap;
+  }
+
+  footer{
+    margin-top:96px;
+    padding-top:24px;
+    border-top:1px solid var(--border-soft);
+    color:var(--text-faint);
+    font-size:12px;
+    font-family:var(--mono);
+    display:flex;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+
+  @media (max-width:640px){
+    .wrap{ padding:0 20px 90px; }
+    .hero{ padding:64px 0 48px; }
+    .chain-stage{ grid-template-columns:1fr; gap:6px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <section class="hero">
+    <div class="eyebrow">Pitch ejecutivo</div>
+    <h1>Un agente que escribe código no alcanza. Necesita poder <span class="redact-toggle" tabindex="0" aria-label="pasá el mouse para revelar">rendir cuentas</span>.</h1>
+    <p class="lede">Esta PoC no prueba que un LLM puede escribir código — eso ya está probado. Prueba <strong>qué hace falta</strong> para que lo haga con supervisión real, evidencia real y poder de veto real: contra Jira, Neo4j, SonarQube, GitHub y dos backends de modelo reales. Cero mocks en la lógica de negocio propia.</p>
+
+    <div class="stat-row">
+      <div class="stat"><div class="num">9</div><div class="lbl">Servicios reales integrados</div></div>
+      <div class="stat"><div class="num">239</div><div class="lbl">Tests pasando</div></div>
+      <div class="stat"><div class="num">3</div><div class="lbl">Caminos de coding agent</div></div>
+      <div class="stat"><div class="num">2</div><div class="lbl">Puntos de bloqueo humano real</div></div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="eyebrow">El problema</div>
+    <h2>Lo que un agente autónomo normalmente no te puede responder</h2>
+    <p class="h2-sub">No es que los agentes de código fallen en silencio — es que, cuando funcionan, tampoco dejan nada para auditar después.</p>
+    <div class="problem-grid">
+      <div class="problem-card">
+        <div class="q">Pregunta 1</div>
+        <h3>¿Qué información realmente vio el modelo?</h3>
+        <p>Sin un punto de control de entrada, un ticket con un secreto pegado por error llega intacto al prompt — y nadie lo sabe hasta que ya es tarde.</p>
+      </div>
+      <div class="problem-card">
+        <div class="q">Pregunta 2</div>
+        <h3>¿Quién audita el resultado?</h3>
+        <p>La mayoría de los pipelines confían en que el mismo agente que escribió el cambio también evalúe si está bien. No hay segunda opinión independiente.</p>
+      </div>
+      <div class="problem-card">
+        <div class="q">Pregunta 3</div>
+        <h3>¿Se acuerda de la última vez que esto salió mal?</h3>
+        <p>Cada corrida empieza de cero. Un componente que ya filtró un secreto hace dos sprints no deja ninguna señal para la próxima vez que un agente lo toque.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="eyebrow violet">La respuesta</div>
+    <h2>Una cadena de evidencia, no una caja negra</h2>
+    <p class="h2-sub">Cada etapa deja un rastro real — un veredicto, un log, o un bloqueo — antes de que la siguiente pueda arrancar.</p>
+    <div class="chain">
+      <div class="chain-stage">
+        <div class="chain-num">01</div>
+        <div class="chain-body">
+          <div class="chain-title">Ticket Jira real</div>
+          <div class="chain-desc">Lee el ticket real — descripción, componentes, adjuntos — nunca un texto simulado.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">02</div>
+        <div class="chain-body">
+          <div class="chain-title">AI Firewall <span class="stamp gate">gate</span></div>
+          <div class="chain-desc">Redacta secretos reales y detecta intentos de jailbreak antes de que lleguen a cualquier modelo. Si rechaza, la corrida termina ahí — el agente ni se entera de que existía el ticket.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">03</div>
+        <div class="chain-body">
+          <div class="chain-title">Contexto real</div>
+          <div class="chain-desc">Grafo de dependencias en Neo4j, hallazgos vigentes de SonarQube, historial real de riesgo del componente — no un resumen inventado.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">04</div>
+        <div class="chain-body">
+          <div class="chain-title">Coding agent + autocrítica</div>
+          <div class="chain-desc">Cada escritura de archivo o comando pide confirmación humana en vivo. Antes de terminar, se autoevalúa — esa autocrítica viaja al juez, que la contrasta contra el diff real en vez de creerla.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">05</div>
+        <div class="chain-body">
+          <div class="chain-title">Guardia de salida + tests reales <span class="stamp block">block</span></div>
+          <div class="chain-desc">Las mismas reglas del firewall, ahora aplicadas al diff que sale. El test suite real del proyecto corre en un contenedor descartable. Cualquiera de los dos puede bloquear antes de que el juez se moleste en mirar.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">06</div>
+        <div class="chain-body">
+          <div class="chain-title">Juez independiente <span class="stamp verify">verifica</span></div>
+          <div class="chain-desc">Modelo distinto, con acceso real a las mismas herramientas para comprobar afirmaciones en vez de confiar en el texto. Nunca vio el razonamiento del coding agent. Puede bloquear una corrida ya aprobada.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">07</div>
+        <div class="chain-body">
+          <div class="chain-title">Veredicto ejecutado</div>
+          <div class="chain-desc"><b>OK</b> → push real + PR + ticket a revisión. <b>FLAGGED</b> → bloqueo, comentario, rama marcada — nunca se mergea sola. Toda la corrida queda escrita como evidencia en el grafo de conocimiento.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="eyebrow">Por qué esto, y no un framework de agentes</div>
+    <h2>Tres decisiones que no se tomaron por default</h2>
+    <p class="h2-sub">Cada una se evaluó explícitamente contra la alternativa obvia — y se descartó con un motivo concreto, no por inercia.</p>
+    <div class="pillar-grid">
+      <div class="pillar" style="--pillar-color:var(--accent)">
+        <div class="n">01</div>
+        <h3>Reversible por diseño</h3>
+        <p>Nunca actúa sobre la rama principal. Cada escritura y cada comando de shell piden confirmación humana antes de ejecutarse — visible y respondible en vivo, no una casilla que se tildó una vez.</p>
+      </div>
+      <div class="pillar" style="--pillar-color:var(--violet)">
+        <div class="n">02</div>
+        <h3>Adversarial a propósito</h3>
+        <p>El juez y el coding agent son deliberadamente independientes: el juez nunca ve el razonamiento del agente, y nunca puede ser convencido después de decidir. No es una limitación técnica — es la garantía real.</p>
+      </div>
+      <div class="pillar" style="--pillar-color:var(--ok)">
+        <div class="n">03</div>
+        <h3>Memoria institucional real</h3>
+        <p>Cada corrida se escribe como evidencia en un grafo de conocimiento en Neo4j. El próximo agente que toque el mismo componente puede consultar su historial real de riesgo antes de actuar — no arranca de cero cada vez.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="eyebrow">Prueba, no promesa</div>
+    <h2>No se diseñó y quedó ahí — se corrió hasta que funcionó de verdad</h2>
+    <p class="proof-note">Levantar el stack completo end-to-end (Neo4j, SonarQube, Qdrant, Ollama, Prefect, Falco, el firewall) expuso problemas reales de infraestructura que ningún diagrama muestra. Se encontraron y arreglaron en el momento, no se documentaron como "conocidos" y se dejaron:</p>
+    <div class="proof-list">
+      <div class="proof-row"><span class="desc">Conflicto real de dependencias (<b>pydantic</b>/<b>mcp</b>/<b>anyio</b>) que rompía el build de producción</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">4 healthchecks de Docker rotos por herramientas ausentes en las imágenes base</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">Endpoint de búsqueda de Jira dado de baja por Atlassian (<code>410 Gone</code>) en dos módulos</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">Mismatch de nombre de vector entre el indexador propio y el MCP de Qdrant</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">SonarQube mal configurado (base de datos embebida rota) — nunca llegaba a arrancar</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc"><code>.env</code> con valores sin comillas que rompían el arranque de bash silenciosamente</span><span class="fixed">Resuelto</span></div>
+    </div>
+  </section>
+
+  <section class="reveal">
+    <div class="ask-box">
+      <div class="eyebrow">Qué hace falta para pasar de PoC a piloto</div>
+      <h2>No pedimos adoptar un framework nuevo. Pedimos un repo real y una decisión de presupuesto.</h2>
+      <div class="ask-list">
+        <div class="ask-item"><div class="k">Repo objetivo</div><div class="v">Un repositorio real (no <code>sample-repo/</code>) donde el coding agent pueda operar sobre una rama nueva.</div></div>
+        <div class="ask-item"><div class="k">Proyecto Jira</div><div class="v">Permisos de creación de issues confirmados, no solo lectura — el pipeline ya distingue entre ambos.</div></div>
+        <div class="ask-item"><div class="k">Presupuesto de modelo</div><div class="v">Anthropic (mejor calidad de juicio) u Ollama local (gratis, offline) — el fallback en vivo ya está probado entre ambos.</div></div>
+        <div class="ask-item"><div class="k">Arquitectura</div><div class="v">Ya evaluada: LangGraph/CrewAI/AutoGen/Agno no resuelven un problema que este repo no tenga ya resuelto (§13.1 del README).</div></div>
+      </div>
+      <div class="ask-cta"><span>Todo el detalle técnico, paso a paso</span><span class="mono">README.md</span></div>
+    </div>
+  </section>
+
+  <footer>
+    <span>PoC — Agente de código con supervisión humana + AI Firewall local</span>
+    <span>Ver <code>design.html</code> para el esquema de arquitectura completo</span>
+  </footer>
+
+</div>
+
+<script>
+  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){ if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+    }, { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach(function(el){ io.observe(el); });
+  } else {
+    document.querySelectorAll('.reveal').forEach(function(el){ el.classList.add('in'); });
+  }
+</script>
