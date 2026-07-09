@@ -137,17 +137,17 @@ def test_run_coding_agent_blocks_write_before_investigation(monkeypatch, tmp_pat
 
     call_count = {"n": 0}
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
                 {"type": "tool_use", "id": "call_1", "name": "write_file", "input": {"path": "x.txt", "content": "hola"}}
             ]
-            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -162,20 +162,20 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
 
     call_count = {"n": 0}
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
-            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         if call_count["n"] == 2:
             content = [
                 {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo verificado"}}
             ]
-            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo y verificado", "files_changed": []}'}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -190,12 +190,12 @@ def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypa
 
     call_count = {"n": 0}
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         call_count["n"] += 1
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -208,14 +208,14 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         content = [{"type": "text", "text": "esto no es json"}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
     async def fake_json_retry(client, backend, messages, tools, system_prompt):
         return '{"status": "blocked", "summary": "recuperado", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -483,7 +483,7 @@ def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path
 
     call_count = {"n": 0}
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
@@ -494,11 +494,11 @@ def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path
                     "input": {"path": "f.py", "old_string": "original", "new_string": "cambiado"},
                 }
             ]
-            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 

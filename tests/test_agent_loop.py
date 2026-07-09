@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 import agent_loop
-from agent_loop import JSON_CORRECTION_MESSAGE, _final_text_with_json_retry, _post_with_retry
+from agent_loop import JSON_CORRECTION_MESSAGE, _final_text_with_json_retry, _post_with_retry, call_with_fallback
 
 
 def _fake_response(status_code: int) -> MagicMock:
@@ -41,6 +41,18 @@ def test_select_backend_returns_none_when_nothing_available(monkeypatch):
     assert agent_loop._select_backend() == "none"
 
 
+def test_backend_available_false_when_over_budget(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(agent_loop, "is_within_budget", lambda backend: False)
+    assert agent_loop._backend_available("anthropic") is False
+
+
+def test_backend_available_true_when_within_budget(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(agent_loop, "is_within_budget", lambda backend: True)
+    assert agent_loop._backend_available("anthropic") is True
+
+
 def test_select_backend_respects_custom_priority_order(monkeypatch):
     """LLM_BACKEND_PRIORITY="ollama,anthropic" -- si Ollama esta alcanzable,
     gana aunque ANTHROPIC_API_KEY tambien este seteada.
@@ -56,7 +68,21 @@ def test_post_with_retry_retries_on_503_then_succeeds(monkeypatch):
     client = MagicMock()
     client.post = AsyncMock(side_effect=[_fake_response(503), _fake_response(200)])
 
-    resp = asyncio.run(_post_with_retry(client, "http://test", json={}))
+    resp = asyncio.run(_post_with_retry(client, "anthropic", "http://test", json={}))
+
+    assert resp.status_code == 200
+    assert client.post.call_count == 2
+
+
+def test_post_with_retry_retries_on_529_for_anthropic(monkeypatch):
+    """529 ("overloaded") es especifico de Anthropic -- confirma que la
+    politica por backend lo incluye, a diferencia del set global anterior.
+    """
+    monkeypatch.setattr(agent_loop.asyncio, "sleep", AsyncMock())
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=[_fake_response(529), _fake_response(200)])
+
+    resp = asyncio.run(_post_with_retry(client, "anthropic", "http://test", json={}))
 
     assert resp.status_code == 200
     assert client.post.call_count == 2
@@ -68,7 +94,7 @@ def test_post_with_retry_does_not_retry_on_401(monkeypatch):
     client.post = AsyncMock(return_value=_fake_response(401))
 
     with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(_post_with_retry(client, "http://test", json={}))
+        asyncio.run(_post_with_retry(client, "anthropic", "http://test", json={}))
 
     assert client.post.call_count == 1
 
@@ -79,9 +105,9 @@ def test_post_with_retry_gives_up_after_max_retries(monkeypatch):
     client.post = AsyncMock(return_value=_fake_response(503))
 
     with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(_post_with_retry(client, "http://test", json={}))
+        asyncio.run(_post_with_retry(client, "anthropic", "http://test", json={}))
 
-    assert client.post.call_count == agent_loop._MAX_TRANSIENT_RETRIES + 1
+    assert client.post.call_count == agent_loop.RETRY_POLICY_PER_BACKEND["anthropic"]["max_retries"] + 1
 
 
 def test_post_with_retry_retries_on_connection_error_then_succeeds(monkeypatch):
@@ -89,10 +115,50 @@ def test_post_with_retry_retries_on_connection_error_then_succeeds(monkeypatch):
     client = MagicMock()
     client.post = AsyncMock(side_effect=[httpx.ConnectError("boom"), _fake_response(200)])
 
-    resp = asyncio.run(_post_with_retry(client, "http://test", json={}))
+    resp = asyncio.run(_post_with_retry(client, "anthropic", "http://test", json={}))
 
     assert resp.status_code == 200
     assert client.post.call_count == 2
+
+
+def test_call_with_fallback_falls_back_to_next_backend_on_failure(monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
+    monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: True)
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+        if backend == "anthropic":
+            raise httpx.HTTPStatusError("error", request=httpx.Request("POST", "http://test"), response=_fake_response(401))
+        return [{"type": "text", "text": "ok"}], "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
+
+    blocks, stop_reason, usage, backend_used = asyncio.run(
+        call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys")
+    )
+
+    assert backend_used == "ollama"
+    assert stop_reason == "end_turn"
+
+
+def test_call_with_fallback_reraises_when_all_backends_fail(monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
+    monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: True)
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+        raise RuntimeError(f"{backend} esta caido")
+
+    monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
+
+    with pytest.raises(RuntimeError, match="esta caido"):
+        asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
+
+
+def test_call_with_fallback_raises_when_no_backend_available(monkeypatch):
+    monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
+    monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: False)
+
+    with pytest.raises(RuntimeError, match="ningun backend"):
+        asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):

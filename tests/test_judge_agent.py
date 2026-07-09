@@ -261,7 +261,7 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
 
     call_count = {"n": 0}
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
@@ -272,7 +272,7 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
                     "input": {"component": "AuthService"},
                 }
             ]
-            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         content = [
             {
                 "type": "text",
@@ -282,9 +282,9 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
                 ),
             }
         ]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
 
     with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
         mock_get_issues.return_value = {"issues": []}
