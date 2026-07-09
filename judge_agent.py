@@ -67,6 +67,7 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
 )
 from firewall_proxy import _redact
 from log_utils import get_logger
+from pipeline_shared import RETRYABLE_POLICY_REFERENCES
 
 load_dotenv()
 
@@ -93,15 +94,10 @@ JUDGE_POLICY_IDS = [
     "other",
 ]
 
-# Subconjunto de JUDGE_POLICY_IDS que el pipeline puede intentar corregir
-# automaticamente con un segundo intento del coding agent (ver
-# retry_coding_agent_with_feedback() en run_poc_loop.sh / _retry_local_diff()
-# en orchestration.py) -- deliberadamente NO incluye data-leak-evidence,
-# jailbreak-evidence, firewall-false-negative ni other: esos son de
-# seguridad o ambiguos, siempre van directo a bloqueo + revision humana, un
-# reintento automatico ahi seria el agente tratando de "arreglar" un
-# problema de seguridad sin supervision.
-RETRYABLE_POLICY_REFERENCES = {"scope-mismatch", "insufficient-test-coverage", "graph-impact-unverified"}
+# RETRYABLE_POLICY_REFERENCES ahora vive en pipeline_shared.py (fuente
+# unica -- antes estaba definida acá Y duplicada en orchestration.py Y en un
+# array bash en run_poc_loop.sh; la copia de bash no tenia test de
+# sincronia hasta que se encontro el gap esta sesion).
 
 _FALLBACK_JUDGE_POLICY_TEXT = """| id | Criterio |
 |---|---|

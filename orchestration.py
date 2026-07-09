@@ -54,10 +54,15 @@ from prefect import flow, get_run_logger, task
 
 import epic_planner
 import graph_writer
+import jira_client
 import output_guard
 from firewall_proxy import _redact
+from log_utils import get_logger
+from pipeline_shared import RETRYABLE_POLICY_REFERENCES
 
 load_dotenv()
+
+logger = get_logger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
@@ -73,12 +78,8 @@ FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
 # Falco); FALCO_ALERT_WEBHOOK_URL sigue funcionando como alias retrocompatible.
 ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL") or os.environ.get("FALCO_ALERT_WEBHOOK_URL", "")
 
-# Debe mantenerse sincronizado con RETRYABLE_POLICY_REFERENCES en
-# judge_agent.py (se duplica en vez de importarse porque judge_agent.py se
-# invoca como subprocess aca, no se importa). Deliberadamente NO incluye
-# data-leak-evidence/jailbreak-evidence/firewall-false-negative/other: esos
-# son de seguridad o ambiguos, nunca se reintentan automaticamente.
-RETRYABLE_POLICY_REFERENCES = {"scope-mismatch", "insufficient-test-coverage", "graph-impact-unverified"}
+# Importado de pipeline_shared.py (fuente unica) -- antes estaba duplicada
+# a mano acá Y en judge_agent.py Y en un array bash en run_poc_loop.sh.
 
 
 def post_alert_webhook(text: str):
@@ -138,13 +139,17 @@ def check_dirty_tree(target_repo_dir: str):
 
 
 @task(retries=1, retry_delay_seconds=5, name="discover-known-components")
-def discover_known_components():
+def discover_known_components() -> list:
     """Best-effort: derive the known-components set from whatever node
     names already exist in the real Neo4j graph, instead of relying only on
     the static JIRA_KNOWN_COMPONENTS list in .env staying in sync with it.
-    Mutates os.environ so the fetch_jira_ticket() subprocess (python3
-    jira_client.py) inherits it. If Neo4j isn't reachable, this leaves
-    JIRA_KNOWN_COMPONENTS as whatever was already in the environment.
+    Devuelve la lista para que el llamador se la pase directo a
+    jira_client.fetch_ticket_live()/fetch_epic_with_children() como
+    argumento -- ya no muta os.environ (eso solo hacia falta cuando
+    fetch_jira_ticket() invocaba jira_client.py como subprocess aparte, que
+    heredaba el entorno; ahora es un import directo). Si Neo4j no esta
+    alcanzable, devuelve [] y el llamador cae al KNOWN_REPOS por default de
+    jira_client.py.
     """
     neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
@@ -157,17 +162,17 @@ def discover_known_components():
             ]
         )
     except RuntimeError:
-        return
+        return []
 
     names = [line.strip().strip('"') for line in output.splitlines()[1:] if line.strip()]
     if names:
-        os.environ["JIRA_KNOWN_COMPONENTS"] = ",".join(names)
-        print(f"Componentes conocidos derivados del grafo Neo4j: {os.environ['JIRA_KNOWN_COMPONENTS']}")
+        print(f"Componentes conocidos derivados del grafo Neo4j: {','.join(names)}")
+    return names
 
 
 @task(retries=2, retry_delay_seconds=5, name="fetch-jira-ticket")
-def fetch_jira_ticket() -> dict:
-    return json.loads(_run(["python3", "jira_client.py"]))
+def fetch_jira_ticket(known_components: list | None = None) -> dict:
+    return jira_client.fetch_ticket_live(known_repos=set(known_components) if known_components else None)
 
 
 @task(name="attachments-gate")
@@ -264,14 +269,23 @@ def evaluate_firewall(prompt: str, jira_context: dict, sonar_errors: list) -> di
 
 @task(retries=2, retry_delay_seconds=5, name="transition-jira")
 def transition_jira(status: str, ticket_key: str | None = None):
-    env = {"JIRA_TICKET_KEY": ticket_key} if ticket_key else None
-    _run(["python3", "jira_client.py", "transition", status], check=False, env=env)
+    key = ticket_key or os.environ["JIRA_TICKET_KEY"]
+    try:
+        jira_client.transition_ticket(key, status)
+    except Exception as exc:
+        # Best-effort (igual que antes, con check=False) pero YA NO en
+        # silencio -- antes un fallo real de Jira (nombre de transicion
+        # invalido, red caida) desaparecia sin dejar rastro.
+        logger.warning(f"No se pudo transicionar el ticket {key} a '{status}': {exc}")
 
 
 @task(retries=2, retry_delay_seconds=5, name="comment-jira")
 def comment_jira(text: str, ticket_key: str | None = None):
-    env = {"JIRA_TICKET_KEY": ticket_key} if ticket_key else None
-    _run(["python3", "jira_client.py", "comment", text], check=False, env=env)
+    key = ticket_key or os.environ["JIRA_TICKET_KEY"]
+    try:
+        jira_client.post_audit_comment(key, text)
+    except Exception as exc:
+        logger.warning(f"No se pudo comentar en el ticket {key}: {exc}")
 
 
 @task(retries=0, name="push-and-open-pr")
@@ -311,6 +325,35 @@ def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket
     return {"pushed": True, "pr_url": pr_result.stdout.strip(), "reason": None}
 
 
+def check_copilot_assignable(repo: str, assignee: str) -> str:
+    """Repository.suggestedActors (capability CAN_BE_ASSIGNED) -- antes esto
+    solo se sabia DESPUES de crear un issue y que la asignacion fallara.
+    Devuelve "yes"/"no"/"unknown" -- best-effort total, cualquier fallo de
+    la query (auth, red, schema) cae a "unknown", nunca lanza.
+    """
+    owner, _, name = repo.partition("/")
+    query = """
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+          nodes { login }
+        }
+      }
+    }"""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return "unknown"
+        data = json.loads(result.stdout)
+        logins = {n["login"] for n in data["data"]["repository"]["suggestedActors"]["nodes"]}
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "unknown"
+    return "yes" if assignee in logins else "no"
+
+
 @task(retries=1, name="coding-agent-cloud")
 def run_coding_agent_cloud(ticket_id: str, summary: str, sanitized_prompt: str) -> dict:
     issue_body = (
@@ -325,6 +368,19 @@ def run_coding_agent_cloud(ticket_id: str, summary: str, sanitized_prompt: str) 
     issue_body, redactions_applied = _redact(issue_body)
     if redactions_applied:
         print(f"output_guard (Camino A): {redactions_applied} redaccion(es) aplicada(s) al issue_body antes de publicarlo.")
+
+    # Diagnostico ANTES de crear el issue -- si "no", probablemente la
+    # asignacion de abajo va a fallar; se avisa temprano pero se intenta
+    # igual (el chequeo puede tener falsos negativos por permisos del
+    # token, y crear-igual-y-reportar-si-falla sigue siendo la red de
+    # seguridad real).
+    if check_copilot_assignable(GITHUB_REPO, GITHUB_COPILOT_ASSIGNEE) == "no":
+        print(
+            f"⚠️ '{GITHUB_COPILOT_ASSIGNEE}' no aparece como asignable en {GITHUB_REPO} -- la asignacion de abajo "
+            "probablemente falle. Revisa Settings > Copilot > Coding agent en GitHub (requiere plan "
+            "Business/Enterprise). Se intenta igual."
+        )
+
     issue_url = _run(["gh", "issue", "create", "--repo", GITHUB_REPO, "--title", summary, "--body", issue_body]).strip()
     assigned = True
     try:
@@ -541,8 +597,8 @@ def run_tests(target_repo_dir: str) -> dict:
 
 
 @task(retries=1, retry_delay_seconds=5, name="fetch-epic")
-def fetch_epic(epic_key: str) -> dict:
-    return json.loads(_run(["python3", "jira_client.py", "fetch-epic", epic_key]))
+def fetch_epic(epic_key: str, known_components: list | None = None) -> dict:
+    return jira_client.fetch_epic_with_children(epic_key, known_repos=set(known_components) if known_components else None)
 
 
 @task(retries=0, name="plan-epic")
@@ -1095,9 +1151,9 @@ def run_pipeline():
     check_dirty_tree(target_repo_dir)
     logger.info(f"Repo objetivo detectado: {target_repo_dir}")
 
-    discover_known_components()
+    known_components = discover_known_components()
 
-    ticket = fetch_jira_ticket()
+    ticket = fetch_jira_ticket(known_components)
     component = ticket["repository_origen"]
     logger.info(f"Ticket {ticket['ticket_id']} — componente {component}")
 
@@ -1149,9 +1205,9 @@ def run_epic_pipeline(epic_key: str):
     check_dirty_tree(target_repo_dir)
     logger.info(f"Repo objetivo detectado: {target_repo_dir}")
 
-    discover_known_components()
+    known_components = discover_known_components()
 
-    epic_data = fetch_epic(epic_key)
+    epic_data = fetch_epic(epic_key, known_components)
     epic = epic_data["epic"]
     children = epic_data["children"]
     logger.info(f"Epica {epic_key} — {len(children)} hijos")

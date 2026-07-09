@@ -158,17 +158,25 @@ def _fetch_rovo_attachment_context(jira_url: str, headers: dict, ticket_key: str
     }
 
 
-def _resolve_repository_origen(fields: dict) -> str | None:
+def _resolve_repository_origen(fields: dict, known_repos: set | None = None) -> str | None:
     """Prefer the native Components field (what it's actually for); fall
     back to labels for tickets/projects that only use those. Shared by
     fetch_ticket_live() and fetch_epic_with_children() so both resolve
     repository_origen the exact same way.
+
+    known_repos overrides the module-level KNOWN_REPOS (frozen at import
+    time from JIRA_KNOWN_COMPONENTS) -- callers that discover the real set
+    at runtime (orchestration.py's discover_known_components(), querying
+    Neo4j) can pass it here directly instead of mutating os.environ before
+    a subprocess re-import, which was the only way to make it take effect
+    when this ran exclusively as a CLI subprocess.
     """
+    repos = known_repos if known_repos is not None else KNOWN_REPOS
     labels = fields.get("labels", []) or []
     components = [c.get("name") for c in (fields.get("components") or []) if c.get("name")]
     return (
-        next((c for c in components if c in KNOWN_REPOS), None)
-        or next((lbl for lbl in labels if lbl in KNOWN_REPOS), None)
+        next((c for c in components if c in repos), None)
+        or next((lbl for lbl in labels if lbl in repos), None)
     )
 
 
@@ -179,9 +187,15 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
 
-def fetch_ticket_live() -> dict:
+def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = None) -> dict:
+    """ticket_key/known_repos, si se pasan, tienen prioridad sobre
+    JIRA_TICKET_KEY/KNOWN_REPOS -- permite que orchestration.py llame esto
+    directo (import) pasando el ticket y los componentes ya descubiertos de
+    Neo4j como argumentos reales, en vez de mutar os.environ antes de
+    invocar esto como subprocess (que sigue funcionando igual via main()).
+    """
     jira_url = os.environ["JIRA_URL"].rstrip("/")
-    ticket_key = os.environ["JIRA_TICKET_KEY"]
+    ticket_key = ticket_key or os.environ["JIRA_TICKET_KEY"]
     headers = _auth_headers()
 
     def _fetch():
@@ -207,7 +221,7 @@ def fetch_ticket_live() -> dict:
         "description": description_text,
         "labels": fields.get("labels", []) or [],
         "components": [c.get("name") for c in (fields.get("components") or []) if c.get("name")],
-        "repository_origen": _resolve_repository_origen(fields),
+        "repository_origen": _resolve_repository_origen(fields, known_repos),
         "status": (fields.get("status") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
         "figma_link": _extract_figma_link(description_text),
@@ -215,7 +229,7 @@ def fetch_ticket_live() -> dict:
     }
 
 
-def fetch_epic_with_children(epic_key: str) -> dict:
+def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> dict:
     """Fetches an Epic and its child issues, each with repository_origen
     already resolved -- used by --epic mode (run_poc_loop.sh/orchestration.py)
     to build one combined prompt instead of processing children one by one.
@@ -248,7 +262,7 @@ def fetch_epic_with_children(epic_key: str) -> dict:
         "ticket_id": epic_issue.get("key"),
         "summary": epic_fields.get("summary", ""),
         "description": _adf_to_text(epic_fields.get("description")).strip(),
-        "repository_origen": _resolve_repository_origen(epic_fields),
+        "repository_origen": _resolve_repository_origen(epic_fields, known_repos),
     }
 
     jql_template = os.environ.get("JIRA_EPIC_LINK_JQL", 'parent = "{epic_key}"')
@@ -269,7 +283,7 @@ def fetch_epic_with_children(epic_key: str) -> dict:
             "ticket_id": issue.get("key"),
             "summary": issue.get("fields", {}).get("summary", ""),
             "description": _adf_to_text(issue.get("fields", {}).get("description")).strip(),
-            "repository_origen": _resolve_repository_origen(issue.get("fields", {})),
+            "repository_origen": _resolve_repository_origen(issue.get("fields", {}), known_repos),
         }
         for issue in search_resp.json().get("issues", [])
     ]

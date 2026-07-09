@@ -27,6 +27,7 @@ times /evaluate can be called in RATE_LIMIT_WINDOW_SECONDS, so the endpoint
 isn't wide open to abuse now that it's reachable on the host network.
 """
 import collections
+import hmac
 import json
 import os
 import re
@@ -81,7 +82,10 @@ if not FIREWALL_API_KEY:
 
 
 def require_api_key(x_firewall_key: Optional[str] = Header(default=None)):
-    if FIREWALL_API_KEY and x_firewall_key != FIREWALL_API_KEY:
+    # hmac.compare_digest en vez de != -- evita un timing attack teorico
+    # que podria inferir la key byte a byte comparando cuanto tarda cada
+    # intento fallido.
+    if FIREWALL_API_KEY and not hmac.compare_digest(x_firewall_key or "", FIREWALL_API_KEY):
         raise HTTPException(status_code=401, detail="missing_or_invalid_x_firewall_key")
 
 

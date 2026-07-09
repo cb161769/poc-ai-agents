@@ -5,6 +5,8 @@ No real Neo4j/Jira/coding-agent network calls -- every Prefect task the
 retry path touches is monkeypatched at the module level.
 """
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -59,6 +61,7 @@ def test_retry_local_diff_returns_new_verdict_when_retry_applies_changes(monkeyp
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
 
     result = _retry_local_diff(
@@ -137,6 +140,7 @@ def test_retry_local_diff_passes_conversation_file_when_present(monkeypatch):
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
 
     agent_result_with_conversation = {**_AGENT_RESULT, "conversation_file": "/tmp/some_conversation.json"}
@@ -166,6 +170,7 @@ def test_retry_local_diff_falls_back_to_full_prompt_without_conversation_file(mo
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
 
     _retry_local_diff(
@@ -176,6 +181,61 @@ def test_retry_local_diff_falls_back_to_full_prompt_without_conversation_file(mo
 
     assert captured["conversation_file"] is None
     assert "prompt original" in captured["feedback_text"]
+
+
+def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):
+    class R:
+        returncode = 0
+        stdout = json.dumps({"data": {"repository": {"suggestedActors": {"nodes": [{"login": "copilot-swe-agent"}]}}}})
+        stderr = ""
+
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: R())
+
+    assert orchestration.check_copilot_assignable("org/repo", "copilot-swe-agent") == "yes"
+
+
+def test_check_copilot_assignable_returns_no_when_login_absent(monkeypatch):
+    class R:
+        returncode = 0
+        stdout = json.dumps({"data": {"repository": {"suggestedActors": {"nodes": [{"login": "some-other-bot"}]}}}})
+        stderr = ""
+
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: R())
+
+    assert orchestration.check_copilot_assignable("org/repo", "copilot-swe-agent") == "no"
+
+
+def test_check_copilot_assignable_returns_unknown_on_query_failure(monkeypatch):
+    class R:
+        returncode = 1
+        stdout = ""
+        stderr = "HTTP 401"
+
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: R())
+
+    assert orchestration.check_copilot_assignable("org/repo", "copilot-swe-agent") == "unknown"
+
+
+def test_run_coding_agent_cloud_still_creates_issue_when_not_assignable(monkeypatch):
+    """El chequeo proactivo es solo diagnostico -- si dice "no", igual se
+    intenta crear el issue y asignar (puede ser un falso negativo de
+    permisos del token), nada del contrato/comportamiento cambia.
+    """
+    captured_cmds = []
+
+    def fake_run(cmd, input_text=None, check=True, env=None):
+        captured_cmds.append(cmd)
+        if cmd[:2] == ["gh", "issue"] and "create" in cmd:
+            return "https://github.com/org/repo/issues/1"
+        return ""
+
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+    monkeypatch.setattr(orchestration, "check_copilot_assignable", lambda *a, **k: "no")
+
+    result = orchestration.run_coding_agent_cloud.fn("T-1", "Fix login", "hace algo")
+
+    assert result["issue_url"] == "https://github.com/org/repo/issues/1"
+    assert any(cmd[:2] == ["gh", "issue"] and "create" in cmd for cmd in captured_cmds)
 
 
 def test_run_coding_agent_cloud_redacts_secret_from_issue_body(monkeypatch):
@@ -193,6 +253,7 @@ def test_run_coding_agent_cloud_redacts_secret_from_issue_body(monkeypatch):
         return ""
 
     monkeypatch.setattr(orchestration, "_run", fake_run)
+    monkeypatch.setattr(orchestration, "check_copilot_assignable", lambda *a, **k: "unknown")
 
     orchestration.run_coding_agent_cloud.fn(
         "T-1", "Rotar password", 'private static final String DB_PASSWORD = "password=Sup3rS3cr3tDbP4ss!";'
@@ -334,6 +395,81 @@ def test_push_and_open_pr_pushes_and_creates_pr(monkeypatch):
     assert "--base" in pr_cmd and "main" in pr_cmd
 
 
+def test_comment_jira_calls_jira_client_directly(monkeypatch):
+    """comment_jira() ya no shellea a 'python3 jira_client.py comment' --
+    importa jira_client y llama post_audit_comment() directo."""
+    captured = {}
+    monkeypatch.setattr(
+        orchestration.jira_client, "post_audit_comment",
+        lambda ticket_key, text: captured.update(ticket_key=ticket_key, text=text),
+    )
+
+    orchestration.comment_jira.fn("hola", ticket_key="T-1")
+
+    assert captured == {"ticket_key": "T-1", "text": "hola"}
+
+
+def test_comment_jira_logs_instead_of_raising_on_failure(monkeypatch):
+    """Antes un fallo real de Jira en comment_jira/transition_jira
+    desaparecia en silencio (subprocess con check=False, resultado
+    descartado) -- ahora se loggea, sin dejar de ser best-effort (no
+    levanta excepcion, no bloquea la corrida). log_utils.get_logger() usa
+    propagate=False, asi que caplog no lo captura -- se mockea logger.warning
+    directo.
+    """
+    def fake_post(ticket_key, text):
+        raise RuntimeError("Jira esta caido")
+
+    warnings = []
+    monkeypatch.setattr(orchestration.jira_client, "post_audit_comment", fake_post)
+    monkeypatch.setattr(orchestration.logger, "warning", lambda msg: warnings.append(msg))
+
+    orchestration.comment_jira.fn("hola", ticket_key="T-1")  # no debe lanzar
+
+    assert any("Jira esta caido" in w for w in warnings)
+
+
+def test_transition_jira_calls_jira_client_directly(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        orchestration.jira_client, "transition_ticket",
+        lambda ticket_key, status: captured.update(ticket_key=ticket_key, status=status),
+    )
+
+    orchestration.transition_jira.fn("Blocked", ticket_key="T-1")
+
+    assert captured == {"ticket_key": "T-1", "status": "Blocked"}
+
+
+def test_fetch_jira_ticket_passes_known_components_to_jira_client(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        orchestration.jira_client, "fetch_ticket_live",
+        lambda known_repos=None: captured.update(known_repos=known_repos) or {"ticket_id": "T-1"},
+    )
+
+    orchestration.fetch_jira_ticket.fn(["AuthService", "Frontend"])
+
+    assert captured["known_repos"] == {"AuthService", "Frontend"}
+
+
+def test_discover_known_components_returns_list_without_mutating_environ(monkeypatch):
+    """discover_known_components() ya no muta os.environ (esa mutacion solo
+    hacia falta cuando fetch_jira_ticket() invocaba jira_client.py como
+    subprocess aparte, que heredaba el entorno) -- ahora devuelve la lista
+    y el llamador se la pasa directo como argumento."""
+    monkeypatch.delenv("JIRA_KNOWN_COMPONENTS", raising=False)
+    monkeypatch.setattr(
+        orchestration, "_run",
+        lambda *a, **k: 'header\n"AuthService"\n"Frontend"\n',
+    )
+
+    result = orchestration.discover_known_components.fn()
+
+    assert result == ["AuthService", "Frontend"]
+    assert "JIRA_KNOWN_COMPONENTS" not in os.environ
+
+
 def test_retryable_policy_references_matches_judge_agent():
     """orchestration.py duplica esta constante (judge_agent.py se invoca
     como subprocess, no se importa) -- este test es la red de seguridad
@@ -344,22 +480,31 @@ def test_retryable_policy_references_matches_judge_agent():
     assert orchestration.RETRYABLE_POLICY_REFERENCES == judge_agent.RETRYABLE_POLICY_REFERENCES
 
 
-def test_retryable_policy_refs_bash_array_matches_judge_agent():
-    """run_poc_loop.sh duplica la MISMA constante una tercera vez, como un
-    array bash (RETRYABLE_POLICY_REFS) -- a diferencia del duplicado de
-    orchestration.py, este no tenia ningun test protegiendolo contra drift.
-    Se lee el archivo como texto (sin ejecutar bash) para no arrastrar los
-    efectos secundarios de nivel de script de run_poc_loop.sh.
+def test_run_poc_loop_reads_retryable_policy_refs_from_pipeline_shared():
+    """run_poc_loop.sh solia duplicar RETRYABLE_POLICY_REFERENCES a mano como
+    un array bash, sin ningun test protegiendolo contra drift -- ahora lo
+    deriva de pipeline_shared.py (la misma fuente que judge_agent.py/
+    orchestration.py importan), eliminando la duplicacion de raiz. Se lee el
+    archivo como texto (sin ejecutar bash) para no arrastrar los efectos
+    secundarios de nivel de script de run_poc_loop.sh -- solo confirma que
+    ya no hay un array hardcodeado y que se usa pipeline_shared.py.
     """
-    import re
-
-    import judge_agent
-
     script_path = Path(__file__).resolve().parent.parent / "run_poc_loop.sh"
     script_text = script_path.read_text(encoding="utf-8")
 
-    match = re.search(r"RETRYABLE_POLICY_REFS=\(([^)]*)\)", script_text)
-    assert match is not None, "no se encontro el array RETRYABLE_POLICY_REFS en run_poc_loop.sh"
+    assert "RETRYABLE_POLICY_REFS=(scope-mismatch" not in script_text, "no deberia quedar un array hardcodeado"
+    assert "pipeline_shared.py" in script_text and "retryable-policy-references" in script_text
 
-    bash_refs = set(match.group(1).split())
-    assert bash_refs == judge_agent.RETRYABLE_POLICY_REFERENCES
+
+def test_pipeline_shared_cli_prints_retryable_policy_references(capsys):
+    import pipeline_shared
+
+    sys_argv_backup = sys.argv
+    sys.argv = ["pipeline_shared.py", "retryable-policy-references"]
+    try:
+        pipeline_shared.main()
+    finally:
+        sys.argv = sys_argv_backup
+
+    printed = set(capsys.readouterr().out.split())
+    assert printed == pipeline_shared.RETRYABLE_POLICY_REFERENCES

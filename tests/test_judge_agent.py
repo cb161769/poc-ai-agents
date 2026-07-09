@@ -248,14 +248,14 @@ def test_build_user_prompt_omits_falco_section_without_alerts():
 def test_build_user_prompt_includes_conflicts_section_when_present():
     prompt = _build_user_prompt(_base_judge_payload(conflicts=["AuthService y Frontend tocan el mismo endpoint"]))
 
-    assert "Conflictos" in prompt
+    assert "conflictos potenciales" in prompt
     assert "AuthService y Frontend tocan el mismo endpoint" in prompt
 
 
 def test_build_user_prompt_omits_conflicts_section_when_absent():
     prompt = _build_user_prompt(_base_judge_payload())
 
-    assert "conflictos potenciales" not in prompt.lower() or "Conflictos" not in prompt
+    assert "conflictos potenciales" not in prompt
 
 
 def test_build_user_prompt_includes_new_sonar_issues_section_when_present():

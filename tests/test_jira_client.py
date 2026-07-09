@@ -130,6 +130,39 @@ def test_fetch_ticket_live_falls_back_to_labels_when_no_matching_component(mock_
     assert ticket["repository_origen"] == "Frontend"
 
 
+@patch("jira_client.httpx.get")
+def test_fetch_ticket_live_ticket_key_param_overrides_env(mock_get, monkeypatch):
+    """orchestration.py llama fetch_ticket_live() directo (import, no
+    subprocess) pasando ticket_key explicito -- confirma que tiene prioridad
+    sobre JIRA_TICKET_KEY, asi ya no hace falta mutar os.environ antes.
+    """
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setenv("JIRA_TICKET_KEY", "T-DEL-ENV")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService"})
+    mock_get.return_value = _fake_issue_response(components=["AuthService"], labels=[])
+
+    jira_client.fetch_ticket_live(ticket_key="T-EXPLICITO")
+
+    called_url = mock_get.call_args[0][0]
+    assert "T-EXPLICITO" in called_url
+    assert "T-DEL-ENV" not in called_url
+
+
+@patch("jira_client.httpx.get")
+def test_fetch_ticket_live_known_repos_param_overrides_module_default(mock_get, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"Frontend"})
+    mock_get.return_value = _fake_issue_response(components=["DataWorker"], labels=[])
+
+    ticket = jira_client.fetch_ticket_live(ticket_key="T-1", known_repos={"DataWorker"})
+
+    assert ticket["repository_origen"] == "DataWorker"
+
+
 def test_build_smoke_ticket_payload_shape(monkeypatch):
     monkeypatch.setenv("JIRA_PROJECT_KEY", "POC")
     monkeypatch.setenv("JIRA_SMOKE_TEST_ISSUE_TYPE", "Bug")

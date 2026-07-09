@@ -154,6 +154,13 @@ def test_evaluate_requires_header_when_api_key_configured(tmp_path, monkeypatch)
             "/evaluate", json=_payload("cambio inofensivo"), headers={"X-Firewall-Key": "test-secret-key"}
         )
         assert right_header.status_code == 200
+
+        # Misma longitud que la key real (hmac.compare_digest en vez de !=
+        # -- confirma que sigue rechazando, no solo que el timing es constante).
+        same_length_wrong = reloaded_client.post(
+            "/evaluate", json=_payload("cambio inofensivo"), headers={"X-Firewall-Key": "test-secret-kex"}
+        )
+        assert same_length_wrong.status_code == 401
     finally:
         # Restore the module to its unauthenticated state for any test that
         # runs after this one in the same process.

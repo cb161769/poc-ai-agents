@@ -235,11 +235,11 @@ record_run_in_graph() {
 }
 
 # Criterios de policy_reference que el juez puede marcar y que el coding
-# agent tiene chance real de corregir -- debe mantenerse sincronizado con
-# RETRYABLE_POLICY_REFERENCES en judge_agent.py. Deliberadamente NO incluye
-# data-leak-evidence/jailbreak-evidence/firewall-false-negative/other: esos
-# son de seguridad o ambiguos, nunca se reintentan automaticamente.
-RETRYABLE_POLICY_REFS=(scope-mismatch insufficient-test-coverage graph-impact-unverified)
+# agent tiene chance real de corregir -- se leen de pipeline_shared.py (la
+# MISMA fuente que usa judge_agent.py/orchestration.py) en vez de un array
+# bash hardcodeado a mano, que se desincronizo sin que nadie lo notara hasta
+# que se le agrego un test especifico.
+mapfile -t RETRYABLE_POLICY_REFS < <(python3 "${SCRIPT_DIR}/pipeline_shared.py" retryable-policy-references)
 
 # Borra el archivo temporal de conversacion del coding agent (Camino B1) si
 # todavia esta ahi -- se llama en cada punto donde una corrida llega a un
@@ -571,6 +571,35 @@ run_tests_gate() {
 # GitHub. Best-effort: si el repo objetivo no tiene un remote real (o git/gh
 # fallan), se omite sin bloquear la corrida -- el veredicto del juez ya fue
 # OK, la rama sigue intacta para pushear a mano.
+# Misma consulta GraphQL que scripts/check_prereqs.sh (Repository.
+# suggestedActors con capability CAN_BE_ASSIGNED) -- antes de crear el
+# issue, no solo despues de que la asignacion falle. "yes"/"no"/"unknown",
+# best-effort: cualquier fallo cae a "unknown", nunca bloquea la corrida.
+check_copilot_assignable() {
+  local repo="$1" assignee="$2"
+  local owner name response
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+
+  if ! response=$(gh api graphql -f query='
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+          nodes { login }
+        }
+      }
+    }' -f owner="${owner}" -f name="${name}" 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+
+  if echo "${response}" | jq -e --arg login "${assignee}" '.data.repository.suggestedActors.nodes[]? | select(.login == $login)' >/dev/null 2>&1; then
+    echo "yes"
+  else
+    echo "no"
+  fi
+}
+
 push_and_open_pr() {
   local branch="$1"
 
@@ -940,6 +969,15 @@ EOF
       if [ -n "${issue_guard_result}" ] && [ "${issue_redactions}" != "0" ]; then
         echo "output_guard (Camino A): ${issue_redactions} redaccion(es) aplicada(s) al issue_body antes de publicarlo."
         issue_body=$(echo "${issue_guard_result}" | jq -r '.redacted_text')
+      fi
+
+      # Diagnostico ANTES de crear el issue -- si "no", probablemente la
+      # asignacion de abajo va a fallar; se avisa temprano pero se intenta
+      # igual (el chequeo puede tener falsos negativos por permisos del
+      # token, y crear-igual-y-reportar-si-falla sigue siendo la red de
+      # seguridad real).
+      if [ "$(check_copilot_assignable "${GITHUB_REPO}" "${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}")" = "no" ]; then
+        echo "⚠️  '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}' no aparece como asignable en ${GITHUB_REPO} -- la asignacion de abajo probablemente falle. Revisa Settings > Copilot > Coding agent en GitHub (requiere plan Business/Enterprise). Se intenta igual."
       fi
 
       issue_url=$(gh issue create --repo "${GITHUB_REPO}" --title "${SUMMARY}" --body "${issue_body}") \

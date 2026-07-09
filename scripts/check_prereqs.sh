@@ -16,6 +16,7 @@ fi
 
 PASS="✅"
 FAIL="❌"
+WARN="⚠️"
 overall_ok=1
 
 check() {
@@ -27,6 +28,43 @@ check() {
   else
     printf "  %s  %s %s\n" "${FAIL}" "${label}" "${detail}"
     overall_ok=0
+  fi
+}
+
+warn() {
+  printf "  %s  %s\n" "${WARN}" "$1"
+}
+
+# Consulta GraphQL real (Repository.suggestedActors con capability
+# CAN_BE_ASSIGNED) para saber si el Copilot coding agent esta realmente
+# habilitado y asignable en el repo -- antes esto solo se descubria DESPUES
+# de crear un issue y que la asignacion fallara (prueba y error). Devuelve
+# por stdout uno de: "yes" (el login aparece como asignable), "no" (la
+# query corrio bien pero no aparece -- no habilitado o sin permisos),
+# "unknown" (la query en si fallo -- token sin scope, red, etc). Nunca
+# hace fallar el script que la llama.
+check_copilot_assignable() {
+  local repo="$1" assignee="$2"
+  local owner name response
+  owner="${repo%%/*}"
+  name="${repo#*/}"
+
+  if ! response=$(gh api graphql -f query='
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+          nodes { login }
+        }
+      }
+    }' -f owner="${owner}" -f name="${name}" 2>/dev/null); then
+    echo "unknown"
+    return 0
+  fi
+
+  if echo "${response}" | jq -e --arg login "${assignee}" '.data.repository.suggestedActors.nodes[]? | select(.login == $login)' >/dev/null 2>&1; then
+    echo "yes"
+  else
+    echo "no"
   fi
 }
 
@@ -108,6 +146,22 @@ fi
 if [ -n "${GITHUB_REPO:-}" ]; then
   if command -v gh >/dev/null 2>&1 && gh repo view "${GITHUB_REPO}" >/dev/null 2>&1; then
     printf "  %s  %s\n" "${PASS}" "GITHUB_REPO accesible (${GITHUB_REPO}) — run_poc_loop.sh usara el coding agent real"
+
+    # Antes esto solo se sabia DESPUES de crear un issue y que la
+    # asignacion fallara -- ahora se verifica de antemano si el bot
+    # realmente aparece como asignable en el repo.
+    assignable=$(check_copilot_assignable "${GITHUB_REPO}" "${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}")
+    case "${assignable}" in
+      yes)
+        printf "  %s  %s\n" "${PASS}" "Copilot coding agent habilitado y asignable en ${GITHUB_REPO}"
+        ;;
+      no)
+        warn "el repo es accesible pero '${GITHUB_COPILOT_ASSIGNEE:-copilot-swe-agent}' no aparece como asignable — revisa Settings > Copilot > Coding agent en GitHub, y que el plan sea Business/Enterprise"
+        ;;
+      *)
+        warn "no se pudo confirmar si Copilot coding agent esta habilitado en ${GITHUB_REPO} (verificalo manualmente)"
+        ;;
+    esac
   else
     check "GITHUB_REPO accesible (${GITHUB_REPO})" "1" "(verifica el nombre owner/repo y que gh este autenticado con acceso)"
   fi
