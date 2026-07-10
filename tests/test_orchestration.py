@@ -12,7 +12,16 @@ from pathlib import Path
 import pytest
 
 import orchestration
-from orchestration import PipelineBlocked, _check_not_epic, _format_conflicts_section, _resolve_single_repo, _retry_local_diff
+from orchestration import (
+    PipelineBlocked,
+    _check_not_epic,
+    _comment_all,
+    _format_conflicts_section,
+    _handle_rejected,
+    _resolve_single_repo,
+    _retry_local_diff,
+    _transition_all,
+)
 
 
 def test_resolve_single_repo_ok_when_all_agree():
@@ -181,6 +190,260 @@ def test_retry_local_diff_falls_back_to_full_prompt_without_conversation_file(mo
 
     assert captured["conversation_file"] is None
     assert "prompt original" in captured["feedback_text"]
+
+
+def test_retry_local_diff_mirrors_blocked_transition_to_epic_children(monkeypatch):
+    """En modo epica, un bloqueo dentro del segundo intento (tests reales
+    fallando de nuevo) tiene que dejar BLOCKED tanto a la epica como a cada
+    hijo -- antes del fan-out, solo se transicionaba el ticket_id (la
+    epica), y los hijos se quedaban visualmente sin cambios.
+    """
+    transitioned = []
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "anthropic"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo de nuevo"})
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    with pytest.raises(PipelineBlocked):
+        _retry_local_diff(
+            "EPIC-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+            {"ticket_id": "EPIC-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+            True, ["CHILD-1", "CHILD-2"], "2026-01-01T00:00:00Z",
+        )
+
+    assert transitioned == [
+        (orchestration.JIRA_BLOCKED_STATUS, "EPIC-1"),
+        (orchestration.JIRA_BLOCKED_STATUS, "CHILD-1"),
+        (orchestration.JIRA_BLOCKED_STATUS, "CHILD-2"),
+    ]
+
+
+def test_comment_all_posts_once_in_ticket_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: calls.append((text, ticket_key)))
+
+    _comment_all("hola", "T-1", False, None)
+
+    assert calls == [("hola", "T-1")]
+
+
+def test_comment_all_mirrors_to_children_in_epic_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: calls.append((text, ticket_key)))
+
+    _comment_all("hola", "EPIC-1", True, ["CHILD-1", "CHILD-2"])
+
+    assert calls == [("hola", "EPIC-1"), ("hola", "CHILD-1"), ("hola", "CHILD-2")]
+
+
+def test_transition_all_posts_once_in_ticket_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: calls.append((status, ticket_key)))
+
+    _transition_all("Blocked", "T-1", False, None)
+
+    assert calls == [("Blocked", "T-1")]
+
+
+def test_transition_all_mirrors_to_children_in_epic_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: calls.append((status, ticket_key)))
+
+    _transition_all("Blocked", "EPIC-1", True, ["CHILD-1", "CHILD-2"])
+
+    assert calls == [("Blocked", "EPIC-1"), ("Blocked", "CHILD-1"), ("Blocked", "CHILD-2")]
+
+
+def test_handle_rejected_transitions_to_blocked_status(monkeypatch):
+    """Antes de este cambio, un rechazo del firewall no transicionaba el
+    ticket a ningun estado -- se quedaba donde estaba, sin senal visible en
+    Jira de que el pipeline ya lo proceso.
+    """
+    transitioned = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    with pytest.raises(PipelineBlocked):
+        _handle_rejected("T-1", {"ticket_id": "T-1", "summary": "s"}, {"status": "REJECTED", "reason": "match jailbreak"})
+
+    assert transitioned == [(orchestration.JIRA_BLOCKED_STATUS, "T-1")]
+
+
+def test_handle_rejected_mirrors_blocked_transition_to_epic_children(monkeypatch):
+    transitioned = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    with pytest.raises(PipelineBlocked):
+        _handle_rejected(
+            "EPIC-1", {"ticket_id": "EPIC-1", "summary": "s"}, {"status": "REJECTED", "reason": "match jailbreak"},
+            is_epic=True, child_ticket_keys=["CHILD-1", "CHILD-2"],
+        )
+
+    assert transitioned == [
+        (orchestration.JIRA_BLOCKED_STATUS, "EPIC-1"),
+        (orchestration.JIRA_BLOCKED_STATUS, "CHILD-1"),
+        (orchestration.JIRA_BLOCKED_STATUS, "CHILD-2"),
+    ]
+
+
+def _fake_child(ticket_id: str, repo: str = "AuthService") -> dict:
+    return {"ticket_id": ticket_id, "summary": f"summary {ticket_id}", "description": f"desc {ticket_id}", "repository_origen": repo}
+
+
+def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch):
+    """2 hijos aprobados y aplicados: el primero crea la rama
+    (run_coding_agent_local_real), el segundo CONTINUA la misma conversacion
+    (retry_coding_agent_local_real con el conversation_file del primero) --
+    y cada uno recibe su propio comentario, no uno generico compartido.
+    """
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    comments = []
+    coding_calls = []
+    guard_diffs = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+
+    def fake_run(cmd, input_text=None, check=True, env=None):
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return "checkpointhash\n"
+        return f"diff {cmd[-1]}"
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        coding_calls.append(("first", sanitized))
+        return {
+            "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
+            "backend": "anthropic", "conversation_file": "/tmp/conv1.json", "self_review": {},
+        }
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        coding_calls.append(("retry", feedback_text, conversation_file))
+        return {"applied": True, "backend": "anthropic", "self_review": {}, "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+
+    def fake_guard(diff_text, jira_context):
+        guard_diffs.append(diff_text)
+        return {"redactions_applied": 0, "jailbreak_reason": None, "clean": True}
+
+    monkeypatch.setattr(orchestration, "run_output_guard", fake_guard)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://github.com/org/repo/pull/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc epica"}, children, "/repo",
+        ["--- AuthService ---\nsin dependencias"], ["--- AuthService ---\n"], [], "", [],
+    )
+
+    assert result["completed"] == [
+        {"ticket_id": "C-1", "outcome": "ok"},
+        {"ticket_id": "C-2", "outcome": "ok"},
+    ]
+    assert result["blocked_at"] is None
+    assert coding_calls[0][0] == "first"
+    assert coding_calls[1] == ("retry", "prompt saneado", "/tmp/conv1.json")
+    # El diff que ve el guardia para el segundo hijo es el incremental
+    # (checkpoint..HEAD), no el acumulado desde el inicio de la rama.
+    assert guard_diffs[1] == "diff checkpointhash..HEAD"
+    child_comment_keys = [tk for tk, _ in comments if tk in ("C-1", "C-2")]
+    assert child_comment_keys.count("C-1") >= 2  # coding agent + juez
+    assert child_comment_keys.count("C-2") >= 2
+    assert any(tk == "EPIC-1" for tk, _ in comments)  # resumen final en la epica
+
+
+def test_deliver_epic_sequential_skips_rejected_child_and_continues(monkeypatch):
+    children = [_fake_child("C-1"), _fake_child("C-2"), _fake_child("C-3")]
+    comments = []
+    coding_backend_calls = []
+
+    def fake_firewall(prompt, jira_context, sonar_errors):
+        if jira_context["ticket_id"] == "C-2":
+            return {"status": "REJECTED", "reason": "jailbreak detectado", "sanitized_prompt": None, "redactions_applied": 0}
+        return {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None}
+
+    monkeypatch.setattr(orchestration, "evaluate_firewall", fake_firewall)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(ticket_key))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        coding_backend_calls.append("first")
+        return {"applied": False, "branch": None, "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None}
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia reintentar sin rama"))
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["blocked_at"] is None
+    outcomes = {c["ticket_id"]: c["outcome"] for c in result["completed"]}
+    assert outcomes["C-1"] == "no-op"
+    assert outcomes["C-3"] == "no-op"
+    assert "C-2" not in outcomes
+    # ninguno de los dos "no-op" dejo rama real -> ambos entran por
+    # run_coding_agent_local_real, ninguno por el reintento encadenado
+    assert coding_backend_calls == ["first", "first"]
+
+
+def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_children(monkeypatch):
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    comments = []
+    transitions = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(ticket_key))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: pytest.fail("no deberia abrir PR: nada quedo OK"))
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia llegar al segundo hijo"))
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["blocked_at"] == "C-1"
+    assert result["completed"] == []
+    assert ("C-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
+    assert "C-2" not in comments  # el segundo hijo nunca se toco
 
 
 def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):
