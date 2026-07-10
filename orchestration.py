@@ -1239,7 +1239,9 @@ def run_epic_pipeline(epic_key: str):
     if not children:
         raise PipelineBlocked(
             f"La epica {epic_key} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). "
-            "Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent'."
+            "Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent'. "
+            "Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md "
+            "(Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
         )
 
     unresolved = [c["ticket_id"] for c in children if not c.get("repository_origen")]

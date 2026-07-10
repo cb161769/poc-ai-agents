@@ -735,7 +735,7 @@ run_epic_etapas() {
   child_count=$(echo "${epic_json}" | jq '.children | length')
   echo "Hijos encontrados: ${child_count}"
   if [ "${child_count}" -eq 0 ]; then
-    fail "la epica ${EPIC_KEY} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent' -- ver README."
+    fail "la epica ${EPIC_KEY} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent' -- ver README. Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md (Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
   fi
 
   CHILD_TICKET_KEYS_JSON=$(echo "${epic_json}" | jq '[.children[].ticket_id]')

@@ -145,6 +145,19 @@ services:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
+    # GPU real si el host la tiene (docker info listando el runtime "nvidia"
+    # confirma que esta disponible) -- sin esto, ollama/ollama:latest cae a
+    # CPU en silencio ("GPU device discovery failed... entering low vram
+    # mode" en el log), que es lo que causaba las llamadas de varios minutos
+    # y los timeouts que vimos esta sesion. No requiere nada mas instalado:
+    # el NVIDIA Container Toolkit ya esta activo en este host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
       # La imagen ollama/ollama no trae wget ni curl -- el binario "ollama"
       # si esta y habla con el servidor local, asi que se usa el mismo en

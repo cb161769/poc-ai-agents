@@ -41,6 +41,27 @@ jailbreak_rules:
     severity: critical
     description: Comando SQL destructivo pedido dentro del prompt.
 
+  - id: ai-slash-command
+    # _check_jailbreak() normaliza el texto con re.sub(r"\s+", " ", ...) antes
+    # de matchear (colapsa saltos de linea), asi que el anchor real util aca
+    # es "inicio de string O precedido por un espacio", no "\n" literal.
+    pattern: '(?:^|\s)/ai\b'
+    severity: high
+    description: >
+      Ticket que trae un comando /ai dirigido al propio modelo (sintaxis de
+      invocacion de Rovo AI de Atlassian) -- un ticket de trabajo real no le
+      da una instruccion al asistente, es la forma tipica de un meta-prompt de
+      inyeccion de rol (ej. KAN-4, que pedia generar un plan de proyecto
+      entero en vez de describir un cambio de codigo).
+
+  - id: role-stacking-injection
+    pattern: 'act[uú]a como (?:un|una)?\s*.{0,80}(product owner|ux lead|enterprise architect|agile coach|prompt engineer)'
+    severity: high
+    description: >
+      Le pide al modelo asumir varios roles profesionales de golpe -- distinto
+      de una historia de usuario real ("Como <rol>, quiero...", formato
+      Gherkin), que no usa "actua como" ni apila roles.
+
 redaction_rules:
   - id: password-assignment
     pattern: 'password\s*=\s*\S+'
