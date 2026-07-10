@@ -41,10 +41,21 @@ Reemplazá `EPIC-123` por la key real antes de usar este prompt.
    acciones difíciles de revertir piden confirmación humana primero).
 
 4. Tras la confirmación, creá cada historia con `createJiraIssue` como hija
-   de `EPIC-123` (campo `parent` apuntando a la épica). Si la épica tiene
-   un `Component` de Jira asignado, asignale el mismo a cada hija nueva --
-   así `jira_client.py::_resolve_repository_origen()` la reconoce sin
-   trabajo manual extra cuando el pipeline la vuelva a leer.
+   de `EPIC-123` (campo `parent` apuntando a la épica). Después asigná el
+   componente real (`jira_client.py::_resolve_repository_origen()` necesita
+   que cada hija matchee un nombre de `JIRA_KNOWN_COMPONENTS`, ej.
+   `AuthService`/`Frontend`/`DataWorker`):
+   - Si el proyecto tiene el campo **Components** configurado (revisalo con
+     `getJiraIssueTypeMetaWithFields` -- muchos proyectos "team-managed" o
+     simplificados, como el usado en esta PoC, NO lo tienen), y la épica ya
+     tiene uno asignado, asigná el mismo a cada hija nueva vía
+     `createJiraIssue`/`editJiraIssue`.
+   - Si el proyecto **no** tiene ese campo (confirmado que pasa en la
+     práctica: `KAN-4` no tenía Components disponible en absoluto), usá el
+     fallback de **labels**: agregale a cada hija un label que matchee
+     exactamente el nombre de un componente conocido del grafo (ej.
+     `Frontend` para un ticket de sitio web), vía `editJiraIssue` con
+     `{"labels": ["Frontend"]}`.
 
 5. Al terminar, resumí en texto plano las historias creadas (key + summary)
    y recordale al usuario el siguiente paso real:
