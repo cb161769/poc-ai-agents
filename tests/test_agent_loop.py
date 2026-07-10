@@ -185,11 +185,53 @@ def test_post_with_retry_retries_on_connection_error_then_succeeds(monkeypatch):
     assert client.post.call_count == 2
 
 
+def test_call_model_turn_ollama_uses_model_override_when_passed(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    asyncio.run(
+        agent_loop._call_model_turn(
+            client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", ollama_model="qwen2.5-coder:7b"
+        )
+    )
+
+    assert captured["json"]["model"] == "qwen2.5-coder:7b"
+
+
+def test_call_model_turn_ollama_falls_back_to_global_model_without_override(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["model"] == agent_loop.OLLAMA_MODEL
+
+
 def test_call_with_fallback_falls_back_to_next_backend_on_failure(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
     monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: True)
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
         if backend == "anthropic":
             raise httpx.HTTPStatusError("error", request=httpx.Request("POST", "http://test"), response=_fake_response(401))
         return [{"type": "text", "text": "ok"}], "end_turn", {"input_tokens": 1, "output_tokens": 1}
@@ -208,7 +250,7 @@ def test_call_with_fallback_reraises_when_all_backends_fail(monkeypatch):
     monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
     monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: True)
 
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
         raise RuntimeError(f"{backend} esta caido")
 
     monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
@@ -284,7 +326,7 @@ def test_compact_old_tool_results_noop_when_not_enough_turns_yet():
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt):
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
         return [{"type": "text", "text": '{"ok": true}'}], "end_turn", {"input_tokens": 5, "output_tokens": 3}
 
     monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)

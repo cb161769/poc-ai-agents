@@ -151,7 +151,7 @@ def test_run_coding_agent_blocks_write_before_investigation(monkeypatch, tmp_pat
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
@@ -176,7 +176,7 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
@@ -204,7 +204,7 @@ def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypa
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
@@ -225,11 +225,11 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt):
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "blocked", "summary": "recuperado", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
 
     monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
@@ -252,7 +252,7 @@ def test_run_coding_agent_resume_skips_reinvestigation(monkeypatch, tmp_path):
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
@@ -293,7 +293,7 @@ def test_run_coding_agent_writes_conversation_file_for_resume(monkeypatch, tmp_p
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
@@ -321,7 +321,7 @@ def test_run_coding_agent_captures_initial_plan(monkeypatch, tmp_path):
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [
@@ -348,7 +348,7 @@ def test_run_coding_agent_initial_plan_survives_resume(monkeypatch, tmp_path):
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": '{"status": "done", "summary": "corregido", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
@@ -381,7 +381,7 @@ def test_run_coding_agent_accepts_done_with_valid_self_review_no_extra_nudge(mon
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
@@ -416,7 +416,7 @@ def test_run_coding_agent_nudges_once_for_missing_self_review(monkeypatch, tmp_p
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
@@ -701,7 +701,7 @@ def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [

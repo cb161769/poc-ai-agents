@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 import orchestration
-from orchestration import PipelineBlocked, _format_conflicts_section, _resolve_single_repo, _retry_local_diff
+from orchestration import PipelineBlocked, _check_not_epic, _format_conflicts_section, _resolve_single_repo, _retry_local_diff
 
 
 def test_resolve_single_repo_ok_when_all_agree():
@@ -262,6 +262,22 @@ def test_run_coding_agent_cloud_redacts_secret_from_issue_body(monkeypatch):
     create_cmd = next(c for c in captured_cmds if "create" in c)
     body = create_cmd[create_cmd.index("--body") + 1]
     assert "Sup3rS3cr3tDbP4ss!" not in body
+
+
+def test_check_not_epic_raises_pipeline_blocked_for_epic_ticket():
+    """KAN-4 (real, corrida en vivo esta sesion) es una Epica pero
+    fetch_ticket_live() no traia issue_type hasta este cambio -- el pipeline
+    la procesaba como ticket normal, sin hijos, en silencio."""
+    with pytest.raises(PipelineBlocked, match="es una Epica"):
+        _check_not_epic({"ticket_id": "KAN-4", "issue_type": "Epic"})
+
+
+def test_check_not_epic_allows_non_epic_ticket():
+    _check_not_epic({"ticket_id": "T-1", "issue_type": "Task"})  # no debe lanzar
+
+
+def test_check_not_epic_allows_missing_issue_type():
+    _check_not_epic({"ticket_id": "T-1"})  # no debe lanzar
 
 
 def test_format_conflicts_section_empty_when_no_conflicts():

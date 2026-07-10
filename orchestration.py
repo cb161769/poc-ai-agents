@@ -48,8 +48,19 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import httpx
 from dotenv import load_dotenv
+
+# load_dotenv() TIENE que correr antes de "from prefect import ..." -- Prefect
+# resuelve su configuracion (PREFECT_API_URL incluido) al importarse, no
+# perezosamente en cada llamada como el resto de los clientes de este
+# proyecto (Jira/Neo4j/Sonar leen os.environ.get(...) recien cuando se
+# invocan). Si .env todavia no esta cargado en ese momento, Prefect cae a su
+# modo "ephemeral" (una base SQLite local dentro del propio proceso) y nunca
+# le manda nada al servidor real -- los flows/tasks se ven "correr bien" en
+# el log de este proceso, pero jamas aparecen en la UI de prefect-server.
+load_dotenv()
+
+import httpx
 from prefect import flow, get_run_logger, task
 
 import epic_planner
@@ -59,8 +70,6 @@ import output_guard
 from firewall_proxy import _redact
 from log_utils import get_logger
 from pipeline_shared import RETRYABLE_POLICY_REFERENCES
-
-load_dotenv()
 
 logger = get_logger(__name__)
 
@@ -629,6 +638,20 @@ def _resolve_single_repo(name_to_repo_url: dict) -> tuple:
     return True, next(iter(distinct)), ""
 
 
+def _check_not_epic(ticket: dict) -> None:
+    """Pure: raises PipelineBlocked si el ticket (modo normal, NO --epic) es
+    en realidad una Epica -- fetch_ticket_live() no le resuelve hijos, asi
+    que procesarla como ticket normal la trata como una story vacia. Antes
+    de esto no habia forma de que el pipeline lo supiera (issuetype nunca se
+    pedia a la API de Jira).
+    """
+    if (ticket.get("issue_type") or "").lower() == "epic":
+        raise PipelineBlocked(
+            f"{ticket['ticket_id']} es una Epica -- correla con --epic {ticket['ticket_id']} en vez de "
+            "como ticket normal, o el pipeline no le va a resolver los hijos."
+        )
+
+
 def _format_conflicts_section(conflicts: list) -> str:
     """Pure: convierte la lista de conflictos que epic_planner.py detecto
     (antes se calculaba y se descartaba sin que nadie los viera) en la
@@ -1154,6 +1177,7 @@ def run_pipeline():
     known_components = discover_known_components()
 
     ticket = fetch_jira_ticket(known_components)
+    _check_not_epic(ticket)
     component = ticket["repository_origen"]
     logger.info(f"Ticket {ticket['ticket_id']} — componente {component}")
 

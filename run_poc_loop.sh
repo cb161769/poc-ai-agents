@@ -1129,6 +1129,12 @@ echo " ETAPA 1/5 — Lectura del ticket Jira real"
 echo "=================================================================="
 JIRA_JSON="$(python3 "${SCRIPT_DIR}/jira_client.py")" || fail "no se pudo leer el ticket de Jira. Revisa .env y check_prereqs.sh"
 
+ISSUE_TYPE=$(echo "${JIRA_JSON}" | jq -r '.issue_type // ""')
+if [ "${ISSUE_TYPE}" = "Epic" ]; then
+  TICKET_ID_FOR_ERROR=$(echo "${JIRA_JSON}" | jq -r '.ticket_id')
+  fail "${TICKET_ID_FOR_ERROR} es una Epica -- corre './run_poc_loop.sh --epic ${TICKET_ID_FOR_ERROR}' en vez de como ticket normal, o el pipeline no le va a resolver los hijos."
+fi
+
 TICKET_ID=$(echo "${JIRA_JSON}" | jq -r '.ticket_id')
 SUMMARY=$(echo "${JIRA_JSON}" | jq -r '.summary')
 DESCRIPTION=$(echo "${JIRA_JSON}" | jq -r '.description')

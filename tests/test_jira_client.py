@@ -85,7 +85,7 @@ def test_extract_figma_link_none_for_empty_description():
     assert _extract_figma_link("") is None
 
 
-def _fake_issue_response(components: list, labels: list) -> MagicMock:
+def _fake_issue_response(components: list, labels: list, issue_type: str = "Task") -> MagicMock:
     resp = MagicMock()
     resp.raise_for_status.return_value = None
     resp.json.return_value = {
@@ -97,6 +97,7 @@ def _fake_issue_response(components: list, labels: list) -> MagicMock:
             "status": {"name": "Open"},
             "attachment": [],
             "components": [{"name": name} for name in components],
+            "issuetype": {"name": issue_type},
         },
     }
     return resp
@@ -114,6 +115,25 @@ def test_fetch_ticket_live_prefers_native_components_field(mock_get, monkeypatch
     ticket = jira_client.fetch_ticket_live()
 
     assert ticket["repository_origen"] == "AuthService"
+
+
+@patch("jira_client.httpx.get")
+def test_fetch_ticket_live_includes_issue_type(mock_get, monkeypatch):
+    """orchestration.py/run_poc_loop.sh necesitan saber si el ticket es una
+    Epica antes de procesarlo como ticket normal -- fetch_ticket_live() no
+    pedia el campo issuetype a la API hasta este cambio."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setenv("JIRA_TICKET_KEY", "T-1")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService"})
+    mock_get.return_value = _fake_issue_response(components=["AuthService"], labels=[], issue_type="Epic")
+
+    ticket = jira_client.fetch_ticket_live()
+
+    assert ticket["issue_type"] == "Epic"
+    requested_fields = mock_get.call_args.kwargs["params"]["fields"]
+    assert "issuetype" in requested_fields
 
 
 @patch("jira_client.httpx.get")

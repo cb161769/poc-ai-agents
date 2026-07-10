@@ -202,7 +202,7 @@ def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = N
         r = httpx.get(
             f"{jira_url}/rest/api/3/issue/{ticket_key}",
             headers=headers,
-            params={"fields": "summary,description,labels,status,attachment,components"},
+            params={"fields": "summary,description,labels,status,attachment,components,issuetype"},
             timeout=15.0,
         )
         r.raise_for_status()
@@ -223,6 +223,7 @@ def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = N
         "components": [c.get("name") for c in (fields.get("components") or []) if c.get("name")],
         "repository_origen": _resolve_repository_origen(fields, known_repos),
         "status": (fields.get("status") or {}).get("name"),
+        "issue_type": (fields.get("issuetype") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
         "figma_link": _extract_figma_link(description_text),
         **attachment_info,

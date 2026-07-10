@@ -48,6 +48,7 @@ from mcp import StdioServerParameters
 import sonar_client
 from agent_loop import (
     ANTHROPIC_MODEL,
+    OLLAMA_MODEL,
     _call_mcp_tool,
     _call_model_turn,
     _connect_mcp_servers,
@@ -68,6 +69,12 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
 
 MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "15"))
+
+# Modelo Ollama propio para este agente -- escribir codigo/usar tools
+# correctamente es mas exigente que solo evaluar texto (judge_agent.py), asi
+# que puede valer la pena un modelo mas fuerte aca (ej. qwen2.5-coder:7b) sin
+# afectar al juez. Cae al generico OLLAMA_MODEL si no se setea.
+CODING_AGENT_OLLAMA_MODEL = os.environ.get("CODING_AGENT_OLLAMA_MODEL", OLLAMA_MODEL)
 
 # Limites defensivos de las tools locales: un archivo/salida/listado gigante
 # no debe reventar el contexto del modelo ni colgar el loop. _MAX_READ_BYTES
@@ -697,7 +704,8 @@ async def run_coding_agent(
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, CODING_AGENT_SYSTEM_PROMPT
+                    client, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
+                    ollama_model=CODING_AGENT_OLLAMA_MODEL,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
@@ -710,7 +718,8 @@ async def run_coding_agent(
                     except json.JSONDecodeError:
                         # Un solo reintento acotado antes de degradar a blocked.
                         retry_text, retry_usage = await _final_text_with_json_retry(
-                            client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT
+                            client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
+                            ollama_model=CODING_AGENT_OLLAMA_MODEL,
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)

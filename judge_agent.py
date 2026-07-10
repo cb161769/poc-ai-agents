@@ -54,6 +54,7 @@ from mcp import StdioServerParameters
 import sonar_client
 from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_to_blocks/_estimate_cost_usd
     ANTHROPIC_MODEL,       # re-exported so existing imports/tests of judge_agent keep working
+    OLLAMA_MODEL,
     _call_mcp_tool,
     _call_model_turn,
     _connect_mcp_servers,
@@ -78,6 +79,12 @@ VERDICT_LOG = LOG_DIR / "judge_verdicts.jsonl"
 JUDGE_POLICY_PATH = Path(__file__).resolve().parent / "evals" / "JUDGE_POLICY.md"
 
 MAX_TOOL_TURNS = 6
+
+# Modelo Ollama propio para el juez -- solo evalua texto+tools, no escribe
+# codigo, asi que puede quedar en un modelo mas chico/rapido que el del
+# coding agent sin perder calidad de juicio. Cae al generico OLLAMA_MODEL
+# si no se setea.
+JUDGE_OLLAMA_MODEL = os.environ.get("JUDGE_OLLAMA_MODEL", OLLAMA_MODEL)
 
 # Criterios validos para el campo policy_reference de un veredicto FLAGGED --
 # ver evals/JUDGE_POLICY.md para la descripcion completa de cada uno. Vive
@@ -377,7 +384,9 @@ async def judge_with_tools(payload: dict) -> dict:
 
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage, backend = await call_with_fallback(client, messages, tools, JUDGE_SYSTEM_PROMPT)
+                content, stop_reason, usage, backend = await call_with_fallback(
+                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=JUDGE_OLLAMA_MODEL,
+                )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
                 messages.append({"role": "assistant", "content": content})
@@ -391,7 +400,8 @@ async def judge_with_tools(payload: dict) -> dict:
                         # devuelve JSON valido esta vez, se deja propagar y
                         # main() lo maneja como error, sin loop infinito.
                         retry_text, retry_usage = await _final_text_with_json_retry(
-                            client, backend, messages, tools, JUDGE_SYSTEM_PROMPT
+                            client, backend, messages, tools, JUDGE_SYSTEM_PROMPT,
+                            ollama_model=JUDGE_OLLAMA_MODEL,
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)

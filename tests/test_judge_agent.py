@@ -323,7 +323,7 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [

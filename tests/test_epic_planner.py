@@ -69,7 +69,7 @@ def test_plan_epic_uses_model_reorder(monkeypatch):
 
     monkeypatch.setattr(epic_planner, "_connect_mcp_servers", fake_connect_mcp_servers)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [
             {
                 "type": "text",
@@ -94,7 +94,7 @@ def test_plan_epic_falls_back_when_model_returns_invalid_json(monkeypatch):
 
     monkeypatch.setattr(epic_planner, "_connect_mcp_servers", fake_connect_mcp_servers)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None):
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 

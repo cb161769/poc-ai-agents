@@ -47,6 +47,11 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
+# CPU-only inference con el system prompt grande de coding_agent.py/
+# judge_agent.py puede tardar varios minutos -- confirmado en corrida real
+# (el juez supero 120s y crasheo el subproceso entero via ReadTimeout antes
+# de este cambio). Configurable si tu hardware es mas lento/rapido.
+OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
 
 # Pricing y orden de preferencia viven en llm_backends.py (el registro de
 # backends) -- _estimate_cost_usd() se mantiene aca como wrapper fino para
@@ -178,12 +183,23 @@ async def _post_with_retry(client: httpx.AsyncClient, backend: str, url: str, **
         return resp
 
 
-async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str) -> tuple:
+async def _call_model_turn(
+    client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str,
+    anthropic_model: str = None, ollama_model: str = None,
+) -> tuple:
     """Returns (content_blocks, stop_reason, usage) normalized to the
     Anthropic content-block shape regardless of which backend answered.
     usage = {"input_tokens": int, "output_tokens": int} (0s for Ollama,
     which is free/local so cost tracking doesn't apply the same way).
+
+    anthropic_model/ollama_model: override por-llamada (cada agente puede
+    pedir su propio modelo -- ej. CODING_AGENT_OLLAMA_MODEL vs
+    JUDGE_OLLAMA_MODEL) -- caen a las constantes globales si no se pasan,
+    asi que un caller que no los usa no nota diferencia.
     """
+    anthropic_model = anthropic_model or ANTHROPIC_MODEL
+    ollama_model = ollama_model or OLLAMA_MODEL
+
     if backend == "anthropic":
         # Prompt caching: system_prompt y tools son estaticos dentro de una
         # corrida (se repiten identicos en cada uno de los hasta
@@ -197,7 +213,7 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
         # un mecanismo de caching equivalente en la API que ya se usa, asi
         # que queda sin cambios.
         request_body = {
-            "model": ANTHROPIC_MODEL,
+            "model": anthropic_model,
             "max_tokens": MODEL_LIMITS["anthropic"]["max_tokens"],
             "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             "messages": messages,
@@ -235,7 +251,7 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
     if backend == "ollama":
         ollama_messages = [{"role": "system", "content": system_prompt}] + _messages_to_ollama(messages)
         request_body = {
-            "model": OLLAMA_MODEL,
+            "model": ollama_model,
             "messages": ollama_messages,
             "stream": False,
             "options": {"num_predict": MODEL_LIMITS["ollama"]["max_tokens"]},
@@ -243,7 +259,9 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
         if tools:
             request_body["tools"] = _tools_to_ollama_format(tools)
 
-        resp = await _post_with_retry(client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=120.0)
+        resp = await _post_with_retry(
+            client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=OLLAMA_TIMEOUT_SECONDS
+        )
         data = resp.json()
         blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}))
         usage = {"input_tokens": data.get("prompt_eval_count", 0), "output_tokens": data.get("eval_count", 0)}
@@ -253,7 +271,8 @@ async def _call_model_turn(client: httpx.AsyncClient, backend: str, messages: li
 
 
 async def call_with_fallback(
-    client: httpx.AsyncClient, messages: list, tools: list, system_prompt: str, exclude: set = None
+    client: httpx.AsyncClient, messages: list, tools: list, system_prompt: str, exclude: set = None,
+    anthropic_model: str = None, ollama_model: str = None,
 ) -> tuple:
     """Fallback EN VIVO entre backends -- a diferencia de _select_backend()
     (que elige un backend una sola vez al arrancar la corrida), esto se
@@ -261,6 +280,9 @@ async def call_with_fallback(
     propios reintentos via _post_with_retry), prueba el siguiente backend
     disponible de get_backend_priority() para ESE MISMO turno, en vez de
     matar la corrida entera.
+
+    anthropic_model/ollama_model: mismo override por-agente que
+    _call_model_turn -- se reenvian tal cual.
 
     Devuelve (content_blocks, stop_reason, usage, backend_used) -- un
     elemento mas que _call_model_turn (que backend realmente respondio),
@@ -280,7 +302,10 @@ async def call_with_fallback(
             continue
         tried_any = True
         try:
-            blocks, stop_reason, usage = await _call_model_turn(client, backend, messages, tools, system_prompt)
+            blocks, stop_reason, usage = await _call_model_turn(
+                client, backend, messages, tools, system_prompt,
+                anthropic_model=anthropic_model, ollama_model=ollama_model,
+            )
             return blocks, stop_reason, usage, backend
         except Exception as exc:
             logger.warning(f"backend '{backend}' fallo, probando el siguiente disponible: {exc}")
@@ -295,7 +320,8 @@ async def call_with_fallback(
 
 
 async def _final_text_with_json_retry(
-    client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str
+    client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str,
+    anthropic_model: str = None, ollama_model: str = None,
 ) -> tuple:
     """Called when a model's final answer wasn't valid JSON: appends a
     correction request and makes ONE more model call (bounded, no loop).
@@ -305,7 +331,10 @@ async def _final_text_with_json_retry(
     valid JSON.
     """
     messages.append({"role": "user", "content": JSON_CORRECTION_MESSAGE})
-    content, _stop_reason, usage = await _call_model_turn(client, backend, messages, tools, system_prompt)
+    content, _stop_reason, usage = await _call_model_turn(
+        client, backend, messages, tools, system_prompt,
+        anthropic_model=anthropic_model, ollama_model=ollama_model,
+    )
     messages.append({"role": "assistant", "content": content})
     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
     return final_text, usage

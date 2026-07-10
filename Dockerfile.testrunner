@@ -24,7 +24,12 @@ RUN curl -fsSL -o /tmp/cypher-shell.deb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt pytest-timeout
+RUN pip install --no-cache-dir -r requirements.txt pytest-timeout uv
+
+# uvx (via el paquete uv) -- coding_agent.py/judge_agent.py/chat.py lo
+# invocan para levantar los MCP reales (mcp-neo4j-cypher, mcp-server-qdrant)
+# como subprocesos. Sin esto, esas conexiones fallan en silencio (se
+# degradan a "MCP no disponible") y el agente pierde acceso al grafo/RAG.
 
 # El codigo se monta en runtime (-v "$(pwd):/repo"), no se copia acá -- así
 # corre siempre contra el estado real del repo sin tener que reconstruir la
