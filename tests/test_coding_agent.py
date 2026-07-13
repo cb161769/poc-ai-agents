@@ -133,6 +133,46 @@ def test_tool_run_shell_command_skips_when_rejected(tmp_path, monkeypatch):
     assert "rechazo" in result
 
 
+def test_tool_run_shell_command_runs_in_monorepo_subdir_via_cwd(tmp_path, monkeypatch):
+    """Confirmado real contra ai-agents-code: sin cwd, 'npm test' corria en
+    la raiz del monorepo (donde no hay package.json) y siempre fallaba --
+    con cwd="frontend" tiene que correr parado ahi de verdad. Se mockea
+    subprocess.run (en vez de usar un comando de shell real tipo 'pwd', que
+    no es portable entre cmd.exe/bash) para verificar el cwd real que
+    recibe, sin depender de la shell del SO que corra los tests.
+    """
+    monkeypatch.setattr("builtins.input", lambda: "s")
+    sub = tmp_path / "frontend"
+    sub.mkdir()
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+
+    result = ca.tool_run_shell_command(str(tmp_path), "npm test", cwd="frontend")
+
+    assert captured["cwd"] == str(sub.resolve())
+    assert "exit_code=0" in result
+
+
+def test_tool_run_shell_command_rejects_cwd_outside_repo(tmp_path, monkeypatch):
+    result = ca.tool_run_shell_command(str(tmp_path), "echo no-deberia-correr", cwd="../../etc")
+
+    assert "error" in result
+    assert "fuera del repo objetivo" in result
+
+
+def test_tool_run_shell_command_rejects_cwd_that_is_not_a_directory(tmp_path, monkeypatch):
+    (tmp_path / "archivo.txt").write_text("contenido")
+
+    result = ca.tool_run_shell_command(str(tmp_path), "echo no-deberia-correr", cwd="archivo.txt")
+
+    assert "no es un directorio" in result
+
+
 def test_build_user_prompt_does_not_precargar_root_listing(tmp_path):
     """El listado de la raiz del repo ya no viaja precargado en el prompt
     inicial -- el modelo lo pide el mismo con list_directory si le hace

@@ -208,6 +208,59 @@ def test_call_model_turn_anthropic_force_json_skipped_when_tools_offered(monkeyp
     assert captured["json"]["messages"][-1] == {"role": "user", "content": "hola"}
 
 
+def test_call_model_turn_anthropic_warns_when_tools_offered_but_ignored_and_not_json(monkeypatch):
+    """Mismo chequeo que ya existe para Ollama, por simetria: se ofrecieron
+    tools reales y la respuesta ni las uso (stop_reason != tool_use) ni es
+    JSON valido -- posible alucinacion sin verificar con tools."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    async def fake_post(url, **kwargs):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "content": [{"type": "text", "text": "che, dejame pensarlo un toque"}],
+            "stop_reason": "end_turn",
+            "usage": {},
+        }
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+
+    asyncio.run(agent_loop._call_model_turn(client, "anthropic", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert any("posible alucinacion" in w for w in warnings)
+
+
+def test_call_model_turn_anthropic_no_warning_when_tool_use(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    async def fake_post(url, **kwargs):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "content": [{"type": "tool_use", "id": "t1", "name": "read_file", "input": {"path": "a.py"}}],
+            "stop_reason": "tool_use",
+            "usage": {},
+        }
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+
+    asyncio.run(agent_loop._call_model_turn(client, "anthropic", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert warnings == []
+
+
 def test_post_with_retry_retries_on_503_then_succeeds(monkeypatch):
     monkeypatch.setattr(agent_loop.asyncio, "sleep", AsyncMock())
     client = MagicMock()

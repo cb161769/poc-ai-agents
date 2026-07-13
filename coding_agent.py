@@ -167,12 +167,29 @@ antes de asumir un comando de test/build, y query_sonar si necesitas mas detalle
 en vez de confiar solo en lo que ya te dieron. Usa git_diff antes de declararte "done" para revisar tu \
 propio cambio de punta a punta.
 
+IMPORTANTE -- no confundas "no encontre X existente" con "no puedo hacer nada": muchos tickets piden \
+CREAR algo que todavia no existe en el repo (un archivo, un componente, una pagina, una funcionalidad \
+nueva). Si investigaste (list_directory/read_file/grep_search) y confirmaste que de verdad no existe \
+todavia lo que el ticket pide, esa es la señal correcta para usar write_file y CREARLO -- seguí el estilo \
+y las convenciones que ya veas en archivos vecinos del mismo proyecto/sub-proyecto. Solo declarate \
+"blocked" si el ticket es genuinamente ambiguo sobre que crear (no simplemente porque el archivo no \
+existia todavia), y explicá en el summary exactamente que ambigüedad te frena.
+
+Si detect_project_stack devuelve "monorepo detectado" (varios sub-proyectos, cada uno en su propia \
+subcarpeta), SIEMPRE pasa el parametro `cwd` de run_shell_command con la subcarpeta del sub-proyecto real \
+que estas tocando -- sin eso el comando corre en la raiz del repo y falla (ahi no esta el package.json/ \
+pom.xml/etc real). Ejemplo: si detect_project_stack dice "frontend/: Node/TS -- npm test", corre \
+run_shell_command con command="npm test" y cwd="frontend".
+
 REGLA OBLIGATORIA: no podes usar write_file, edit_file, ni run_shell_command hasta haber usado al menos \
 una vez read_file, list_directory, o grep_search en esta corrida -- si lo intentas antes, la herramienta \
 va a rechazar el llamado y vas a perder un turno. Investiga primero, siempre.
 
-Cada escritura, edicion, o comando de shell tambien requieren confirmacion humana antes de ejecutarse -- \
-si el usuario rechaza uno, no insistas con el mismo cambio, ajusta tu plan.
+Cada escritura, edicion, o comando de shell YA tiene su propia confirmacion humana incorporada -- se \
+pregunta automaticamente cuando llamas a write_file/edit_file/run_shell_command, vos NUNCA tenes que \
+pedir permiso en texto ni bloquearte con "no puedo sin confirmacion humana": eso ya esta resuelto por la \
+herramienta misma, simplemente llamala. Si el usuario rechaza uno, no insistas con el mismo cambio, \
+ajusta tu plan.
 
 Antes de tu primer llamado a write_file/edit_file/run_shell_command, tu respuesta de texto tiene que \
 incluir un bloque corto "Plan: " con los pasos concretos que vas a seguir -- no es opcional, es lo que \
@@ -545,8 +562,23 @@ def tool_query_sonar(target_repo_dir: str, component: str) -> str:
     return "\n".join(lines)
 
 
-def tool_run_shell_command(target_repo_dir: str, command: str) -> str:
-    print(f"\nEl agente quiere correr en {target_repo_dir}:", file=sys.stderr)
+def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") -> str:
+    """cwd (opcional, relativo a target_repo_dir): en que subcarpeta correr
+    el comando -- sin esto, siempre corria en la RAIZ del repo, lo que
+    rompe cualquier comando (npm test, mvn test, pytest) en un monorepo con
+    sub-proyectos reales (confirmado contra ai-agents-code: 'npm test'
+    fallaba desde la raiz porque el package.json real esta en frontend/,
+    no en la raiz). Usa detect_project_stack primero para saber que
+    subcarpeta corresponde a cada sub-proyecto.
+    """
+    try:
+        work_dir = _safe_path(target_repo_dir, cwd) if cwd else Path(target_repo_dir).resolve()
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not work_dir.is_dir():
+        return f"error: '{cwd}' no es un directorio dentro del repo objetivo"
+
+    print(f"\nEl agente quiere correr en {work_dir}:", file=sys.stderr)
     print(f"  $ {command}", file=sys.stderr)
     if not _confirm("¿Ejecutar este comando? [s/n]: "):
         return "el usuario rechazo ejecutar este comando"
@@ -555,7 +587,7 @@ def tool_run_shell_command(target_repo_dir: str, command: str) -> str:
         result = subprocess.run(
             command,
             shell=True,
-            cwd=target_repo_dir,
+            cwd=str(work_dir),
             capture_output=True,
             text=True,
             timeout=120,
@@ -598,8 +630,20 @@ LOCAL_TOOLS = {
         "fn": tool_write_file,
     },
     "run_shell_command": {
-        "description": "Corre un comando de shell dentro del repo objetivo (tests, build, etc). Requiere confirmacion humana.",
-        "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+        "description": (
+            "Corre un comando de shell dentro del repo objetivo (tests, build, etc). Requiere confirmacion "
+            "humana. En un monorepo (varios sub-proyectos, ver detect_project_stack), pasa 'cwd' con la "
+            "subcarpeta del sub-proyecto real -- sin esto corre en la RAIZ del repo, donde comandos como "
+            "'npm test'/'mvn test' van a fallar si el package.json/pom.xml real esta en una subcarpeta."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "cwd": {"type": "string", "description": "Subcarpeta relativa al repo donde correr el comando (opcional, default: raiz del repo)"},
+            },
+            "required": ["command"],
+        },
         "fn": tool_run_shell_command,
     },
     "edit_file": {

@@ -348,11 +348,26 @@ async def _call_model_turn(
         data = resp.json()
         usage = data.get("usage", {})
         content = data["content"]
+        stop_reason = data.get("stop_reason", "end_turn")
         if use_prefill and content and content[0].get("type") == "text":
             # La respuesta de Anthropic continua DESDE el prefill, no lo
             # repite -- hay que reponer el "{" para que el JSON quede
             # completo y parseable.
             content = [{**content[0], "text": "{" + content[0]["text"]}] + content[1:]
+
+        if tools and stop_reason != "tool_use":
+            # Mismo chequeo que ya existe para Ollama: se ofrecieron tools
+            # reales y el modelo no las uso, y lo que devolvio tampoco es
+            # JSON valido -- ni tool-call ni respuesta final utilizable.
+            raw_text = next((b.get("text", "") for b in content if b.get("type") == "text"), "")
+            try:
+                json.loads(raw_text.strip())
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(
+                    f"anthropic ({anthropic_model}): se ofrecieron {len(tools)} tool(s) y no se uso "
+                    "ninguna, y la respuesta tampoco es JSON valido -- posible alucinacion sin verificar con tools."
+                )
+
         return (
             content,
             data.get("stop_reason", "end_turn"),
