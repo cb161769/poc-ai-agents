@@ -281,6 +281,55 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
     assert result["summary"] == "recuperado"
 
 
+def test_run_coding_agent_retries_when_final_json_has_wrong_schema(monkeypatch, tmp_path):
+    """Confirmado real esta sesion (ornith:9b contra KAN-15): un modelo puede
+    devolver JSON SINTACTICAMENTE valido pero con el esquema equivocado
+    (ej. {"plan": "..."} en vez de {"status":..., "summary":...}) -- eso no
+    dispara json.JSONDecodeError, asi que sin este chequeo el resultado
+    ambiguo (sin 'status') se aceptaba tal cual como final. Tiene que
+    disparar el mismo reintento de correccion que un JSON invalido.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"plan": "Detectar el stack del proyecto."}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"status": "blocked", "summary": "recuperado del esquema invalido", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert result["summary"] == "recuperado del esquema invalido"
+
+
+def test_run_coding_agent_degrades_to_blocked_when_retry_also_has_wrong_schema(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"plan": "primer intento"}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        # El reintento TAMBIEN devuelve un esquema invalido -- se degrada a
+        # blocked igual que con JSON directamente invalido, no queda colgado.
+        return '{"plan": "segundo intento, sigue mal"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert "segundo intento" in result["summary"]
+
+
 def test_run_coding_agent_nudges_to_investigate_first_when_refusal_comes_before_investigation(monkeypatch, tmp_path):
     """Confirmado real esta sesion contra ai-agents-code: el modelo puede
     rendirse ANTES de investigar con exito -- ej. adivina mal una ruta con

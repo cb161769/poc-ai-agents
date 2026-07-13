@@ -485,6 +485,28 @@ def test_call_model_turn_ollama_without_force_json_omits_format(monkeypatch):
     assert "format" not in captured["json"]
 
 
+def test_call_model_turn_ollama_force_json_omits_format_when_tools_offered(monkeypatch):
+    """Mismo criterio que use_prefill en la rama Anthropic (que tampoco
+    aplica el prefill cuando hay tools): forzar format:"json" en un turno
+    donde TAMBIEN se ofrecen tools reales empuja al modelo a responder ya
+    en texto en vez de usar tool-calling -- confirmado real esta sesion con
+    qwen2.5-coder:7b y ornith:9b. Con tools presentes, force_json no debe
+    activar format:"json" -- solo aplica en el turno final sin tools (o el
+    reintento de correccion, que ya pasa tools=[]).
+    """
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+
+    asyncio.run(
+        agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], tools, "sys", force_json=True)
+    )
+
+    assert "format" not in captured["json"]
+    assert captured["json"]["tools"]
+
+
 def test_final_text_with_json_retry_ollama_forces_json_and_drops_tools(monkeypatch):
     captured = {}
 

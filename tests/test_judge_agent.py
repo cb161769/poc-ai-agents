@@ -202,6 +202,27 @@ def test_build_user_prompt_defaults_to_pointwise_rubric():
     assert "Modo de evaluación: pointwise" in prompt
 
 
+def test_build_user_prompt_warns_no_diff_exists_in_issue_only_mode():
+    """Bug real confirmado en vivo (KAN-15 con parable/fable): la frase
+    ambigua vieja ("diff real, o el texto del issue") hacia que el juez
+    alucinara un diff completo con archivos y rutas inventadas a partir de
+    solo el texto del ticket. El prompt en modo issue_only tiene que dejar
+    explicito que NO hay ningun diff.
+    """
+    prompt = _build_user_prompt(
+        _base_judge_payload(change_source="issue_only", change_description="Como usuario quiero X", test_summary="sin cambios aplicados")
+    )
+
+    assert "NO HAY NINGUN DIFF" in prompt
+    assert "no existen" in prompt
+
+
+def test_build_user_prompt_local_diff_mode_does_not_include_no_diff_warning():
+    prompt = _build_user_prompt(_base_judge_payload(change_source="local_diff"))
+
+    assert "NO HAY NINGUN DIFF" not in prompt
+
+
 def test_build_user_prompt_includes_reference_grounded_context():
     prompt = _build_user_prompt(
         _base_judge_payload(reference_answer="La forma correcta de resolver esto es X.")

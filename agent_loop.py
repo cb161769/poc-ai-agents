@@ -282,16 +282,19 @@ async def _call_model_turn(
     asi que un caller que no los usa no nota diferencia.
 
     force_json: en Ollama fuerza la decodificacion a JSON valido por
-    gramatica (parametro real de /api/chat). Anthropic no tiene un
-    parametro nativo equivalente -- se usa la tecnica de "prefill"
-    documentada por Anthropic (arrancar la respuesta del asistente con
-    "{"), pero SOLO cuando no hay tools ofrecidas (prefillear texto le
-    impide a Claude emitir un tool_use en ese turno). Usado siempre por
-    _final_text_with_json_retry() (ya sabemos que el texto anterior no fue
-    JSON valido) -- y opcionalmente por el loop principal de
-    coding_agent.py/judge_agent.py desde el primer turno, para que el
-    modelo no tenga una vuelta libre en texto narrativo antes
-    de que se lo empiece a forzar.
+    gramatica (parametro real de /api/chat), SOLO cuando no hay tools
+    ofrecidas -- forzar JSON en un turno donde tambien se ofrecen tools
+    empuja al modelo a responder ya en texto en vez de usar el mecanismo
+    real de tool-calling (confirmado real esta sesion con qwen2.5-coder:7b
+    y ornith:9b). Mismo criterio en Anthropic: se usa la tecnica de
+    "prefill" documentada por Anthropic (arrancar la respuesta del
+    asistente con "{"), tambien SOLO cuando no hay tools ofrecidas
+    (prefillear texto le impide a Claude emitir un tool_use en ese turno).
+    Usado siempre por _final_text_with_json_retry() (que ya pasa
+    tools=[]) -- y opcionalmente por el loop principal de
+    coding_agent.py/judge_agent.py desde el primer turno (sin efecto
+    mientras el loop siga ofreciendo tools reales; empieza a aplicar recien
+    en el turno final, sin tools, donde se espera la respuesta JSON).
     """
     anthropic_model = anthropic_model or ANTHROPIC_MODEL
     ollama_model = ollama_model or OLLAMA_MODEL
@@ -393,7 +396,17 @@ async def _call_model_turn(
         }
         if tools:
             request_body["tools"] = _tools_to_ollama_format(tools)
-        if force_json:
+        # Mismo criterio que use_prefill en la rama Anthropic: forzar
+        # format:"json" cuando TAMBIEN se ofrecen tools empuja al modelo a
+        # "contestar ya" en JSON de texto en vez de usar el mecanismo real
+        # de tool-calling (message.tool_calls) -- confirmado real esta
+        # sesion: con format:"json" siempre activo desde el primer turno,
+        # tanto qwen2.5-coder:7b como ornith:9b devolvian el tool-call (o un
+        # JSON con el esquema equivocado) como texto plano en vez de
+        # investigar primero. Solo forzar JSON cuando NO hay tools que
+        # llamar (la respuesta final, o el reintento de correccion que
+        # siempre pasa tools=[]).
+        if force_json and not tools:
             request_body["format"] = "json"
 
         resp = await _post_with_retry(

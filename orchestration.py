@@ -67,6 +67,7 @@ import epic_planner
 import graph_writer
 import jira_client
 import output_guard
+from tech_doc_agent import generate_technical_report
 from firewall_proxy import _redact
 from log_utils import get_logger
 from pipeline_shared import RETRYABLE_POLICY_REFERENCES
@@ -194,9 +195,19 @@ def check_attachments_gate(ticket: dict):
         raise PipelineBlocked("adjuntos sin describir por Rovo")
 
 
+# Nombres reales de issue type que representan un BUG -- varian por
+# instancia/idioma de Jira (confirmado real: el proyecto KAN de esta
+# sesion ni siquiera tiene un tipo "Bug", solo Epic/Historia/Tarea/
+# Subtask). Sin este chequeo, check_log_evidence le pedia un stack trace a
+# CUALQUIER ticket sin bloque de codigo en la descripcion -- incluidas
+# Historias/Tareas reales que nunca tuvieron un error que diagnosticar.
+_BUG_ISSUE_TYPE_NAMES = {"bug", "error", "defecto", "fallo", "incidencia"}
+
+
 @task(name="log-evidence-nudge")
 def check_log_evidence(ticket: dict):
-    if not ticket.get("has_log_evidence"):
+    is_bug = (ticket.get("issue_type") or "").strip().lower() in _BUG_ISSUE_TYPE_NAMES
+    if is_bug and not ticket.get("has_log_evidence"):
         comment_jira.submit(
             f"📋 Pipeline (Prefect): para diagnosticar este bug en '{ticket.get('repository_origen')}' con "
             "precision, pega el log o stack trace real como bloque de codigo en la descripcion."
@@ -295,6 +306,31 @@ def comment_jira(text: str, ticket_key: str | None = None):
         jira_client.post_audit_comment(key, text)
     except Exception as exc:
         logger.warning(f"No se pudo comentar en el ticket {key}: {exc}")
+
+
+def _post_child_technical_report(epic_key: str, child_id: str, backend: str | None, resultado: str, extra: dict | None = None) -> None:
+    """Comprobante tecnico POR HISTORIA -- a diferencia del resumen fijo
+    (que arma orchestration.py con texto propio), esto lo redacta el
+    backend LLM que realmente trabajo esa historia (ver
+    tech_doc_agent.py). Se llama en cada punto de salida real del loop de
+    _deliver_epic_sequential (no-op, bloqueada, o con veredicto), asi cada
+    historia que el agente efectivamente toco (no las rechazadas por el
+    firewall, que nunca llegaron a un agente) deja su propio comprobante.
+    Best-effort: si no se genera nada, no se postea nada extra.
+    """
+    evidence = {
+        "epica": epic_key,
+        "historia": child_id,
+        "backend_usado": backend or "ninguno",
+        "modelo_ollama_coding_agent": os.environ.get("CODING_AGENT_OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL", ""),
+        "modelo_ollama_juez": os.environ.get("JUDGE_OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL", ""),
+        "resultado": resultado,
+    }
+    if extra:
+        evidence.update(extra)
+    technical_report = generate_technical_report(evidence)
+    if technical_report:
+        comment_jira(technical_report, ticket_key=child_id)
 
 
 def _comment_all(text: str, ticket_id: str, is_epic: bool, child_ticket_keys: list | None) -> None:
@@ -1179,6 +1215,20 @@ def _deliver(
                 )
         _transition_all(JIRA_REVIEW_STATUS, ticket_id, is_epic, child_ticket_keys)
 
+    technical_report = generate_technical_report({
+        "ticket": ticket_id,
+        "es_epica_combinada": is_epic,
+        "backend_usado": backend or "ninguno",
+        "modelo_ollama_coding_agent": os.environ.get("CODING_AGENT_OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL", ""),
+        "modelo_ollama_juez": os.environ.get("JUDGE_OLLAMA_MODEL") or os.environ.get("OLLAMA_MODEL", ""),
+        "tests_status": tests_status,
+        "veredicto_juez": (judge_verdict or {}).get("verdict", "sin veredicto"),
+        "razonamiento_juez": (judge_verdict or {}).get("reasoning", "no disponible"),
+        "rama_git": branch or "ninguna",
+    })
+    if technical_report:
+        _comment_all(technical_report, ticket_id, is_epic, child_ticket_keys)
+
     # Ya no hace falta un check_falco_correlation() aca -- run_judge() ya lo
     # hizo internamente (fetch + post) ANTES de invocar al juez, para que la
     # evidencia de Falco de esta misma corrida pudiera llegar a su payload
@@ -1292,6 +1342,7 @@ def _deliver_epic_sequential(
                 f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio para esta historia.",
                 ticket_key=child_id,
             )
+            _post_child_technical_report(epic_key, child_id, backend, "no-op -- el agente no aplico ningun cambio")
             completed.append({"ticket_id": child_id, "outcome": "no-op"})
             continue
 
@@ -1312,6 +1363,7 @@ def _deliver_epic_sequential(
             post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {child_id} (modo epica secuencial): {reason}")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             check_falco_correlation(falco_since, child_id)
+            _post_child_technical_report(epic_key, child_id, backend, f"bloqueada por la guardia de salida ({reason})")
             blocked_at = child_id
             break
 
@@ -1321,6 +1373,7 @@ def _deliver_epic_sequential(
             post_alert_webhook(f"🧪 Testing agent BLOCKED en {child_id} (modo epica secuencial): tests reales fallaron.")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             check_falco_correlation(falco_since, child_id)
+            _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- los tests reales fallaron", {"salida_tests": test_result["output"][:2000]})
             blocked_at = child_id
             break
 
@@ -1349,16 +1402,19 @@ def _deliver_epic_sequential(
 
         if judge_verdict is None:
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): no pudo evaluar {child_id} -- continua sin veredicto.", ticket_key=child_id)
+            _post_child_technical_report(epic_key, child_id, backend, "sin veredicto del juez", {"rama_git": branch})
             completed.append({"ticket_id": child_id, "outcome": "no-verdict"})
         elif judge_verdict["verdict"] == "FLAGGED":
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): FLAGGED en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
             post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {child_id} (modo epica secuencial): {judge_verdict['reasoning']}")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
+            _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- el juez marco FLAGGED", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})
             blocked_at = child_id
             break
         else:
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
             transition_jira(JIRA_REVIEW_STATUS, ticket_key=child_id)
+            _post_child_technical_report(epic_key, child_id, backend, "OK -- listo para revision humana", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})
             completed.append({"ticket_id": child_id, "outcome": "ok"})
 
     pr_result = None

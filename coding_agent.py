@@ -859,6 +859,17 @@ async def run_coding_agent(
 
                     try:
                         result = _extract_json(final_text)
+                        if result.get("status") not in ("done", "blocked"):
+                            # Real: ornith:9b devolvio JSON sintacticamente
+                            # valido pero con el esquema equivocado
+                            # ({"plan": "..."} en vez de {"status":...,
+                            # "summary":...}) -- sin este chequeo, el parseo
+                            # "exitoso" hacia que este resultado ambiguo (sin
+                            # status) se aceptara tal cual como final,
+                            # dejando el ticket en un estado indefinido en
+                            # vez de disparar el mismo reintento de
+                            # correccion que ya existe para JSON invalido.
+                            raise json.JSONDecodeError("falta 'status' valido en el JSON", final_text, 0)
                     except json.JSONDecodeError:
                         # Un solo reintento acotado antes de degradar a blocked.
                         retry_text, retry_usage = await _final_text_with_json_retry(
@@ -869,6 +880,8 @@ async def run_coding_agent(
                         total_output_tokens += retry_usage.get("output_tokens", 0)
                         try:
                             result = _extract_json(retry_text)
+                            if result.get("status") not in ("done", "blocked"):
+                                raise json.JSONDecodeError("falta 'status' valido en el JSON", retry_text, 0)
                         except json.JSONDecodeError:
                             return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
 

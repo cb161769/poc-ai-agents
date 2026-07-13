@@ -328,6 +328,27 @@ los introdujo el cambio real). Considerálos como evidencia real, no como \
 deuda técnica preexistente del repo:
 {issues_list}"""
 
+    change_source = payload.get("change_source")
+    if change_source == "issue_only":
+        # Real: con parable/fable, la frase ambigua vieja ("diff real, o el
+        # texto del issue") llevo al juez a alucinar un diff completo
+        # (archivos y rutas que nunca existieron) a partir de solo el texto
+        # del ticket -- confirmado en vivo (KAN-15, ver reflog: la rama se
+        # creo y se borro sin ningun commit nuevo, pero el juez describio
+        # "ErrorPage"/"src/app/issueOnly.tsx" como si fueran reales). Esta
+        # advertencia explicita saca la ambiguedad de raiz.
+        change_content_label = (
+            "Contenido del cambio -- ATENCION: NO HAY NINGUN DIFF. El coding "
+            "agent NO aplico ningun cambio real todavia (o corre en la nube y "
+            "el PR no existe aun). Lo de abajo es SOLO el texto original del "
+            "ticket, no un diff. NO describas archivos, rutas ni contenido de "
+            "codigo como si fueran reales -- no existen. Evalua unicamente si "
+            "el pedido en si es razonable/seguro, no una implementacion que no "
+            "paso"
+        )
+    else:
+        change_content_label = "Contenido del cambio (diff real aplicado por el coding agent)"
+
     return f"""Modo de evaluación: {evaluation_mode}
 
 Ticket: {payload['ticket'].get('ticket_id')} — {payload['ticket'].get('summary')}
@@ -338,9 +359,8 @@ Decision del firewall: {payload['firewall'].get('status')}
 Motivo (si rechazo): {payload['firewall'].get('reason')}
 Redacciones aplicadas: {payload['firewall'].get('redactions_applied')}
 
-Fuente del cambio: {payload.get('change_source')}
-Contenido del cambio (diff real, o el texto del issue si el agente en la nube \
-todavia no genero un PR):
+Fuente del cambio: {change_source}
+{change_content_label}:
 {payload.get('change_description')}
 
 Resultado del testing agent (build/test real del modulo, ya corrio ANTES que \

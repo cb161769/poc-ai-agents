@@ -16,6 +16,7 @@ from orchestration import (
     PipelineBlocked,
     _check_not_epic,
     _comment_all,
+    _deliver,
     _format_conflicts_section,
     _handle_rejected,
     _resolve_single_repo,
@@ -351,6 +352,7 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
     monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
 
     result = orchestration._deliver_epic_sequential(
         "EPIC-1", {"summary": "epica", "description": "desc epica"}, children, "/repo",
@@ -397,6 +399,7 @@ def test_deliver_epic_sequential_skips_rejected_child_and_continues(monkeypatch)
     monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia reintentar sin rama"))
     monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
 
     result = orchestration._deliver_epic_sequential(
         "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
@@ -435,6 +438,7 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: pytest.fail("no deberia abrir PR: nada quedo OK"))
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia llegar al segundo hijo"))
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
 
     result = orchestration._deliver_epic_sequential(
         "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
@@ -444,6 +448,181 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     assert result["completed"] == []
     assert ("C-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
     assert "C-2" not in comments  # el segundo hijo nunca se toco
+
+
+def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypatch):
+    """El comprobante tecnico (poblado por el LLM, no por texto fijo) se
+    pide POR HISTORIA, con la evidencia real de esa historia puntual, y si
+    se genera se postea como un comentario adicional en ESA historia (no
+    solo en la epica) -- best-effort: si generate_technical_report
+    devuelve None (backend no disponible, ver otros tests), no se postea
+    nada extra.
+    """
+    children = [_fake_child("C-1")]
+    comments = []
+    report_calls = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://github.com/org/repo/pull/9", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    def fake_report(evidence):
+        report_calls.append(evidence)
+        return "# Comprobante real generado por el modelo"
+
+    monkeypatch.setattr(orchestration, "generate_technical_report", fake_report)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["completed"] == [{"ticket_id": "C-1", "outcome": "ok"}]
+    assert len(report_calls) == 1
+    evidence = report_calls[0]
+    assert evidence["epica"] == "EPIC-1"
+    assert evidence["historia"] == "C-1"
+    assert evidence["backend_usado"] == "ollama"
+    assert evidence["resultado"] == "OK -- listo para revision humana"
+    assert evidence["veredicto_juez"] == "todo bien"
+    assert ("C-1", "# Comprobante real generado por el modelo") in comments
+
+
+def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monkeypatch):
+    """Si generate_technical_report devuelve None (backend no disponible o
+    fallo real), no se postea ningun comentario extra -- best-effort, no
+    debe inventarse un comentario vacio ni romper la corrida."""
+    children = [_fake_child("C-1")]
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://github.com/org/repo/pull/9", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda evidence: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    summary_comments = [text for _tk, text in comments if "Modo epica secuencial" in text]
+    assert len(summary_comments) == 1  # solo el resumen -- nada extra del comprobante
+
+
+def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
+    """Ticket unico (no epica): _deliver tambien pide un comprobante
+    tecnico real al terminar y lo postea en el mismo ticket -- este es el
+    camino que corre run_pipeline() para una historia comun (ej. KAN-15),
+    no solo el modo epica secuencial.
+    """
+    comments = []
+    report_calls = []
+
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff real")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/T-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin remote"})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    def fake_report(evidence):
+        report_calls.append(evidence)
+        return "# Comprobante real de T-1"
+
+    monkeypatch.setattr(orchestration, "generate_technical_report", fake_report)
+
+    orchestration._deliver(
+        "T-1", "resumen", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "AuthService"}, "/repo",
+    )
+
+    assert len(report_calls) == 1
+    assert report_calls[0]["ticket"] == "T-1"
+    assert report_calls[0]["backend_usado"] == "ollama"
+    assert report_calls[0]["veredicto_juez"] == "OK"
+    assert ("T-1", "# Comprobante real de T-1") in comments
+
+
+class _FakeFuture:
+    def __init__(self, value=None):
+        self._value = value
+
+    def result(self):
+        return self._value
+
+
+def test_check_log_evidence_skips_non_bug_ticket_without_stack_trace(monkeypatch):
+    """Bug real de esta sesion: check_log_evidence le pedia un stack trace
+    a CUALQUIER ticket sin bloque de codigo, sin mirar el tipo de issue --
+    incluidas Historias/Tareas reales que nunca tuvieron un error que
+    diagnosticar (confirmado en vivo: el proyecto KAN real ni siquiera
+    tiene un tipo 'Bug', solo Epic/Historia/Tarea/Subtask).
+    """
+    calls = []
+    monkeypatch.setattr(orchestration.comment_jira, "submit", lambda *a, **k: calls.append((a, k)) or _FakeFuture())
+
+    orchestration.check_log_evidence({"issue_type": "Historia", "has_log_evidence": False, "repository_origen": "Frontend"})
+
+    assert calls == []
+
+
+def test_check_log_evidence_fires_for_real_bug_without_evidence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration.comment_jira, "submit", lambda *a, **k: calls.append((a, k)) or _FakeFuture())
+
+    orchestration.check_log_evidence({"issue_type": "Bug", "has_log_evidence": False, "repository_origen": "Frontend"})
+
+    assert len(calls) == 1
+
+
+def test_check_log_evidence_skips_bug_that_already_has_evidence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration.comment_jira, "submit", lambda *a, **k: calls.append((a, k)) or _FakeFuture())
+
+    orchestration.check_log_evidence({"issue_type": "Bug", "has_log_evidence": True, "repository_origen": "Frontend"})
+
+    assert calls == []
 
 
 def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):
