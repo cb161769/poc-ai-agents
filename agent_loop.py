@@ -45,6 +45,10 @@ JSON_CORRECTION_MESSAGE = (
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+# Mismo criterio que OLLAMA_TEMPERATURE: 0.0 (deterministico) para tareas de
+# verificacion (coding_agent.py/judge_agent.py esperan JSON estricto en la
+# respuesta final), no el default del modelo pensado para charla natural.
+ANTHROPIC_TEMPERATURE = float(os.environ.get("ANTHROPIC_TEMPERATURE", "0.0"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 # CPU-only inference con el system prompt grande de coding_agent.py/
@@ -277,14 +281,16 @@ async def _call_model_turn(
     JUDGE_OLLAMA_MODEL) -- caen a las constantes globales si no se pasan,
     asi que un caller que no los usa no nota diferencia.
 
-    force_json: solo tiene efecto con backend "ollama" -- fuerza la
-    decodificacion a JSON valido por gramatica (parametro real de
-    /api/chat, no un truco de prompt). Se ignora en Anthropic, que ya
-    devuelve JSON valido de forma confiable cuando el backend en si
-    funciona. Usado siempre por _final_text_with_json_retry() (ya sabemos
-    que el texto anterior no fue JSON valido) -- y opcionalmente por el
-    loop principal de coding_agent.py/judge_agent.py desde el primer turno,
-    para que el modelo no tenga una vuelta libre en texto narrativo antes
+    force_json: en Ollama fuerza la decodificacion a JSON valido por
+    gramatica (parametro real de /api/chat). Anthropic no tiene un
+    parametro nativo equivalente -- se usa la tecnica de "prefill"
+    documentada por Anthropic (arrancar la respuesta del asistente con
+    "{"), pero SOLO cuando no hay tools ofrecidas (prefillear texto le
+    impide a Claude emitir un tool_use en ese turno). Usado siempre por
+    _final_text_with_json_retry() (ya sabemos que el texto anterior no fue
+    JSON valido) -- y opcionalmente por el loop principal de
+    coding_agent.py/judge_agent.py desde el primer turno, para que el
+    modelo no tenga una vuelta libre en texto narrativo antes
     de que se lo empiece a forzar.
     """
     anthropic_model = anthropic_model or ANTHROPIC_MODEL
@@ -302,11 +308,25 @@ async def _call_model_turn(
         # combinado con tools normalmente lo supera. La rama ollama no tiene
         # un mecanismo de caching equivalente en la API que ya se usa, asi
         # que queda sin cambios.
+        # force_json en Anthropic: no existe un parametro nativo tipo
+        # format:"json" de Ollama -- la tecnica real y documentada por
+        # Anthropic es "prefill": arrancar la respuesta del asistente con
+        # "{" para que el modelo SOLO pueda continuar como JSON. Solo se
+        # aplica cuando no hay tools ofrecidas (prefillear texto le impide
+        # a Claude emitir un bloque tool_use en ese turno -- coherente con
+        # como ya se usa esto hoy, siempre con tools=[] desde
+        # _final_text_with_json_retry o el turno final sin mas tools).
+        anthropic_messages = messages
+        use_prefill = force_json and not tools
+        if use_prefill:
+            anthropic_messages = messages + [{"role": "assistant", "content": "{"}]
+
         request_body = {
             "model": anthropic_model,
             "max_tokens": MODEL_LIMITS["anthropic"]["max_tokens"],
+            "temperature": ANTHROPIC_TEMPERATURE,
             "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
-            "messages": messages,
+            "messages": anthropic_messages,
         }
         if tools:
             tools_with_cache = [dict(t) for t in tools]
@@ -327,8 +347,14 @@ async def _call_model_turn(
         )
         data = resp.json()
         usage = data.get("usage", {})
+        content = data["content"]
+        if use_prefill and content and content[0].get("type") == "text":
+            # La respuesta de Anthropic continua DESDE el prefill, no lo
+            # repite -- hay que reponer el "{" para que el JSON quede
+            # completo y parseable.
+            content = [{**content[0], "text": "{" + content[0]["text"]}] + content[1:]
         return (
-            data["content"],
+            content,
             data.get("stop_reason", "end_turn"),
             {
                 "input_tokens": usage.get("input_tokens", 0),

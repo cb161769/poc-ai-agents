@@ -4,6 +4,7 @@ correction retry (_final_text_with_json_retry). No real network calls --
 httpx.AsyncClient.post and _call_model_turn are mocked.
 """
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -127,6 +128,84 @@ def test_call_model_turn_anthropic_skips_tools_cache_control_when_no_tools(monke
     asyncio.run(agent_loop._call_model_turn(client, "anthropic", [], [], "system prompt real"))
 
     assert "tools" not in captured["json"]
+
+
+def test_call_model_turn_anthropic_sends_temperature_zero_by_default(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"content": [], "stop_reason": "end_turn", "usage": {}}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    asyncio.run(agent_loop._call_model_turn(client, "anthropic", [], [], "sys"))
+
+    assert captured["json"]["temperature"] == 0.0
+
+
+def test_call_model_turn_anthropic_force_json_prefills_and_restores_opening_brace(monkeypatch):
+    """Anthropic no tiene un format:"json" nativo -- se usa la tecnica de
+    prefill (arrancar la respuesta del asistente con "{"). La API devuelve
+    la CONTINUACION, no el "{" -- hay que reponerlo para que el texto final
+    sea JSON valido y parseable.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "content": [{"type": "text", "text": '"status": "done", "summary": "ok"}'}],
+            "stop_reason": "end_turn",
+            "usage": {},
+        }
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+
+    blocks, _stop_reason, _usage = asyncio.run(
+        agent_loop._call_model_turn(client, "anthropic", [{"role": "user", "content": "hola"}], [], "sys", force_json=True)
+    )
+
+    assert captured["json"]["messages"][-1] == {"role": "assistant", "content": "{"}
+    assert blocks[0]["text"] == '{"status": "done", "summary": "ok"}'
+    json.loads(blocks[0]["text"])  # confirma que ahora es JSON valido de verdad
+
+
+def test_call_model_turn_anthropic_force_json_skipped_when_tools_offered(monkeypatch):
+    """Prefillear texto le impide a Claude emitir un tool_use en ese turno
+    -- con tools ofrecidas, force_json no debe aplicar el prefill."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {}}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+
+    asyncio.run(
+        agent_loop._call_model_turn(client, "anthropic", [{"role": "user", "content": "hola"}], tools, "sys", force_json=True)
+    )
+
+    assert captured["json"]["messages"][-1] == {"role": "user", "content": "hola"}
 
 
 def test_post_with_retry_retries_on_503_then_succeeds(monkeypatch):

@@ -669,6 +669,53 @@ def test_tool_detect_project_stack_unknown(tmp_path):
     assert "no se detecto" in result
 
 
+def test_tool_detect_project_stack_finds_monorepo_subprojects(tmp_path):
+    """Confirmado real contra ai-agents-code: ningun marcador en la raiz,
+    3 sub-proyectos reales un nivel abajo -- antes esto devolvia siempre
+    "no se detecto ningun marcador" y el agente se rendia ahi.
+    """
+    (tmp_path / "auth-service").mkdir()
+    (tmp_path / "auth-service" / "pom.xml").write_text("<project/>")
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text("{}")
+    (tmp_path / "data-worker").mkdir()
+    (tmp_path / "data-worker" / "Pipfile").write_text("")
+
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "monorepo detectado con 3 sub-proyecto(s)" in result
+    assert "auth-service/: Maven/Java" in result
+    assert "frontend/: Node/TS" in result
+    assert "data-worker/: Python (Pipenv)" in result
+
+
+def test_tool_detect_project_stack_root_marker_wins_over_subdirs(tmp_path):
+    """Si la raiz SI tiene un marcador, no escanea subcarpetas -- evita
+    reportar sub-proyectos irrelevantes (ej. node_modules con su propio
+    package.json) cuando el repo real es de un solo stack."""
+    (tmp_path / "package.json").write_text("{}")
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "pom.xml").write_text("<project/>")
+
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "Node/TS" in result
+    assert "monorepo" not in result
+
+
+def test_tool_detect_project_stack_skips_ignored_dirs_in_monorepo_scan(tmp_path):
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "package.json").write_text("{}")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "real-service").mkdir()
+    (tmp_path / "real-service" / "pom.xml").write_text("<project/>")
+
+    result = ca.tool_detect_project_stack(str(tmp_path))
+
+    assert "real-service/: Maven/Java" in result
+    assert "node_modules" not in result
+
+
 # --- tool_query_sonar ---
 
 

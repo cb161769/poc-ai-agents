@@ -476,19 +476,57 @@ _STACK_MARKERS = [
 ]
 
 
+def _detect_stack_at(dir_path: Path) -> tuple | None:
+    for marker, stack, suggested_cmd in _STACK_MARKERS:
+        if (dir_path / marker).exists():
+            return stack, suggested_cmd
+    if list(dir_path.glob("*.csproj")) or list(dir_path.glob("*.sln")):
+        return ".NET", "dotnet test"
+    return None
+
+
 def tool_detect_project_stack(target_repo_dir: str) -> str:
     """Puramente informativo -- no ejecuta nada, solo le dice al agente que
     stack detecto y que comando de verificacion sugiere, para que no tenga
     que adivinarlo. El agente sigue usando run_shell_command (con
     confirmacion) para correrlo de verdad.
+
+    Antes solo miraba la RAIZ del repo -- en un monorepo real (confirmado
+    contra ai-agents-code: auth-service/pom.xml, frontend/package.json,
+    data-worker/Pipfile, ninguno en la raiz) siempre devolvia "no se
+    detecto ningun marcador", y el agente se rendia ahi en vez de seguir
+    investigando. Ahora, si la raiz no tiene marcador, escanea las
+    subcarpetas de primer nivel (no recursivo completo -- evita bajar a
+    node_modules/.git/etc via _SKIP_DIRS) y reporta CADA sub-proyecto
+    encontrado con su propio comando de verificacion.
     """
     root = Path(target_repo_dir).resolve()
-    for marker, stack, suggested_cmd in _STACK_MARKERS:
-        if (root / marker).exists():
-            return f"stack detectado: {stack} (por {marker}) -- comando de verificacion sugerido: {suggested_cmd}"
-    if list(root.glob("*.csproj")) or list(root.glob("*.sln")):
-        return "stack detectado: .NET (por *.csproj/*.sln) -- comando de verificacion sugerido: dotnet test"
-    return "no se detecto un marcador de stack conocido en la raiz del repo -- inspecciona manualmente con list_directory/read_file"
+
+    root_hit = _detect_stack_at(root)
+    if root_hit:
+        stack, suggested_cmd = root_hit
+        return f"stack detectado: {stack} (por marcador en la raiz) -- comando de verificacion sugerido: {suggested_cmd}"
+
+    sub_hits = []
+    for sub in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in _SKIP_DIRS and not p.name.startswith(".")):
+        hit = _detect_stack_at(sub)
+        if hit:
+            stack, suggested_cmd = hit
+            sub_hits.append((sub.name, stack, suggested_cmd))
+
+    if not sub_hits:
+        return (
+            "no se detecto ningun marcador de stack conocido ni en la raiz ni en subcarpetas de primer nivel "
+            "-- inspecciona manualmente con list_directory/read_file"
+        )
+
+    lines = [f"- {name}/: {stack} -- comando de verificacion sugerido: {cmd}" for name, stack, cmd in sub_hits]
+    return (
+        f"monorepo detectado con {len(sub_hits)} sub-proyecto(s) (nada en la raiz):\n"
+        + "\n".join(lines)
+        + "\nUsa list_directory/read_file dentro del sub-proyecto real que vayas a tocar antes de escribir, "
+        "y corre el comando de verificacion de ESE sub-proyecto puntual, no uno solo para todo el repo."
+    )
 
 
 def tool_query_sonar(target_repo_dir: str, component: str) -> str:
@@ -594,7 +632,9 @@ LOCAL_TOOLS = {
     "detect_project_stack": {
         "description": (
             "Detecta el stack del repo objetivo (Maven/Go/Ruby/Rust/Python/Node/.NET) por su archivo de "
-            "proyecto y sugiere el comando de test/build -- no ejecuta nada, solo informa. Solo lectura."
+            "proyecto y sugiere el comando de test/build -- no ejecuta nada, solo informa. Si no hay marcador "
+            "en la raiz, escanea subcarpetas de primer nivel y reporta cada sub-proyecto de un monorepo por "
+            "separado. Solo lectura."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
         "fn": tool_detect_project_stack,
