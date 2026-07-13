@@ -281,6 +281,138 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
     assert result["summary"] == "recuperado"
 
 
+def test_run_coding_agent_nudges_to_investigate_first_when_refusal_comes_before_investigation(monkeypatch, tmp_path):
+    """Confirmado real esta sesion contra ai-agents-code: el modelo puede
+    rendirse ANTES de investigar con exito -- ej. adivina mal una ruta con
+    read_file (error), y en el siguiente turno se niega a crear en vez de
+    reintentar la investigacion. El nudge en ese caso tiene que mandarlo a
+    confirmar la ruta con list_directory, no solo repetirle "llama la tool
+    ya" (eso solo chocaria con el gate real de "investiga primero").
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # read_file con una ruta que NO existe -- error, has_investigated sigue False.
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "no-existe.js"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            # Se niega en texto SIN haber investigado con exito todavia.
+            content = [{"type": "text", "text": "no-existe.js no existe en el repositorio. No puedo crear archivos nuevos sin confirmación humana."}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 3:
+            # Esta vez lista el directorio de verdad (siguiendo el nudge).
+            content = [{"type": "tool_use", "id": "call_2", "name": "list_directory", "input": {"path": "."}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{
+            "type": "text",
+            "text": (
+                '{"status": "done", "summary": "listo", "files_changed": [], '
+                '"self_review": {"scope_matches_ticket": true, "no_secrets_introduced": true, "tests_adequate": true}}'
+            ),
+        }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    captured_messages = []
+
+    async def spying_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        captured_messages.append(messages[-1])
+        return await fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(ca, "call_with_fallback", spying_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    # El nudge mandado despues del rechazo tiene que ser la variante que
+    # pide investigar primero, no la que asume que ya investigo.
+    nudge_sent = captured_messages[2]["content"]
+    assert nudge_sent == ca.TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION
+
+
+def test_run_coding_agent_nudges_when_model_refuses_to_call_tool(monkeypatch, tmp_path):
+    """Confirmado real esta sesion: algunos modelos anuncian que van a crear
+    un archivo pero explican en texto que "no pueden sin confirmacion
+    humana" en vez de llamar write_file (que ya pide esa confirmacion
+    sola). El nudge especifico le da una oportunidad real de llamar la tool
+    en vez de caer directo al reintento generico de "dame JSON valido".
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Investiga primero (para pasar el gate real).
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            # Se niega en texto en vez de llamar write_file.
+            content = [{"type": "text", "text": "El archivo nuevo.txt no existe. No puedo crearlo sin confirmación humana."}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        # Respuesta "done" completa (self_review + verificacion ya hecha en
+        # el turno 1) para que el foco del test sea solo el nudge de
+        # tool-call, sin que los otros dos empujones (verificacion/
+        # self_review, ya cubiertos en otro test) agreguen turnos de mas.
+        content = [{
+            "type": "text",
+            "text": (
+                '{"status": "done", "summary": "listo tras el nudge", "files_changed": [], '
+                '"self_review": {"scope_matches_ticket": true, "no_secrets_introduced": true, "tests_adequate": true}}'
+            ),
+        }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert call_count["n"] == 4  # investigar -> se niega -> nudge -> responde bien -> empujon de verificacion (self_review ya venia OK)
+    assert result["status"] == "done"
+    assert result["summary"] == "listo tras el nudge"
+
+
+def test_run_coding_agent_only_nudges_tool_call_refusal_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+    refusal_text = "No puedo crear ese archivo sin confirmación humana."
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        # Se niega SIEMPRE, incluso despues del nudge -- el segundo rechazo
+        # no debe generar un segundo nudge (evita loop infinito).
+        content = [{"type": "text", "text": refusal_text}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"status": "blocked", "summary": "no se animo a llamar la tool", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    # investigar -> se niega (nudge 1) -> se niega otra vez -> retry generico -> blocked
+    assert call_count["n"] == 3
+    assert result["status"] == "blocked"
+
+
 def test_run_coding_agent_resume_skips_reinvestigation(monkeypatch, tmp_path):
     """Con resume_messages/resume_state (reintento tras feedback del juez),
     no deberia hacer falta investigar de nuevo -- has_investigated ya viene

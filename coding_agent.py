@@ -34,6 +34,7 @@ import asyncio
 import difflib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -135,6 +136,35 @@ SELF_REVIEW_NUDGE_MESSAGE = (
     "contestando cada campo con honestidad segun tu propio cambio."
 )
 
+# Confirmado real esta sesion: algunos modelos locales anuncian en texto
+# narrativo que van a crear/editar un archivo o correr un comando, pero
+# nunca llegan a emitir la tool-call real -- en vez de eso explican que
+# "no pueden sin confirmacion humana" (aunque write_file/edit_file/
+# run_shell_command YA piden esa confirmacion solas al ser llamadas). Sin
+# este nudge especifico, el flujo caia directo al reintento generico de
+# "dame JSON valido", que no corrige la causa real (el modelo sigue sin
+# animarse a llamar la tool, solo reformatea su negativa como JSON).
+_TOOL_CALL_REFUSAL_PATTERN = re.compile(
+    r"sin confirmaci[oó]n|necesito (?:confirmaci[oó]n|permiso)|no puedo (?:crear|escribir|editar|ejecutar|modificar)|"
+    r"requiere confirmaci[oó]n humana|no puedo hacer(?:lo)? sin",
+    re.IGNORECASE,
+)
+
+TOOL_CALL_NUDGE_MESSAGE = (
+    "Ya podes hacerlo -- la confirmacion humana la pide automaticamente la herramienta misma "
+    "(write_file/edit_file/run_shell_command) apenas la llamas, vos no necesitas pedir permiso en texto "
+    "ni explicar de nuevo por que no podes. Llama a la tool correspondiente AHORA MISMO, con el "
+    "contenido o comando real -- no respondas con otra explicacion."
+)
+
+TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION = (
+    "Ya podes hacerlo -- la confirmacion humana la pide automaticamente la herramienta misma, vos no "
+    "necesitas pedir permiso en texto. Pero primero confirma la ruta EXACTA con list_directory (no "
+    "adivines un nombre de archivo/carpeta) -- si de verdad no existe, esa es la señal correcta para "
+    "crearlo con write_file en la ubicacion real del proyecto, no para bloquearte. Segui esos pasos "
+    "AHORA, no respondas con otra explicacion."
+)
+
 _SELF_REVIEW_FIELDS = ("scope_matches_ticket", "no_secrets_introduced", "tests_adequate")
 
 
@@ -166,6 +196,12 @@ write_file para crear archivos nuevos o reescrituras genuinamente completas. Usa
 antes de asumir un comando de test/build, y query_sonar si necesitas mas detalle de un hallazgo puntual \
 en vez de confiar solo en lo que ya te dieron. Usa git_diff antes de declararte "done" para revisar tu \
 propio cambio de punta a punta.
+
+NUNCA le pases a read_file una ruta que estas ADIVINANDO -- si no sabes la ruta EXACTA de un archivo, \
+usa list_directory primero (empezando por la carpeta del sub-proyecto real, ver detect_project_stack) \
+para confirmarla, o grep_search si sabes un fragmento de contenido pero no la ubicacion. Un read_file \
+con una ruta inventada solo te da un error y quema un turno -- list_directory te da la estructura real \
+del proyecto para no tener que adivinar nada.
 
 IMPORTANTE -- no confundas "no encontre X existente" con "no puedo hacer nada": muchos tickets piden \
 CREAR algo que todavia no existe en el repo (un archivo, un componente, una pagina, una funcionalidad \
@@ -745,6 +781,7 @@ async def run_coding_agent(
     consulted_risk_graph = bool(resume_state.get("consulted_risk_graph"))
     verification_nudge_given = False
     self_review_nudge_given = False
+    tool_call_nudge_given = False
 
     def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
@@ -803,6 +840,23 @@ async def run_coding_agent(
 
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
+
+                    if not tool_call_nudge_given and _TOOL_CALL_REFUSAL_PATTERN.search(final_text):
+                        # El modelo anuncio una negativa a llamar la tool en
+                        # vez de llamarla -- un nudge especifico ataca la
+                        # causa real, a diferencia del reintento generico de
+                        # "dame JSON valido" (que solo le pide reformatear la
+                        # misma negativa como JSON, no que actue). No
+                        # depende de has_investigated -- confirmado real que
+                        # el modelo puede rendirse ANTES de investigar con
+                        # exito (ej. adivino mal una ruta), y en ese caso el
+                        # nudge tiene que mandarlo a investigar bien primero,
+                        # no solo repetirle "llama la tool ya".
+                        tool_call_nudge_given = True
+                        nudge = TOOL_CALL_NUDGE_MESSAGE if has_investigated else TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION
+                        messages.append({"role": "user", "content": nudge})
+                        continue
+
                     try:
                         result = _extract_json(final_text)
                     except json.JSONDecodeError:
