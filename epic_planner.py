@@ -167,7 +167,7 @@ async def plan_epic(epic: dict, children: list) -> dict:
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT
+                    client, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT, force_json=True,
                 )
                 messages.append({"role": "assistant", "content": content})
 

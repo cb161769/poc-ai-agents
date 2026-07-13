@@ -711,7 +711,7 @@ async def run_coding_agent(
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
                     client, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
-                    ollama_model=CODING_AGENT_OLLAMA_MODEL,
+                    ollama_model=CODING_AGENT_OLLAMA_MODEL, force_json=True,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)

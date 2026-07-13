@@ -262,6 +262,75 @@ def test_call_model_turn_ollama_respects_num_ctx_env_override(monkeypatch):
     assert captured["json"]["options"]["num_ctx"] == 16384
 
 
+def test_call_model_turn_ollama_sends_temperature_zero_by_default(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["options"]["temperature"] == 0.0
+
+
+def test_call_model_turn_ollama_respects_temperature_env_override(monkeypatch):
+    monkeypatch.setattr(agent_loop, "OLLAMA_TEMPERATURE", 0.4)
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["options"]["temperature"] == 0.4
+
+
+def test_call_model_turn_ollama_warns_when_tools_offered_but_ignored_and_not_json(monkeypatch):
+    """Se ofrecieron tools reales (para investigar antes de actuar) y el
+    modelo no las uso, y lo que devolvio tampoco es JSON valido -- ni
+    tool-call ni respuesta final utilizable. Confirmado real esta sesion con
+    qwen2.5-coder:7b contra Ollama en vivo (nunca llamo ninguna tool)."""
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": "che, dejame pensarlo un toque"}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert any("posible alucinacion" in w for w in warnings)
+
+
+def test_call_model_turn_ollama_no_warning_when_final_answer_is_valid_json(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": '{"status": "done", "summary": "ok"}'}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert warnings == []
+
+
 def test_call_model_turn_ollama_force_json_sets_format(monkeypatch):
     captured = {}
     client = MagicMock()
@@ -341,6 +410,55 @@ def test_ollama_response_to_blocks_parses_valid_string_arguments_without_warning
     assert warnings == []
 
 
+def test_ollama_response_to_blocks_falls_back_to_plaintext_json_tool_call(monkeypatch):
+    """qwen2.5-coder:7b real (confirmado contra Ollama en vivo esta sesion)
+    nunca completa message.tool_calls -- escribe la llamada como JSON plano
+    en content: {"name": "read_file", "arguments": {...}}. Sin este
+    fallback, agent_loop lo trataba como respuesta final de texto en vez de
+    una tool-call real, y la corrida entera terminaba "blocked" sin haber
+    intentado ni una tool.
+    """
+    message = {"content": '{"name": "read_file", "arguments": {"path": "README.md"}}'}
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: None)
+
+    blocks, stop_reason = _ollama_response_to_blocks(message, {"read_file", "write_file"})
+
+    assert stop_reason == "tool_use"
+    assert blocks == [{"type": "tool_use", "id": "ollama_call_fallback_0", "name": "read_file", "input": {"path": "README.md"}}]
+
+
+def test_ollama_response_to_blocks_ignores_plaintext_json_for_unknown_tool_name(monkeypatch):
+    """Si el nombre no esta entre las tools ofrecidas, no lo confunde con
+    una tool-call real -- se trata como texto final normal (evita falsos
+    positivos con una respuesta JSON legitima que use la clave "name" por
+    otra razon)."""
+    message = {"content": '{"name": "algo_que_no_ofrecimos", "arguments": {}}'}
+
+    blocks, stop_reason = _ollama_response_to_blocks(message, {"read_file"})
+
+    assert stop_reason == "end_turn"
+    assert blocks == [{"type": "text", "text": message["content"]}]
+
+
+def test_ollama_response_to_blocks_real_tool_calls_take_priority_over_fallback(monkeypatch):
+    """Si message.tool_calls SI viene poblado, nunca se activa el fallback
+    de texto plano, aunque content tambien tenga forma de tool-call."""
+    message = {
+        "content": '{"name": "algo", "arguments": {}}',
+        "tool_calls": [{"function": {"name": "read_file", "arguments": {"path": "a.py"}}}],
+    }
+
+    blocks, stop_reason = _ollama_response_to_blocks(message, {"read_file"})
+
+    assert stop_reason == "tool_use"
+    tool_block = next(b for b in blocks if b["type"] == "tool_use")
+    assert tool_block["name"] == "read_file"
+    assert tool_block["input"] == {"path": "a.py"}
+    # No aparece ningun bloque sintetizado por el fallback -- el tool_calls
+    # real siempre tiene prioridad.
+    assert all(b.get("id") != "ollama_call_fallback_0" for b in blocks)
+
+
 def test_ollama_model_available_true_when_exact_name_present(monkeypatch):
     resp = MagicMock()
     resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "qwen2.5-coder:7b"}]}
@@ -391,6 +509,21 @@ def test_call_with_fallback_falls_back_to_next_backend_on_failure(monkeypatch):
 
     assert backend_used == "ollama"
     assert stop_reason == "end_turn"
+
+
+def test_call_with_fallback_forwards_force_json(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_backend_available", lambda backend: backend == "ollama")
+    captured = {}
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
+        captured["force_json"] = kwargs.get("force_json")
+        return [{"type": "text", "text": '{"ok": true}'}], "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
+
+    asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys", force_json=True))
+
+    assert captured["force_json"] is True
 
 
 def test_call_with_fallback_reraises_when_all_backends_fail(monkeypatch):

@@ -391,7 +391,7 @@ async def judge_with_tools(payload: dict) -> dict:
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=JUDGE_OLLAMA_MODEL,
+                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=JUDGE_OLLAMA_MODEL, force_json=True,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)

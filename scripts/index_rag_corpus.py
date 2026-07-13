@@ -35,6 +35,12 @@ VECTOR_SIZE = 384  # all-MiniLM-L6-v2 output dimension
 # antes), toda query real del MCP falla con 400 "Vector with name
 # fast-all-minilm-l6-v2 is not configured in this collection".
 MCP_VECTOR_NAME = "fast-all-minilm-l6-v2"
+# mcp-server-qdrant lee el contenido de cada resultado EXCLUSIVAMENTE de
+# payload["document"] (Entry.content = result.payload["document"], sin
+# fallback) -- payload.get("metadata") es el unico campo opcional. Guardar
+# el texto bajo cualquier otra clave (como "text"/"summary"/"message", el
+# valor de antes) hace que TODA busqueda real del MCP crashee con
+# KeyError: 'document', sin importar que el resto de los datos sea correcto.
 
 SOURCE_EXTENSIONS = {".java", ".ts", ".py"}
 
@@ -63,7 +69,7 @@ def index_sample_repo_code(client: QdrantClient, model: SentenceTransformer):
                 PointStruct(
                     id=str(uuid.uuid5(uuid.NAMESPACE_URL, str(path))),
                     vector={MCP_VECTOR_NAME: vector},
-                    payload={"path": str(path.relative_to(SAMPLE_REPO_DIR)), "text": text},
+                    payload={"document": text, "metadata": {"path": str(path.relative_to(SAMPLE_REPO_DIR))}},
                 )
             )
     if points:
@@ -106,7 +112,7 @@ def index_jira_history(client: QdrantClient, model: SentenceTransformer):
             PointStruct(
                 id=str(uuid.uuid5(uuid.NAMESPACE_URL, issue.get("key", str(uuid.uuid4())))),
                 vector={MCP_VECTOR_NAME: vector},
-                payload={"ticket_id": issue.get("key"), "summary": summary},
+                payload={"document": text, "metadata": {"ticket_id": issue.get("key")}},
             )
         )
     if points:
@@ -135,7 +141,10 @@ def index_sonar_history(client: QdrantClient, model: SentenceTransformer):
             PointStruct(
                 id=str(uuid.uuid4()),
                 vector={MCP_VECTOR_NAME: vector},
-                payload={"rule": issue.get("rule"), "message": issue.get("message"), "component": issue.get("component")},
+                payload={
+                    "document": text,
+                    "metadata": {"rule": issue.get("rule"), "component": issue.get("component")},
+                },
             )
         )
     if points:

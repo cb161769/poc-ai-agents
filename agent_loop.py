@@ -61,6 +61,14 @@ OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
 # Ollama como unico backend (Anthropic sin credito), el patron recurrente
 # fue JSON vacio/invalido en las respuestas finales.
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+# Sin esto, Ollama usa la temperatura default del modelo (tipicamente ~0.7-0.8,
+# pensada para charla natural) para TODO -- incluida la respuesta final que
+# coding_agent.py/judge_agent.py esperan como JSON estricto. Mas creatividad
+# ahi es mas chance de narrar en vez de devolver el esquema pedido, o de
+# "inventar" hechos en vez de usar las tools reales para confirmarlos. 0.0
+# (deterministico) es el default correcto para tareas de verificacion, no
+# de generacion creativa.
+OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.0"))
 
 # Pricing y orden de preferencia viven en llm_backends.py (el registro de
 # backends) -- _estimate_cost_usd() se mantiene aca como wrapper fino para
@@ -156,13 +164,46 @@ def _messages_to_ollama(messages: list) -> list:
     return out
 
 
-def _ollama_response_to_blocks(message: dict) -> tuple:
+def _text_as_fallback_tool_call(text: str, offered_tool_names: set) -> dict | None:
+    """Algunos modelos locales (confirmado con qwen2.5-coder:7b contra
+    Ollama real) nunca completan message.tool_calls -- en vez de eso,
+    escriben la llamada como JSON plano en el campo content, con forma
+    {"name": "...", "arguments": {...}}. Sin este fallback, agent_loop trata
+    ese texto como la respuesta final del modelo (no una tool-call real):
+    coding_agent.py/judge_agent.py esperan un esquema distinto ahi
+    ({"status":...}/{"verdict":...}), el parseo de JSON falla, y la corrida
+    entera termina en "blocked" sin haber intentado ni una tool.
+    """
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    name = parsed.get("name")
+    if not isinstance(name, str) or "arguments" not in parsed:
+        return None
+    if offered_tool_names and name not in offered_tool_names:
+        return None
+    arguments = parsed.get("arguments")
+    return {"name": name, "arguments": arguments if isinstance(arguments, dict) else {}}
+
+
+def _ollama_response_to_blocks(message: dict, offered_tool_names: set | None = None) -> tuple:
     blocks = []
     text = message.get("content") or ""
-    if text:
+
+    tool_calls = list(message.get("tool_calls") or [])
+    fallback_call = None
+    if not tool_calls and text:
+        fallback_call = _text_as_fallback_tool_call(text, offered_tool_names or set())
+
+    if text and fallback_call is None:
         blocks.append({"type": "text", "text": text})
 
-    tool_calls = message.get("tool_calls") or []
     for i, tc in enumerate(tool_calls):
         fn = tc.get("function", {})
         arguments = fn.get("arguments", {})
@@ -180,7 +221,14 @@ def _ollama_response_to_blocks(message: dict) -> tuple:
                 arguments = {}
         blocks.append({"type": "tool_use", "id": f"ollama_call_{i}", "name": fn.get("name"), "input": arguments})
 
-    stop_reason = "tool_use" if tool_calls else "end_turn"
+    if fallback_call is not None:
+        logger.warning(
+            f"ollama: '{fallback_call['name']}' llegó como JSON plano en content en vez de "
+            "message.tool_calls -- usando fallback en vez de tratarlo como respuesta final."
+        )
+        blocks.append({"type": "tool_use", "id": "ollama_call_fallback_0", "name": fallback_call["name"], "input": fallback_call["arguments"]})
+
+    stop_reason = "tool_use" if (tool_calls or fallback_call is not None) else "end_turn"
     return blocks, stop_reason
 
 
@@ -233,8 +281,11 @@ async def _call_model_turn(
     decodificacion a JSON valido por gramatica (parametro real de
     /api/chat, no un truco de prompt). Se ignora en Anthropic, que ya
     devuelve JSON valido de forma confiable cuando el backend en si
-    funciona -- usado por _final_text_with_json_retry() cuando ya sabemos
-    que el texto anterior no fue JSON valido.
+    funciona. Usado siempre por _final_text_with_json_retry() (ya sabemos
+    que el texto anterior no fue JSON valido) -- y opcionalmente por el
+    loop principal de coding_agent.py/judge_agent.py desde el primer turno,
+    para que el modelo no tenga una vuelta libre en texto narrativo antes
+    de que se lo empiece a forzar.
     """
     anthropic_model = anthropic_model or ANTHROPIC_MODEL
     ollama_model = ollama_model or OLLAMA_MODEL
@@ -293,7 +344,11 @@ async def _call_model_turn(
             "model": ollama_model,
             "messages": ollama_messages,
             "stream": False,
-            "options": {"num_predict": MODEL_LIMITS["ollama"]["max_tokens"], "num_ctx": OLLAMA_NUM_CTX},
+            "options": {
+                "num_predict": MODEL_LIMITS["ollama"]["max_tokens"],
+                "num_ctx": OLLAMA_NUM_CTX,
+                "temperature": OLLAMA_TEMPERATURE,
+            },
         }
         if tools:
             request_body["tools"] = _tools_to_ollama_format(tools)
@@ -304,8 +359,28 @@ async def _call_model_turn(
             client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=OLLAMA_TIMEOUT_SECONDS
         )
         data = resp.json()
-        blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}))
+        offered_tool_names = {t["name"] for t in tools} if tools else set()
+        blocks, stop_reason = _ollama_response_to_blocks(data.get("message", {}), offered_tool_names)
         usage = {"input_tokens": data.get("prompt_eval_count", 0), "output_tokens": data.get("eval_count", 0)}
+
+        if offered_tool_names and stop_reason == "end_turn":
+            raw_text = next((b["text"] for b in blocks if b.get("type") == "text"), "")
+            try:
+                json.loads(raw_text.strip())
+                looks_like_valid_answer = True
+            except (json.JSONDecodeError, ValueError):
+                looks_like_valid_answer = False
+            if not looks_like_valid_answer:
+                # Se le ofrecieron tools reales (para investigar antes de
+                # actuar) y no las uso, Y lo que devolvio tampoco es un JSON
+                # valido -- ni tool-call ni respuesta final utilizable. Senal
+                # real de que el modelo esta "alucinando" en vez de verificar
+                # con las herramientas disponibles.
+                logger.warning(
+                    f"ollama ({ollama_model}): se ofrecieron {len(offered_tool_names)} tool(s) y no se uso "
+                    "ninguna, y la respuesta tampoco es JSON valido -- posible alucinacion sin verificar con tools."
+                )
+
         return blocks, stop_reason, usage
 
     raise RuntimeError("ni ANTHROPIC_API_KEY ni un Ollama local disponible")
@@ -313,7 +388,7 @@ async def _call_model_turn(
 
 async def call_with_fallback(
     client: httpx.AsyncClient, messages: list, tools: list, system_prompt: str, exclude: set = None,
-    anthropic_model: str = None, ollama_model: str = None,
+    anthropic_model: str = None, ollama_model: str = None, force_json: bool = False,
 ) -> tuple:
     """Fallback EN VIVO entre backends -- a diferencia de _select_backend()
     (que elige un backend una sola vez al arrancar la corrida), esto se
@@ -323,7 +398,12 @@ async def call_with_fallback(
     matar la corrida entera.
 
     anthropic_model/ollama_model: mismo override por-agente que
-    _call_model_turn -- se reenvian tal cual.
+    _call_model_turn -- se reenvian tal cual. force_json: idem (ver
+    docstring de _call_model_turn) -- coding_agent.py/judge_agent.py lo
+    pasan en True incluso en el turno inicial (no solo en el reintento de
+    correccion), porque ambos esperan JSON estricto en la respuesta final y
+    dejarlo sin forzar hasta el reintento le da al modelo una vuelta libre
+    para responder en texto narrativo (o alucinar) antes de corregirse.
 
     Devuelve (content_blocks, stop_reason, usage, backend_used) -- un
     elemento mas que _call_model_turn (que backend realmente respondio),
@@ -345,7 +425,7 @@ async def call_with_fallback(
         try:
             blocks, stop_reason, usage = await _call_model_turn(
                 client, backend, messages, tools, system_prompt,
-                anthropic_model=anthropic_model, ollama_model=ollama_model,
+                anthropic_model=anthropic_model, ollama_model=ollama_model, force_json=force_json,
             )
             return blocks, stop_reason, usage, backend
         except Exception as exc:
