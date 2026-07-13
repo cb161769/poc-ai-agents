@@ -52,6 +52,15 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 # (el juez supero 120s y crasheo el subproceso entero via ReadTimeout antes
 # de este cambio). Configurable si tu hardware es mas lento/rapido.
 OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
+# Ventana de contexto de ENTRADA -- distinto de num_predict (limite de
+# tokens de SALIDA, en MODEL_LIMITS). Sin esto, Ollama usa el default del
+# modelo (2048-4096 en muchos casos), y con los prompts largos de este
+# pipeline (grafo + Sonar + el esquema JSON pedido al final del system
+# prompt) la parte final -- justo donde esta el esquema -- se puede estar
+# truncando en silencio. Confirmado como sospechoso real esta sesion: con
+# Ollama como unico backend (Anthropic sin credito), el patron recurrente
+# fue JSON vacio/invalido en las respuestas finales.
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 
 # Pricing y orden de preferencia viven en llm_backends.py (el registro de
 # backends) -- _estimate_cost_usd() se mantiene aca como wrapper fino para
@@ -78,6 +87,22 @@ def _backend_available(backend: str) -> bool:
     if not reachable:
         return False
     return is_within_budget(backend)
+
+
+def _ollama_model_available(model: str) -> bool:
+    """Best-effort: _backend_available("ollama") ya confirma que el
+    servidor responde -- esto ademas confirma que el modelo PEDIDO esta
+    realmente descargado. Sin esto, un nombre mal escrito o un modelo
+    nunca 'ollama pull'-eado (ej. probando CODING_AGENT_OLLAMA_MODEL/
+    JUDGE_OLLAMA_MODEL por primera vez) recien fallaba a mitad de una
+    corrida real, sin ningun aviso previo.
+    """
+    try:
+        resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
+        names = {m.get("name") for m in resp.json().get("models", [])}
+        return model in names or any(n.startswith(f"{model}:") for n in names)
+    except httpx.HTTPError:
+        return False
 
 
 def _select_backend() -> str:
@@ -145,6 +170,13 @@ def _ollama_response_to_blocks(message: dict) -> tuple:
             try:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
+                # Antes esto caia a {} en silencio -- una tool real
+                # (write_file/edit_file) terminaba llamada con argumentos
+                # vacios sin ningun rastro de que el parseo fallo.
+                logger.warning(
+                    f"ollama: argumentos de tool-call '{fn.get('name')}' no son JSON valido, "
+                    f"se llama con {{}} -- crudo: {arguments[:300]!r}"
+                )
                 arguments = {}
         blocks.append({"type": "tool_use", "id": f"ollama_call_{i}", "name": fn.get("name"), "input": arguments})
 
@@ -185,7 +217,7 @@ async def _post_with_retry(client: httpx.AsyncClient, backend: str, url: str, **
 
 async def _call_model_turn(
     client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str,
-    anthropic_model: str = None, ollama_model: str = None,
+    anthropic_model: str = None, ollama_model: str = None, force_json: bool = False,
 ) -> tuple:
     """Returns (content_blocks, stop_reason, usage) normalized to the
     Anthropic content-block shape regardless of which backend answered.
@@ -196,6 +228,13 @@ async def _call_model_turn(
     pedir su propio modelo -- ej. CODING_AGENT_OLLAMA_MODEL vs
     JUDGE_OLLAMA_MODEL) -- caen a las constantes globales si no se pasan,
     asi que un caller que no los usa no nota diferencia.
+
+    force_json: solo tiene efecto con backend "ollama" -- fuerza la
+    decodificacion a JSON valido por gramatica (parametro real de
+    /api/chat, no un truco de prompt). Se ignora en Anthropic, que ya
+    devuelve JSON valido de forma confiable cuando el backend en si
+    funciona -- usado por _final_text_with_json_retry() cuando ya sabemos
+    que el texto anterior no fue JSON valido.
     """
     anthropic_model = anthropic_model or ANTHROPIC_MODEL
     ollama_model = ollama_model or OLLAMA_MODEL
@@ -254,10 +293,12 @@ async def _call_model_turn(
             "model": ollama_model,
             "messages": ollama_messages,
             "stream": False,
-            "options": {"num_predict": MODEL_LIMITS["ollama"]["max_tokens"]},
+            "options": {"num_predict": MODEL_LIMITS["ollama"]["max_tokens"], "num_ctx": OLLAMA_NUM_CTX},
         }
         if tools:
             request_body["tools"] = _tools_to_ollama_format(tools)
+        if force_json:
+            request_body["format"] = "json"
 
         resp = await _post_with_retry(
             client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=OLLAMA_TIMEOUT_SECONDS
@@ -331,9 +372,13 @@ async def _final_text_with_json_retry(
     valid JSON.
     """
     messages.append({"role": "user", "content": JSON_CORRECTION_MESSAGE})
+    # Ya sabemos que el texto anterior no fue JSON valido -- acá le pedimos
+    # texto corregido, no otra tool-call, asi que no se reenvian los tools
+    # originales; force_json fuerza la gramatica JSON en Ollama (ignorado en
+    # Anthropic, ver docstring de _call_model_turn).
     content, _stop_reason, usage = await _call_model_turn(
-        client, backend, messages, tools, system_prompt,
-        anthropic_model=anthropic_model, ollama_model=ollama_model,
+        client, backend, messages, [], system_prompt,
+        anthropic_model=anthropic_model, ollama_model=ollama_model, force_json=True,
     )
     messages.append({"role": "assistant", "content": content})
     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")

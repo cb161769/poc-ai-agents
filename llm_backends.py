@@ -79,7 +79,11 @@ RETRY_POLICY_PER_BACKEND = {
 # existir.
 MODEL_LIMITS = {
     "anthropic": {"max_tokens": 1536},
-    "ollama": {"max_tokens": 1536},
+    # Ollama es local/gratis (sin tradeoff de costo, a diferencia de
+    # Anthropic) -- mas alto para que un JSON con format:"json" forzado no
+    # se corte antes de cerrar el objeto, que es JSON invalido igual aunque
+    # la gramatica este bien.
+    "ollama": {"max_tokens": 4096},
 }
 
 _LOG_DIR = Path(__file__).resolve().parent / "logs"

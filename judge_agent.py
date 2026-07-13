@@ -62,6 +62,7 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
     _final_text_with_json_retry,
     _messages_to_ollama,
     _normalize_tool_schema,
+    _ollama_model_available,
     _ollama_response_to_blocks,
     _select_backend,
     call_with_fallback,
@@ -352,6 +353,11 @@ tests es suficiente para el cambio real, no asumas que "paso" significa \
 async def judge_with_tools(payload: dict) -> dict:
     backend = _select_backend()
     logger.info(f"juez: usando backend '{backend}'")
+    if backend == "ollama" and not _ollama_model_available(JUDGE_OLLAMA_MODEL):
+        logger.warning(
+            f"juez: el modelo '{JUDGE_OLLAMA_MODEL}' no aparece en 'ollama list' -- "
+            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
+        )
 
     start_time = time.monotonic()
     total_input_tokens = 0

@@ -34,10 +34,12 @@ from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
 from agent_loop import (
+    OLLAMA_MODEL,
     _call_mcp_tool,
     _connect_mcp_servers,
     _final_text_with_json_retry,
     _normalize_tool_schema,
+    _ollama_model_available,
     _select_backend,
     call_with_fallback,
 )
@@ -143,6 +145,11 @@ async def plan_epic(epic: dict, children: list) -> dict:
         return _fallback_result(children)
 
     logger.info(f"epic planner: usando backend '{backend}'")
+    if backend == "ollama" and not _ollama_model_available(OLLAMA_MODEL):
+        logger.warning(
+            f"epic planner: el modelo '{OLLAMA_MODEL}' no aparece en 'ollama list' -- "
+            "probablemente falta 'ollama pull', cae al orden mecanico si falla mas adelante."
+        )
 
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="epic planner")

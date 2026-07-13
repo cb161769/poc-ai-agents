@@ -145,6 +145,13 @@ services:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
+    environment:
+      # Default de Ollama: descarga el modelo de VRAM a los 5 minutos de
+      # inactividad. El modo --epic secuencial (orchestration.py) deja
+      # pasar minutos reales entre el turno de una historia y la siguiente
+      # (tests, rescan de Sonar, juez) -- sin esto, cada historia paga de
+      # nuevo el cold-start (~40s) del modelo.
+      OLLAMA_KEEP_ALIVE: "30m"
     # GPU real si el host la tiene (docker info listando el runtime "nvidia"
     # confirma que esta disponible) -- sin esto, ollama/ollama:latest cae a
     # CPU en silencio ("GPU device discovery failed... entering low vram

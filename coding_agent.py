@@ -55,6 +55,7 @@ from agent_loop import (
     _estimate_cost_usd,
     _final_text_with_json_retry,
     _normalize_tool_schema,
+    _ollama_model_available,
     _select_backend,
     call_with_fallback,
     compact_old_tool_results,
@@ -644,6 +645,11 @@ async def run_coding_agent(
     logger.info(f"coding agent: usando backend '{backend}'")
     if backend == "none":
         return {"status": "blocked", "summary": "ni ANTHROPIC_API_KEY ni Ollama disponibles", "files_changed": [], "_meta": {}}
+    if backend == "ollama" and not _ollama_model_available(CODING_AGENT_OLLAMA_MODEL):
+        logger.warning(
+            f"coding agent: el modelo '{CODING_AGENT_OLLAMA_MODEL}' no aparece en 'ollama list' -- "
+            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
+        )
 
     start_time = time.monotonic()
     total_input_tokens = 0

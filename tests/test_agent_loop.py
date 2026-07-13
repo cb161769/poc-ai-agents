@@ -13,6 +13,8 @@ import agent_loop
 from agent_loop import (
     JSON_CORRECTION_MESSAGE,
     _final_text_with_json_retry,
+    _ollama_model_available,
+    _ollama_response_to_blocks,
     _post_with_retry,
     call_with_fallback,
     compact_old_tool_results,
@@ -225,6 +227,151 @@ def test_call_model_turn_ollama_falls_back_to_global_model_without_override(monk
     asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
 
     assert captured["json"]["model"] == agent_loop.OLLAMA_MODEL
+
+
+def _fake_ollama_post_capturing(captured):
+    async def fake_post(url, **kwargs):
+        captured["json"] = kwargs["json"]
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    return fake_post
+
+
+def test_call_model_turn_ollama_sends_num_ctx_option(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["options"]["num_ctx"] == agent_loop.OLLAMA_NUM_CTX
+
+
+def test_call_model_turn_ollama_respects_num_ctx_env_override(monkeypatch):
+    monkeypatch.setattr(agent_loop, "OLLAMA_NUM_CTX", 16384)
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["options"]["num_ctx"] == 16384
+
+
+def test_call_model_turn_ollama_force_json_sets_format(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(
+        agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", force_json=True)
+    )
+
+    assert captured["json"]["format"] == "json"
+
+
+def test_call_model_turn_ollama_without_force_json_omits_format(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert "format" not in captured["json"]
+
+
+def test_final_text_with_json_retry_ollama_forces_json_and_drops_tools(monkeypatch):
+    captured = {}
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
+        captured["tools"] = tools
+        captured["force_json"] = kwargs.get("force_json")
+        return [{"type": "text", "text": '{"ok": true}'}], "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
+
+    messages = [{"role": "user", "content": "hola"}]
+    asyncio.run(
+        _final_text_with_json_retry(
+            client=None, backend="ollama", messages=messages,
+            tools=[{"name": "some_tool"}], system_prompt="sys",
+        )
+    )
+
+    assert captured["tools"] == []
+    assert captured["force_json"] is True
+
+
+def test_ollama_response_to_blocks_warns_and_defaults_to_empty_args_on_malformed_json(monkeypatch):
+    """Antes esto caia a {} en silencio -- una tool real terminaba llamada
+    con argumentos vacios sin ningun rastro de que el parseo fallo.
+    log_utils.get_logger() usa propagate=False, asi que caplog no lo
+    captura -- se mockea logger.warning directo (mismo patron que
+    test_orchestration.py::test_comment_jira_logs_instead_of_raising_on_failure).
+    """
+    message = {
+        "content": "",
+        "tool_calls": [{"function": {"name": "write_file", "arguments": "{esto no es json valido"}}],
+    }
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    blocks, stop_reason = _ollama_response_to_blocks(message)
+
+    assert stop_reason == "tool_use"
+    assert blocks[0]["input"] == {}
+    assert any("write_file" in w and "no son JSON valido" in w for w in warnings)
+
+
+def test_ollama_response_to_blocks_parses_valid_string_arguments_without_warning(monkeypatch):
+    message = {
+        "content": "",
+        "tool_calls": [{"function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}],
+    }
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    blocks, _stop_reason = _ollama_response_to_blocks(message)
+
+    assert blocks[0]["input"] == {"path": "a.py"}
+    assert warnings == []
+
+
+def test_ollama_model_available_true_when_exact_name_present(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "qwen2.5-coder:7b"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert _ollama_model_available("qwen2.5-coder:7b") is True
+
+
+def test_ollama_model_available_true_when_bare_name_matches_a_tag(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert _ollama_model_available("llama3.1") is True
+
+
+def test_ollama_model_available_false_when_model_missing(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert _ollama_model_available("qwen2.5-coder:7b") is False
+
+
+def test_ollama_model_available_false_when_server_unreachable(monkeypatch):
+    def fake_get(*a, **k):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(agent_loop.httpx, "get", fake_get)
+
+    assert _ollama_model_available("llama3.1") is False
 
 
 def test_call_with_fallback_falls_back_to_next_backend_on_failure(monkeypatch):

@@ -34,6 +34,16 @@ def test_anthropic_retry_policy_includes_529_overloaded():
     assert 529 in llm_backends.RETRY_POLICY_PER_BACKEND["anthropic"]["retryable_status_codes"]
 
 
+def test_ollama_max_tokens_is_higher_than_anthropic():
+    """Ollama es local/gratis (sin tradeoff de costo) -- un tope mas alto
+    que Anthropic evita que un JSON con format:"json" forzado se corte
+    antes de cerrar el objeto, que sigue siendo JSON invalido aunque la
+    gramatica este bien.
+    """
+    assert llm_backends.MODEL_LIMITS["ollama"]["max_tokens"] == 4096
+    assert llm_backends.MODEL_LIMITS["ollama"]["max_tokens"] > llm_backends.MODEL_LIMITS["anthropic"]["max_tokens"]
+
+
 def test_estimate_cost_usd_known_backend_and_model():
     assert llm_backends.estimate_cost_usd("anthropic", "claude-sonnet-5", 1_000_000, 0) == 3.0
 
