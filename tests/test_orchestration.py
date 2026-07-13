@@ -20,6 +20,7 @@ from orchestration import (
     _format_conflicts_section,
     _handle_rejected,
     _resolve_single_repo,
+    _retry_after_no_changes,
     _retry_local_diff,
     _transition_all,
 )
@@ -222,6 +223,116 @@ def test_retry_local_diff_mirrors_blocked_transition_to_epic_children(monkeypatc
         (orchestration.JIRA_BLOCKED_STATUS, "CHILD-1"),
         (orchestration.JIRA_BLOCKED_STATUS, "CHILD-2"),
     ]
+
+
+_NOT_APPLIED_AGENT_RESULT = {
+    "applied": False, "branch": None, "base_branch": "main", "backend": "ollama",
+    "conversation_file": "/tmp/conv_no_changes.json", "self_review": None,
+}
+_FLAGGED_OTHER = {"verdict": "FLAGGED", "reasoning": "implementa las paginas de error", "policy_reference": "other"}
+
+
+def test_retry_after_no_changes_returns_new_verdict_and_mutates_agent_result(monkeypatch):
+    """Bug real confirmado esta sesion (KAN-15): antes, cuando el primer
+    intento no aplicaba nada y el juez marcaba FLAGGED con una sugerencia
+    concreta, esa sugerencia nunca volvia al coding agent. Este reintento
+    tiene que: crear una rama nueva (la primera se borro), pasarle el
+    feedback del juez, y si esta vez SI aplica algo, mutar agent_result
+    (branch/applied/backend) para que _deliver() vea la rama nueva.
+    """
+    git_calls = []
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: git_calls.append(cmd))
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}})
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ahora si"})
+
+    agent_result = dict(_NOT_APPLIED_AGENT_RESULT)
+    result = _retry_after_no_changes(
+        "T-1", "prompt original", "/repo", agent_result, _FLAGGED_OTHER,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["Frontend"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert result == {"verdict": "OK", "reasoning": "ahora si"}
+    assert agent_result["applied"] is True
+    assert agent_result["branch"] is not None
+    assert any(cmd[:4] == ["git", "-C", "/repo", "checkout"] and "-b" in cmd for cmd in git_calls)
+
+
+def test_retry_after_no_changes_returns_none_and_cleans_up_when_still_nothing_applied(monkeypatch):
+    git_calls = []
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: git_calls.append(cmd))
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": False, "backend": None})
+
+    agent_result = dict(_NOT_APPLIED_AGENT_RESULT)
+    result = _retry_after_no_changes(
+        "T-1", "prompt original", "/repo", agent_result, _FLAGGED_OTHER,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["Frontend"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert result is None
+    assert agent_result["applied"] is False  # no mutado -- el reintento tampoco aplico nada
+    # se limpia la rama nueva que se creo para el reintento (checkout de vuelta + delete)
+    assert ["git", "-C", "/repo", "checkout", "main"] in git_calls
+    assert any(cmd[:4] == ["git", "-C", "/repo", "branch"] and cmd[4] == "-D" for cmd in git_calls)
+
+
+def test_deliver_retries_and_recovers_when_no_changes_applied_but_judge_flags(monkeypatch):
+    """Integracion real: _deliver() en el camino local, primer intento no
+    aplica nada, el juez marca FLAGGED con policy_reference "other" (no
+    esta en RETRYABLE_POLICY_REFERENCES -- este camino no se gatea por
+    eso) -- tiene que reintentar solo, y si el reintento aplica algo y
+    queda OK, terminar en push_and_open_pr con la rama NUEVA.
+    """
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": False, "branch": None, "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+
+    judge_calls = {"n": 0}
+
+    def fake_judge_safe(*a, **k):
+        judge_calls["n"] += 1
+        if judge_calls["n"] == 1:
+            return dict(_FLAGGED_OTHER)
+        return {"verdict": "OK", "reasoning": "el reintento si aplico algo"}
+
+    monkeypatch.setattr(orchestration, "_run_judge_safe", fake_judge_safe)
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: None)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+
+    pr_calls = []
+    monkeypatch.setattr(
+        orchestration, "push_and_open_pr",
+        lambda target_repo_dir, branch, base_branch, *a, **k: pr_calls.append(branch) or {"pr_url": "https://x/pr/1", "pushed": True, "reason": None},
+    )
+
+    result = _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert judge_calls["n"] == 2
+    assert result["judge"]["verdict"] == "OK"
+    assert len(pr_calls) == 1
+    assert pr_calls[0] is not None  # la rama NUEVA creada por el reintento, no None
 
 
 def test_comment_all_posts_once_in_ticket_mode(monkeypatch):

@@ -556,11 +556,15 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
-    if conversation_file:
-        Path(conversation_file).unlink(missing_ok=True)
+    # Ya NO se borra el conversation_file aca (antes si) -- _deliver()
+    # necesita poder reintentar con el feedback real del juez cuando el
+    # primer intento no aplico nada, y para eso necesita continuar la MISMA
+    # conversacion (investigacion ya hecha) en vez de repagarla de cero. El
+    # llamador que no reintenta simplemente lo deja huerfano en /tmp, mismo
+    # criterio que el resto de los conversation_file de esta corrida.
     return {
         "applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend,
-        "conversation_file": None, "self_review": None,
+        "conversation_file": conversation_file, "self_review": None,
     }
 
 
@@ -906,6 +910,78 @@ def _run_judge_safe(*args, **kwargs) -> dict | None:
         return None
 
 
+def _evaluate_new_diff_after_retry(
+    ticket_id: str,
+    branch: str,
+    base_branch: str,
+    backend: str | None,
+    self_review: dict | None,
+    target_repo_dir: str,
+    jira_context: dict,
+    firewall_result: dict,
+    components: list,
+    summary: str,
+    is_epic: bool,
+    child_ticket_keys: list | None,
+    falco_since: str,
+    label: str,
+    conflicts: list | None = None,
+) -> dict | None:
+    """Guardia de salida + tests + juez sobre un diff nuevo producido por un
+    reintento -- comun a _retry_local_diff (reintento tras FLAGGED con un
+    diff ya aplicado) y _retry_after_no_changes (reintento tras "el agente
+    no aplico nada"). label identifica el intento en los mensajes de Jira
+    (ej. "segundo intento") para que quede claro cual paso fallo.
+    """
+    diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..{branch}"])
+
+    guard_result = run_output_guard(diff_text, jira_context)
+    if not guard_result["clean"]:
+        reason = f"redacciones={guard_result['redactions_applied']}, jailbreak={guard_result['jailbreak_reason']}"
+        _comment_all(
+            f"🛡️ Guardia de salida (Prefect): el diff del {label} contiene evidencia real de fuga de "
+            f"datos o manipulacion ({reason}). Bloqueado antes del testing agent.",
+            ticket_id, is_epic, child_ticket_keys,
+        )
+        post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id} ({label}): {reason}")
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        check_falco_correlation(falco_since, ticket_id)
+        record_run_in_graph(
+            _build_graph_payload(
+                ticket_id, summary, components, firewall_result,
+                tests_status="SKIPPED", tests_reason=None,
+                judge_verdict=None, branch=branch, backend=backend,
+                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+                output_guard_status="FAILED", output_guard_reason=reason,
+            )
+        )
+        raise PipelineBlocked(f"guardia de salida bloqueo el {label}: {reason}")
+
+    test_result = run_tests(target_repo_dir)
+    if not test_result["passed"]:
+        _comment_all(f"🧪 Testing agent (Prefect): los tests reales FALLARON en el {label} de '{branch}'.", ticket_id, is_epic, child_ticket_keys)
+        post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id} ({label}): los tests reales fallaron en '{branch}'.")
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        check_falco_correlation(falco_since, ticket_id)
+        record_run_in_graph(
+            _build_graph_payload(
+                ticket_id, summary, components, firewall_result,
+                tests_status="FAILED", tests_reason=f"el test suite real fallo ({label})",
+                judge_verdict=None, branch=branch, backend=backend,
+                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
+            )
+        )
+        raise PipelineBlocked(f"tests reales fallaron en el {label}")
+
+    new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
+
+    return _run_judge_safe(
+        jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
+        self_review=self_review, falco_since=falco_since, conflicts=conflicts,
+        new_sonar_issues=new_sonar_issues,
+    )
+
+
 def _retry_local_diff(
     ticket_id: str,
     sanitized: str,
@@ -951,52 +1027,81 @@ def _retry_local_diff(
         return None
 
     branch = agent_result["branch"]
-    diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{branch}"])
+    return _evaluate_new_diff_after_retry(
+        ticket_id, branch, agent_result["base_branch"], retry_result.get("backend"), retry_result.get("self_review"),
+        target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
+        "segundo intento", conflicts=conflicts,
+    )
 
-    guard_result = run_output_guard(diff_text, jira_context)
-    if not guard_result["clean"]:
-        reason = f"redacciones={guard_result['redactions_applied']}, jailbreak={guard_result['jailbreak_reason']}"
-        _comment_all(
-            f"🛡️ Guardia de salida (Prefect): el diff del segundo intento contiene evidencia real de fuga de "
-            f"datos o manipulacion ({reason}). Bloqueado antes del testing agent.",
-            ticket_id, is_epic, child_ticket_keys,
-        )
-        post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id} (segundo intento): {reason}")
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
-        check_falco_correlation(falco_since, ticket_id)
-        record_run_in_graph(
-            _build_graph_payload(
-                ticket_id, summary, components, firewall_result,
-                tests_status="SKIPPED", tests_reason=None,
-                judge_verdict=None, branch=branch, backend=retry_result.get("backend"),
-                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
-                output_guard_status="FAILED", output_guard_reason=reason,
-            )
-        )
-        raise PipelineBlocked(f"guardia de salida bloqueo el segundo intento: {reason}")
 
-    test_result = run_tests(target_repo_dir)
-    if not test_result["passed"]:
-        _comment_all(f"🧪 Testing agent (Prefect): los tests reales FALLARON en el segundo intento de '{branch}'.", ticket_id, is_epic, child_ticket_keys)
-        post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id} (segundo intento): los tests reales fallaron en '{branch}'.")
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
-        check_falco_correlation(falco_since, ticket_id)
-        record_run_in_graph(
-            _build_graph_payload(
-                ticket_id, summary, components, firewall_result,
-                tests_status="FAILED", tests_reason="el test suite real fallo (segundo intento)",
-                judge_verdict=None, branch=branch, backend=retry_result.get("backend"),
-                is_epic=is_epic, child_ticket_keys=child_ticket_keys,
-            )
-        )
-        raise PipelineBlocked("tests reales fallaron en el segundo intento")
+def _retry_after_no_changes(
+    ticket_id: str,
+    sanitized: str,
+    target_repo_dir: str,
+    agent_result: dict,
+    judge_verdict: dict,
+    jira_context: dict,
+    firewall_result: dict,
+    components: list,
+    summary: str,
+    is_epic: bool,
+    child_ticket_keys: list | None,
+    falco_since: str,
+    conflicts: list | None = None,
+) -> dict | None:
+    """Mismo espiritu que _retry_local_diff, pero para cuando el PRIMER
+    intento no aplico NINGUN cambio real (agent_result["applied"] es
+    False) -- antes, un veredicto FLAGGED en ese caso (ej. el juez
+    sugiriendo una accion concreta como "implementa las paginas de error")
+    se comentaba en Jira y ahi quedaba, sin que esa guia volviera nunca al
+    coding agent (confirmado real esta sesion contra KAN-15). Reintenta
+    SIEMPRE que el juez marco FLAGGED aca -- a diferencia de
+    _retry_local_diff, no se gatea por RETRYABLE_POLICY_REFERENCES (esos
+    policy_reference estan pensados para evaluar un diff real; aca todavia
+    no hay ningun diff, asi que no aplican -- confirmado real: el juez le
+    asigna "other"). Como el primer intento no dejo ninguna rama viva (se
+    borro), este reintento crea una rama nueva antes de continuar la
+    conversacion.
+    """
+    reasoning = judge_verdict.get("reasoning", "")
+    feedback_text = (
+        f"{sanitized}\n\n--- FEEDBACK DEL JUEZ (tu intento anterior NO aplico ningun cambio real -- "
+        f"actua sobre este feedback en vez de volver a rendirte) ---\n{reasoning}"
+    )
 
-    new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
+    base_branch = agent_result.get("base_branch") or "main"
+    branch = f"copilot/{ticket_id}-{int(time.time())}"
+    subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
 
-    return _run_judge_safe(
-        jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
-        self_review=retry_result.get("self_review"), falco_since=falco_since, conflicts=conflicts,
-        new_sonar_issues=new_sonar_issues,
+    retry_result = retry_coding_agent_local_real(
+        ticket_id, feedback_text, target_repo_dir, conversation_file=agent_result.get("conversation_file")
+    )
+    if retry_result.get("conversation_file"):
+        Path(retry_result["conversation_file"]).unlink(missing_ok=True)
+
+    if not retry_result["applied"]:
+        print("El segundo intento tampoco aplico ningun cambio -- se mantiene el veredicto FLAGGED original.")
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
+        subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
+        return None
+
+    _comment_all(
+        f"🤖 Copilot (Prefect): segundo intento con el feedback del juez -- esta vez SI aplico un cambio "
+        f"en la rama '{branch}' de {target_repo_dir}, pendiente de revision humana.",
+        ticket_id, is_epic, child_ticket_keys,
+    )
+    # Mutamos agent_result (dict, pasado por referencia) para que _deliver()
+    # vea la rama nueva -- a diferencia de _retry_local_diff, aca la rama no
+    # existia todavia cuando el llamador arranco (el primer intento no
+    # aplico nada, no dejo ninguna rama viva), asi que no hay otra forma de
+    # que _deliver() se entere sin este side-effect explicito.
+    agent_result["branch"] = branch
+    agent_result["applied"] = True
+    agent_result["backend"] = retry_result.get("backend") or agent_result.get("backend")
+    return _evaluate_new_diff_after_retry(
+        ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
+        target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
+        "segundo intento (tras no aplicar nada)", conflicts=conflicts,
     )
 
 
@@ -1181,6 +1286,27 @@ def _deliver(
                 self_review=agent_result.get("self_review"), falco_since=falco_since, conflicts=conflicts,
             )
             tests_status, tests_reason = "SKIPPED", None
+
+            if judge_verdict is not None and judge_verdict.get("verdict") == "FLAGGED":
+                # Real: antes esto solo comentaba en Jira ("che, todavia no
+                # aplicaste nada") y ahi quedaba -- el feedback del juez
+                # (a veces una accion bien concreta, ej. "implementa las
+                # paginas de error") nunca volvia al coding agent. Un solo
+                # reintento real, con ese feedback como parte del prompt.
+                print("🔁 El agente no aplico nada y el juez lo marco FLAGGED -- dandole un segundo intento con su feedback.")
+                retried_verdict = _retry_after_no_changes(
+                    ticket_id, sanitized, target_repo_dir, agent_result, judge_verdict,
+                    jira_context, firewall_result, components, summary,
+                    is_epic, child_ticket_keys, falco_since, conflicts=conflicts,
+                )
+                if retried_verdict is not None:
+                    judge_verdict = retried_verdict
+                    # _retry_after_no_changes muto agent_result (branch
+                    # nuevo, applied=True) -- branch/backend locales tienen
+                    # que reflejarlo para que push_and_open_pr() mas abajo
+                    # use la rama correcta.
+                    branch = agent_result.get("branch")
+                    backend = agent_result.get("backend") or backend
 
     if judge_verdict is None:
         print("El juez no pudo evaluar esta corrida — continua sin veredicto.")
