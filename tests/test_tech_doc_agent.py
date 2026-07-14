@@ -7,6 +7,7 @@ respondio, y que cualquier fallo se trague en silencio (best-effort).
 import pytest
 
 import tech_doc_agent
+from tech_doc_agent import _looks_like_refusal, _strip_filler_sections
 
 
 def test_generate_technical_report_returns_none_when_disabled(monkeypatch):
@@ -49,6 +50,119 @@ def test_generate_technical_report_returns_none_when_no_backend_available(monkey
 
     async def fake_call_with_fallback(*a, **k):
         raise RuntimeError("ningun backend disponible (ni alcanzable ni dentro de presupuesto)")
+
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_call_with_fallback)
+
+    assert tech_doc_agent.generate_technical_report({"epica": "EPIC-1"}) is None
+
+
+def test_system_prompt_requires_omitting_sections_without_real_data():
+    """Auditoria real (confirmado esta sesion en KAN-2/KAN-4): el prompt
+    viejo pedia rellenar las 7 secciones SIEMPRE, lo que producia relleno
+    generico ("no se proporciona informacion... no fue provista en los
+    datos reales") en vez de omitir la seccion sin contenido real."""
+    assert "OMITILA POR COMPLETO" in tech_doc_agent._SYSTEM_PROMPT
+    assert "es mejor que uno completo con relleno" in tech_doc_agent._SYSTEM_PROMPT
+
+
+def test_strip_filler_sections_removes_real_boilerplate_observed_live():
+    """Caso real confirmado en vivo (KAN-5, epica KAN-4): pedirle al modelo
+    por prompt que omita secciones sin datos no alcanzo -- ollama igual
+    "completo el patron" de las 7 secciones con relleno. Este texto es
+    (recortado) el comprobante real que devolvio el modelo esa corrida."""
+    text = (
+        "**Resumen Ejecutivo y Objetivo**\n"
+        "-----------------------------\n\n"
+        "La corrida realizada correspondio a la epica KAN-4 y la historia KAN-5.\n\n"
+        "**Configuración del Entorno y Variables de Entorno**\n"
+        "-------------------------------------------------\n\n"
+        "No se proporciona información sobre la configuración del entorno o las "
+        "variables de entorno utilizadas en esta corrida.\n\n"
+        "**Resultado Real de la Corrida**\n"
+        "------------------------------\n\n"
+        "* **Resultado:** Bloqueada\n\n"
+        "**Prueba de Integración y Validación de API**\n"
+        "------------------------------------------\n\n"
+        "No se proporciona información sobre la prueba de integración y validación "
+        "de API realizada en esta corrida.\n"
+    )
+
+    cleaned = _strip_filler_sections(text)
+
+    assert "Configuración del Entorno" not in cleaned
+    assert "Prueba de Integración y Validación de API" not in cleaned
+    assert "No se proporciona información" not in cleaned
+    assert "Resumen Ejecutivo y Objetivo" in cleaned
+    assert "Resultado Real de la Corrida" in cleaned
+    assert "**Resultado:** Bloqueada" in cleaned
+
+
+def test_strip_filler_sections_keeps_section_with_real_content():
+    text = (
+        "**Ficha Tecnica del Modelo y Entorno**\n"
+        "-----------------------------------\n\n"
+        "* **Backend utilizado:** Ollama\n"
+        "* **Modelo Ollama Coding Agent:** Ornith:9b\n"
+    )
+
+    assert _strip_filler_sections(text) == text.strip()
+
+
+def test_strip_filler_sections_keeps_long_section_mentioning_filler_phrase_in_passing():
+    """Una seccion con contenido real sustancial no se descarta solo porque
+    UNA frase adentro se parezca al patron de relleno -- solo se descarta
+    si el cuerpo ENTERO es puro relleno (cuerpo corto)."""
+    long_body = (
+        "El coding agent aplico un cambio real en src/services/logger.ts, con 57 "
+        "inserciones. Los tests reales (vitest) pasaron 3/3. Nota: el tiempo de "
+        "carga en frio del modelo no se midieron con precision, pero el resto de "
+        "las metricas reales de esta corrida si estan disponibles y documentadas "
+        "arriba con el detalle correspondiente para auditoria completa."
+    )
+    text = f"**Resultado Real de la Corrida**\n------------------------------\n\n{long_body}\n"
+
+    assert _strip_filler_sections(text) == text
+
+
+def test_strip_filler_sections_no_headings_returns_text_unchanged():
+    assert _strip_filler_sections("solo texto plano, sin encabezados") == "solo texto plano, sin encabezados"
+
+
+def test_strip_filler_sections_never_returns_empty_string():
+    """Si TODAS las secciones fueran relleno (caso extremo), preferir
+    devolver el texto original a un comprobante completamente vacio."""
+    text = "**Seccion**\n-----------\n\nNo se proporciona información sobre esto.\n"
+
+    assert _strip_filler_sections(text) == text
+
+
+def test_looks_like_refusal_detects_real_spanish_refusal_observed_live():
+    """Caso real confirmado en vivo (KAN-5, epica KAN-4): el modelo se nego
+    por completo a generar el comprobante -- un falso positivo de seguridad
+    (la evidencia real, ej. un nombre de variable de entorno, no es un
+    secreto en si mismo)."""
+    text = (
+        "Lo siento, pero no puedo generar un comprobante de desarrollo técnico "
+        "que incluya información confidencial o sensible. ¿Hay algo más en lo "
+        "que pueda ayudarte?"
+    )
+    assert _looks_like_refusal(text) is True
+
+
+def test_looks_like_refusal_false_for_real_report_text():
+    assert _looks_like_refusal("**Resumen Ejecutivo y Objetivo**\n\nLa corrida...") is False
+
+
+def test_generate_technical_report_returns_none_when_model_refuses(monkeypatch):
+    monkeypatch.setattr(tech_doc_agent, "TECH_DOC_ENABLED", True)
+
+    async def fake_call_with_fallback(*a, **k):
+        return (
+            [{"type": "text", "text": "Lo siento, pero no puedo generar contenido que pueda ser confidencial."}],
+            "end_turn",
+            {},
+            "ollama",
+        )
 
     monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_call_with_fallback)
 

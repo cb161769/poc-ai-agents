@@ -371,7 +371,8 @@ def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket
     remote_check = subprocess.run(
         ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
     )
-    if remote_check.returncode != 0 or not remote_check.stdout.strip():
+    remote_url = remote_check.stdout.strip()
+    if remote_check.returncode != 0 or not remote_url:
         return {"pushed": False, "pr_url": None, "reason": "el repo objetivo no tiene un remote 'origin' configurado"}
 
     push_result = subprocess.run(
@@ -384,6 +385,46 @@ def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket
         f"{body_text}\n\n---\nGenerado automaticamente por poc-ai-agents (orchestration.py) para el ticket "
         f"Jira {ticket_id} -- paso firewall, tests reales, y el agente juez independiente antes de llegar aca."
     )
+
+    # Confirmado real (repo objetivo real de esta sesion): "gh" JAMAS
+    # funciona contra Azure DevOps -- antes esto SIEMPRE degradaba a
+    # "pushea y abri el PR a mano" para ese caso, dejando la rama pusheada
+    # sin ninguna PR real abierta ni adjuntada al ticket, pese a tener
+    # AZURE_DEVOPS_PAT real disponible en .env. Abre la PR de verdad via la
+    # REST API de Azure DevOps cuando el remote es de ese proveedor.
+    azure_match = _AZURE_DEVOPS_REPO_PATTERN.search(remote_url)
+    if azure_match:
+        pat = os.environ.get("AZURE_DEVOPS_PAT")
+        if not pat:
+            return {
+                "pushed": True, "pr_url": None,
+                "reason": "el repo objetivo es Azure DevOps pero AZURE_DEVOPS_PAT no esta seteada -- "
+                "la rama ya se pusheo, abri el PR a mano.",
+            }
+        org, project, repo = azure_match.group("org"), azure_match.group("project"), azure_match.group("repo")
+        try:
+            pr_resp = httpx.post(
+                f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests",
+                params={"api-version": "7.1"},
+                json={
+                    "sourceRefName": f"refs/heads/{branch}",
+                    "targetRefName": f"refs/heads/{base_branch}",
+                    "title": summary,
+                    "description": pr_body[:4000],  # Azure DevOps trunca descripciones muy largas
+                },
+                auth=("", pat),
+                timeout=15.0,
+            )
+            pr_resp.raise_for_status()
+            pr_id = pr_resp.json()["pullRequestId"]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            return {"pushed": True, "pr_url": None, "reason": f"Azure DevOps pull request create fallo: {exc}"}
+        return {
+            "pushed": True,
+            "pr_url": f"https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{pr_id}",
+            "reason": None,
+        }
+
     # cwd=target_repo_dir (no --repo explicito) para que gh auto-detecte el
     # owner/repo del remote local -- a diferencia de Camino A, que corre
     # desde SCRIPT_DIR y por eso SI necesita GITHUB_REPO.
@@ -1607,7 +1648,18 @@ def _deliver(
                     backend = agent_result.get("backend") or backend
 
     if judge_verdict is None:
-        print("El juez no pudo evaluar esta corrida — continua sin veredicto.")
+        # Confirmado real (KAN-2, epica KAN-4): antes esto solo hacia
+        # print() -- ni comentario en Jira ni transicion de status -- y el
+        # ticket quedaba clavado en JIRA_IN_PROGRESS_STATUS para siempre,
+        # indistinguible de una corrida que sigue en curso de verdad.
+        # "sin veredicto" es evidencia insuficiente para dar el cambio por
+        # bueno (mismo criterio que ya aplica el prompt del juez), asi que
+        # se trata como bloqueado, no como en curso.
+        _comment_all(
+            "🧑‍⚖️ Agente juez (Prefect): no pudo evaluar esta corrida -- continua sin veredicto.",
+            ticket_id, is_epic, child_ticket_keys,
+        )
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
     elif judge_verdict["verdict"] == "FLAGGED":
         _comment_all(f"🧑‍⚖️ Agente juez (Prefect): FLAGGED. {judge_verdict['reasoning']}", ticket_id, is_epic, child_ticket_keys)
         post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {ticket_id}: {judge_verdict['reasoning']}")
@@ -1846,6 +1898,12 @@ def _deliver_epic_sequential(
 
         if judge_verdict is None:
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): no pudo evaluar {child_id} -- continua sin veredicto.", ticket_key=child_id)
+            # Confirmado real (KAN-2): antes esto no transicionaba nada -- el
+            # hijo quedaba clavado en JIRA_IN_PROGRESS_STATUS para siempre,
+            # indistinguible de un hijo que sigue en curso de verdad. "sin
+            # veredicto" es evidencia insuficiente para dar el cambio por
+            # bueno, se trata como bloqueado (necesita revision humana).
+            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             _post_child_technical_report(epic_key, child_id, backend, "sin veredicto del juez", {"rama_git": branch})
             completed.append({"ticket_id": child_id, "outcome": "no-verdict"})
         elif judge_verdict["verdict"] == "FLAGGED":
@@ -1877,6 +1935,21 @@ def _deliver_epic_sequential(
     if pr_result and pr_result.get("pr_url"):
         summary_lines.append(f"PR: {pr_result['pr_url']}")
     comment_jira(" ".join(summary_lines), ticket_key=epic_key)
+
+    # Confirmado real (KAN-4): antes esto no existia -- la epica se
+    # transicionaba a JIRA_IN_PROGRESS_STATUS al arrancar y nunca mas, asi
+    # que quedaba clavada en "En curso" para siempre sin importar el
+    # resultado real (12/12 OK o cortada en la primera historia). El modo
+    # combinado (_deliver con is_epic=True) ya transicionaba la epica junto
+    # con los hijos via _transition_all -- esto lleva el modo secuencial al
+    # mismo criterio: bloqueada si se corto en algun punto o si nada quedo
+    # listo para revision humana, en revision si al menos una historia lo
+    # esta (mismo criterio que la condicion de arriba para abrir la PR).
+    has_reviewable_work = branch and any(c["outcome"] in ("ok", "no-verdict") for c in completed)
+    if blocked_at or not has_reviewable_work:
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key)
+    else:
+        transition_jira(JIRA_REVIEW_STATUS, ticket_key=epic_key)
 
     if conversation_file:
         Path(conversation_file).unlink(missing_ok=True)

@@ -337,6 +337,43 @@ def test_deliver_retries_and_recovers_when_no_changes_applied_but_judge_flags(mo
     assert pr_calls[0] is not None  # la rama NUEVA creada por el reintento, no None
 
 
+def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict(monkeypatch):
+    """Bug real confirmado en vivo (KAN-2, epica KAN-4): cuando el juez no
+    puede evaluar (judge_verdict is None), _deliver() antes solo hacia
+    print() -- ni comentario en Jira ni transicion de status -- y el ticket
+    quedaba clavado en JIRA_IN_PROGRESS_STATUS para siempre, indistinguible
+    de una corrida que sigue en curso de verdad."""
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: None)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+
+    transitions = []
+    comments = []
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+
+    result = _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert result["judge"] is None
+    assert (orchestration.JIRA_BLOCKED_STATUS, "T-1") in transitions
+    assert any("no pudo evaluar" in text for _key, text in comments)
+
+
 def test_comment_all_posts_once_in_ticket_mode(monkeypatch):
     calls = []
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: calls.append((text, ticket_key)))
@@ -561,6 +598,89 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     assert result["completed"] == []
     assert ("C-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
     assert "C-2" not in comments  # el segundo hijo nunca se toco
+    # Bug real confirmado (KAN-4): la epica en si nunca recibia un status
+    # final -- quedaba clavada en JIRA_IN_PROGRESS_STATUS para siempre.
+    assert ("EPIC-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
+
+
+def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok(monkeypatch):
+    """Bug real confirmado (KAN-4): con TODAS las historias en outcome "ok",
+    la epica en si nunca se transicionaba -- quedaba en JIRA_IN_PROGRESS_STATUS
+    para siempre aunque las 2 historias terminaran listas para revision."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    transitions = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(
+        orchestration, "retry_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "backend": "anthropic", "self_review": None, "conversation_file": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["blocked_at"] is None
+    assert ("EPIC-1", orchestration.JIRA_REVIEW_STATUS) in transitions
+
+
+def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeypatch):
+    """Bug real confirmado en vivo (KAN-2, epica KAN-4): cuando el juez no
+    puede evaluar un hijo, antes solo se comentaba -- el hijo quedaba
+    clavado en JIRA_IN_PROGRESS_STATUS para siempre."""
+    children = [_fake_child("C-1")]
+    transitions = []
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["completed"] == [{"ticket_id": "C-1", "outcome": "no-verdict"}]
+    assert ("C-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
+    assert any("no pudo evaluar" in text for _key, text in comments if _key == "C-1")
 
 
 def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monkeypatch):
@@ -1375,8 +1495,8 @@ def test_push_and_open_pr_pushes_and_creates_pr(monkeypatch):
 
 
 def test_push_and_open_pr_degrades_gracefully_when_gh_is_not_installed(monkeypatch):
-    """Bug real confirmado esta sesion (repo objetivo real en Azure DevOps,
-    no GitHub): "gh" ni siquiera esta instalado, y subprocess.run lanza
+    """Bug real confirmado esta sesion (remote no-GitHub, no Azure DevOps,
+    ej. Bitbucket): "gh" ni siquiera esta instalado, y subprocess.run lanza
     FileNotFoundError (no un returncode!=0) -- el docstring de esta funcion
     ya prometia "best-effort, nunca bloquea la corrida" para este caso, pero
     el codigo solo atajaba "gh corrio y fallo", no "gh no existe". El push
@@ -1384,6 +1504,64 @@ def test_push_and_open_pr_degrades_gracefully_when_gh_is_not_installed(monkeypat
     def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
         if cmd[:2] == ["gh", "pr"]:
             raise FileNotFoundError("[Errno 2] No such file or directory: 'gh'")
+        class R:
+            returncode = 0
+            stdout = "https://bitbucket.org/org/repo.git" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    result = orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    assert result["pushed"] is True
+    assert result["pr_url"] is None
+    assert "gh" in result["reason"]
+
+
+def test_push_and_open_pr_opens_real_pr_via_azure_devops_rest_api(monkeypatch):
+    """Bug real confirmado esta sesion (repo objetivo real de esta sesion
+    es Azure DevOps): antes SIEMPRE degradaba a "pushea y abri el PR a
+    mano" para este remote, aunque AZURE_DEVOPS_PAT ya esta disponible en
+    .env -- ahora abre la PR de verdad via la REST API real."""
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        class R:
+            returncode = 0
+            stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"pullRequestId": 42}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return FakeResp()
+
+    monkeypatch.setattr(orchestration.httpx, "post", fake_post)
+
+    result = orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    assert result["pushed"] is True
+    assert result["pr_url"] == "https://dev.azure.com/org/proj/_git/repo/pullrequest/42"
+    assert captured["json"]["sourceRefName"] == "refs/heads/copilot/T-1-123"
+    assert captured["json"]["targetRefName"] == "refs/heads/main"
+
+
+def test_push_and_open_pr_azure_devops_without_pat_degrades_gracefully(monkeypatch):
+    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
         class R:
             returncode = 0
             stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
@@ -1396,7 +1574,31 @@ def test_push_and_open_pr_degrades_gracefully_when_gh_is_not_installed(monkeypat
 
     assert result["pushed"] is True
     assert result["pr_url"] is None
-    assert "gh" in result["reason"]
+    assert "AZURE_DEVOPS_PAT" in result["reason"]
+
+
+def test_push_and_open_pr_azure_devops_rest_api_failure_degrades_gracefully(monkeypatch):
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        class R:
+            returncode = 0
+            stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    def fake_post(url, **kwargs):
+        raise orchestration.httpx.HTTPError("boom")
+
+    monkeypatch.setattr(orchestration.httpx, "post", fake_post)
+
+    result = orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    assert result["pushed"] is True
+    assert result["pr_url"] is None
+    assert "Azure DevOps" in result["reason"]
 
 
 def test_comment_jira_calls_jira_client_directly(monkeypatch):
