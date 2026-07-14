@@ -477,14 +477,130 @@ def run_coding_agent_cloud(ticket_id: str, summary: str, sanitized_prompt: str) 
     return {"issue_url": issue_url, "assigned": assigned}
 
 
+_AZURE_DEVOPS_REPO_PATTERN = re.compile(r"dev\.azure\.com/(?P<org>[^/]+)/(?P<project>[^/]+)/_git/(?P<repo>[^/]+)")
+
+
+def _check_pr_rejected_for_branch(target_repo_dir: str, branch: str) -> bool:
+    """Confirmado real (pregunta del usuario): _find_open_branch_for_ticket
+    solo mira si la rama es ancestro de base_branch via git -- una PR
+    RECHAZADA/cerrada sin mergear deja la rama en el mismo estado git que
+    una PR todavia abierta (no es ancestro en ninguno de los dos casos), asi
+    que sin esto una rama cuyo trabajo un humano ya rechazo explicitamente
+    se reusaria igual que una legitimamente abierta, sin ninguna señal.
+
+    Best-effort, nunca bloquea ni lanza: intenta 'gh pr view' (GitHub) o la
+    REST API real de Azure DevOps (AZURE_DEVOPS_PAT, mismo repo objetivo
+    real de esta sesion) segun el remote 'origin' detectado -- si ninguno
+    aplica o falla (sin CLI/credenciales, red, JSON invalido), devuelve
+    False (no se puede confirmar el rechazo, se asume que no fue rechazada
+    -- mismo criterio de graceful-degradation que push_and_open_pr).
+    """
+    remote_url = subprocess.run(
+        ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
+    ).stdout.strip()
+    if not remote_url:
+        return False
+
+    if "dev.azure.com" in remote_url:
+        match = _AZURE_DEVOPS_REPO_PATTERN.search(remote_url)
+        pat = os.environ.get("AZURE_DEVOPS_PAT")
+        if not match or not pat:
+            return False
+        org, project, repo = match.group("org"), match.group("project"), match.group("repo")
+        try:
+            resp = httpx.get(
+                f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests",
+                params={"searchCriteria.sourceRefName": f"refs/heads/{branch}", "searchCriteria.status": "all", "api-version": "7.1"},
+                auth=("", pat),
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            prs = resp.json().get("value", [])
+        except (httpx.HTTPError, ValueError):
+            return False
+        if not prs:
+            return False
+        # Si hay al menos una PR todavia activa para esta rama, no se
+        # considera rechazada aunque tambien exista una vieja "abandoned".
+        if any(pr.get("status") == "active" for pr in prs):
+            return False
+        return any(pr.get("status") == "abandoned" for pr in prs)
+
+    if shutil.which("gh"):
+        result = subprocess.run(
+            ["gh", "pr", "view", branch, "--json", "state"], capture_output=True, text=True, cwd=target_repo_dir,
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            state = json.loads(result.stdout).get("state")
+        except json.JSONDecodeError:
+            return False
+        return state == "CLOSED"  # "MERGED" es un caso distinto, ya cubierto por merge-base
+
+    return False
+
+
+def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
+    """Confirmado real (epica KAN-4): antes de este chequeo, cada re-corrida
+    de un ticket (ej. un humano revierte manualmente el status en Jira
+    pidiendo un redo) creaba una rama copilot/{ticket_id}-{timestamp} NUEVA
+    e incondicional -- sin mirar si ya habia una abierta de una corrida
+    anterior, dejando ramas huerfanas en paralelo sin ningun vinculo con el
+    trabajo/comentarios/veredicto previos. Esto busca una rama real (local o
+    remota) para ESE ticket que todavia no este mergeada en base_branch, para
+    que la corrida pueda retomarla en vez de empezar de cero. Pure-ish (solo
+    lee vía git, no escribe nada) -- devuelve None si no hay ninguna abierta,
+    mismo comportamiento que hoy.
+    """
+    listed = subprocess.run(
+        ["git", "-C", target_repo_dir, "branch", "-a", "--list", f"*copilot/{ticket_id}-*"],
+        capture_output=True, text=True,
+    ).stdout
+    candidates = []
+    for line in listed.splitlines():
+        name = line.strip().lstrip("*").strip()
+        if not name or "->" in name:
+            continue
+        name = name.removeprefix("remotes/origin/")
+        if name not in candidates:
+            candidates.append(name)
+
+    open_branches = []
+    for branch in candidates:
+        merged = subprocess.run(
+            ["git", "-C", target_repo_dir, "merge-base", "--is-ancestor", branch, base_branch],
+            capture_output=True,
+        )
+        if merged.returncode != 0:  # no es ancestro de base_branch -> todavia no mergeada
+            open_branches.append(branch)
+
+    if not open_branches:
+        return None
+
+    open_branches.sort(key=lambda b: b.rsplit("-", 1)[-1], reverse=True)
+    if len(open_branches) > 1:
+        logger.warning(
+            f"{ticket_id}: hay {len(open_branches)} ramas abiertas sin mergear -- se retoma la mas reciente "
+            f"'{open_branches[0]}', las demas quedan sin tocar (revisar a mano): {open_branches[1:]}"
+        )
+    return open_branches[0]
+
+
 @task(retries=0, name="coding-agent-local-fallback")
 def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
     base_branch = subprocess.run(
         ["git", "-C", target_repo_dir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
 
-    branch = f"copilot/{ticket_id}-{int(time.time())}"
-    subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
+    existing_branch = _find_open_branch_for_ticket(target_repo_dir, ticket_id, base_branch)
+    if existing_branch:
+        get_run_logger().info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        branch = existing_branch
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", branch], check=True)
+    else:
+        branch = f"copilot/{ticket_id}-{int(time.time())}"
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
     suggest = subprocess.run(["gh", "copilot", "suggest", "-t", "shell", sanitized_prompt], cwd=target_repo_dir)
     status = subprocess.run(
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
@@ -496,7 +612,12 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
         return {"applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest"}
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
-    subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
+    if not existing_branch:
+        # Solo se borra una rama recien creada y vacia -- una rama RETOMADA
+        # (existing_branch) puede ya traer commits reales de una corrida
+        # anterior; borrarla aca destruiria ese trabajo solo porque ESTE
+        # intento puntual no sumo nada nuevo.
+        subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
     return {"applied": False, "branch": None, "base_branch": base_branch, "backend": "gh_copilot_suggest"}
 
 
@@ -526,8 +647,14 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         ["git", "-C", target_repo_dir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True
     ).stdout.strip()
 
-    branch = f"copilot/{ticket_id}-{int(time.time())}"
-    subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
+    existing_branch = _find_open_branch_for_ticket(target_repo_dir, ticket_id, base_branch)
+    if existing_branch:
+        get_run_logger().info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        branch = existing_branch
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", branch], check=True)
+    else:
+        branch = f"copilot/{ticket_id}-{int(time.time())}"
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
 
     payload_file = SCRIPT_DIR / "logs" / f".coding_agent_payload_{ticket_id}_{int(time.time())}.json"
     payload_file.parent.mkdir(parents=True, exist_ok=True)
@@ -602,10 +729,15 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "backend": agent_backend,
             "conversation_file": conversation_file,
             "self_review": self_review,
+            "resumed_branch": bool(existing_branch),
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
-    subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
+    if not existing_branch:
+        # Misma razon que en run_coding_agent_local: una rama RETOMADA no se
+        # borra aca solo porque ESTE intento puntual no sumo commits nuevos
+        # -- podria tener trabajo real de una corrida anterior.
+        subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch])
     # Ya NO se borra el conversation_file aca (antes si) -- _deliver()
     # necesita poder reintentar con el feedback real del juez cuando el
     # primer intento no aplico nada, y para eso necesita continuar la MISMA
@@ -1343,9 +1475,13 @@ def _deliver(
         backend = agent_result.get("backend")
 
         if agent_result["applied"]:
+            resumed_note = (
+                " (retoma una rama existente de una corrida anterior de este ticket, no empieza de cero)"
+                if agent_result.get("resumed_branch") else ""
+            )
             _comment_all(
                 f"🤖 Copilot (Prefect): AI Firewall aprobo la solicitud (redacciones: {firewall_result['redactions_applied']}). "
-                f"Copilot aplico un cambio en la rama '{agent_result['branch']}' de {target_repo_dir}, "
+                f"Copilot aplico un cambio en la rama '{agent_result['branch']}' de {target_repo_dir}{resumed_note}, "
                 f"pendiente de revision humana (no en '{agent_result['base_branch']}').",
                 ticket_id, is_epic, child_ticket_keys,
             )
@@ -1558,8 +1694,15 @@ def _deliver_epic_sequential(
     completed = []
     blocked_at = None
 
-    for child in ordered_children:
+    for child_index, child in enumerate(ordered_children):
         child_id = child["ticket_id"]
+        # Confirmado real: un humano mirando SOLO el ticket hijo bloqueado no
+        # tenia forma de saber si el resto de la epica sigue o se corta --
+        # esa info solo vivia en el comentario-resumen final de la epica.
+        # Se calcula aca para poder incluirla en el comentario de bloqueo de
+        # ESTE hijo, en cada uno de los 3 puntos de corte de abajo.
+        siblings_remaining = [c["ticket_id"] for c in ordered_children[child_index + 1:]]
+        siblings_remaining_text = ", ".join(siblings_remaining) if siblings_remaining else "ninguna"
         child_prompt = (
             f"Historia {child_id} de la epica {epic_key} ({child['repository_origen']}): {child['summary']}\n"
             f"{child['description']}\n"
@@ -1616,9 +1759,13 @@ def _deliver_epic_sequential(
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
 
+        resumed_note = (
+            " (retoma una rama existente de una corrida anterior de esta epica, no empieza de cero)"
+            if agent_result.get("resumed_branch") else ""
+        )
         comment_jira(
             f"🤖 Copilot (Prefect, modo epica secuencial): AI Firewall aprobo {child_id} "
-            f"(redacciones: {firewall_result['redactions_applied']}). Copilot aplico un cambio en la rama '{branch}', "
+            f"(redacciones: {firewall_result['redactions_applied']}). Copilot aplico un cambio en la rama '{branch}'{resumed_note}, "
             "pendiente de revision humana.",
             ticket_key=child_id,
         )
@@ -1626,7 +1773,11 @@ def _deliver_epic_sequential(
         guard_result = run_output_guard(diff_text, jira_context)
         if not guard_result["clean"]:
             reason = f"redacciones={guard_result['redactions_applied']}, jailbreak={guard_result['jailbreak_reason']}"
-            comment_jira(f"🛡️ Guardia de salida (Prefect): diff de {child_id} bloqueado ({reason}).", ticket_key=child_id)
+            comment_jira(
+                f"🛡️ Guardia de salida (Prefect): diff de {child_id} bloqueado ({reason}). Esto corta el "
+                f"procesamiento de la epica -- historias hermanas sin tocar: {siblings_remaining_text}.",
+                ticket_key=child_id,
+            )
             post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {child_id} (modo epica secuencial): {reason}")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             check_falco_correlation(falco_since, child_id)
@@ -1636,7 +1787,11 @@ def _deliver_epic_sequential(
 
         test_result = run_tests(target_repo_dir)
         if not test_result["passed"]:
-            comment_jira(f"🧪 Testing agent (Prefect): los tests reales FALLARON procesando {child_id}.", ticket_key=child_id)
+            comment_jira(
+                f"🧪 Testing agent (Prefect): los tests reales FALLARON procesando {child_id}. Esto corta el "
+                f"procesamiento de la epica -- historias hermanas sin tocar: {siblings_remaining_text}.",
+                ticket_key=child_id,
+            )
             post_alert_webhook(f"🧪 Testing agent BLOCKED en {child_id} (modo epica secuencial): tests reales fallaron.")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             check_falco_correlation(falco_since, child_id)
@@ -1672,7 +1827,11 @@ def _deliver_epic_sequential(
             _post_child_technical_report(epic_key, child_id, backend, "sin veredicto del juez", {"rama_git": branch})
             completed.append({"ticket_id": child_id, "outcome": "no-verdict"})
         elif judge_verdict["verdict"] == "FLAGGED":
-            comment_jira(f"🧑‍⚖️ Agente juez (Prefect): FLAGGED en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
+            comment_jira(
+                f"🧑‍⚖️ Agente juez (Prefect): FLAGGED en {child_id}. {judge_verdict['reasoning']} Esto corta el "
+                f"procesamiento de la epica -- historias hermanas sin tocar: {siblings_remaining_text}.",
+                ticket_key=child_id,
+            )
             post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {child_id} (modo epica secuencial): {judge_verdict['reasoning']}")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
             _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- el juez marco FLAGGED", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})

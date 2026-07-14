@@ -579,7 +579,31 @@ async def judge_with_tools(payload: dict) -> dict:
                         retry_verdict = _extract_json(retry_text)
                         if retry_verdict.get("verdict") not in ("OK", "FLAGGED"):
                             raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
-                        return _finalize(_normalize_policy_reference(retry_verdict))
+                        retry_verdict = _normalize_policy_reference(retry_verdict)
+                        # Bug real confirmado esta sesion (investigacion KAN-5):
+                        # este camino (JSON invalido en el primer turno) devolvia
+                        # el veredicto del reintento SIN pasar nunca por los
+                        # chequeos de auto-contradiccion/alucinacion de contenido
+                        # de abajo -- un bypass completo, no solo el limite de
+                        # "un solo empujon" que ya tienen esos chequeos en el
+                        # camino normal. Ya no queda presupuesto para otro
+                        # reintento real aca (este YA es el reintento de JSON
+                        # invalido), asi que solo se deja constancia real en el
+                        # log -- visible en el stderr que orchestration.py
+                        # captura, a diferencia del nudge en memoria de abajo
+                        # que hoy no deja ningun rastro -- y se acepta igual
+                        # (mismo criterio de nunca bloquear infinito).
+                        if _verdict_is_self_contradictory(retry_verdict):
+                            logger.warning(
+                                "juez: el veredicto del reintento de JSON es auto-contradictorio "
+                                f"(verdict=FLAGGED con tono de aprobacion) -- se acepta igual: {retry_text[:500]!r}"
+                            )
+                        elif _reasoning_ignores_real_diff_files(payload, retry_verdict):
+                            logger.warning(
+                                "juez: el reasoning del veredicto del reintento no menciona ningun archivo "
+                                f"real del diff -- posible alucinacion de contenido, se acepta igual: {retry_text[:500]!r}"
+                            )
+                        return _finalize(retry_verdict)
 
                     if not consistency_nudge_given and _verdict_is_self_contradictory(verdict):
                         # Confirmado real (KAN-15): verdict=FLAGGED con

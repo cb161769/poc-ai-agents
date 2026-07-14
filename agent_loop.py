@@ -40,7 +40,13 @@ logger = get_logger(__name__)
 
 JSON_CORRECTION_MESSAGE = (
     "Tu respuesta anterior no fue JSON valido. Respondé de nuevo usando "
-    "UNICAMENTE el JSON exacto pedido, sin texto antes ni despues."
+    "UNICAMENTE el JSON exacto pedido, sin texto antes ni despues. En este "
+    "mensaje NO hay ninguna herramienta disponible -- no intentes llamar "
+    "ninguna (ni inventes una que no se te ofrecio, como una tool de shell "
+    "generica). Si crees que necesitarias una herramienta para responder "
+    "con seguridad, decilo explicitamente en el campo de texto que "
+    "corresponda (reasoning/summary) en vez de emitir una llamada de "
+    "herramienta."
 )
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
@@ -177,7 +183,20 @@ def _text_as_fallback_tool_call(text: str, offered_tool_names: set) -> dict | No
     coding_agent.py/judge_agent.py esperan un esquema distinto ahi
     ({"status":...}/{"verdict":...}), el parseo de JSON falla, y la corrida
     entera termina en "blocked" sin haber intentado ni una tool.
+
+    Sin tools ofrecidas (offered_tool_names vacio -- el caso real de
+    _final_text_with_json_retry, que pasa tools=[] a proposito porque pide
+    texto corregido, no otra tool-call) NINGUNA forma se reconoce como
+    tool-call: no hay ninguna tool real que se pudiera estar invocando, asi
+    que cualquier JSON con esta forma es, como mucho, una alucinacion sobre
+    una tool inexistente (confirmado real: el juez, con parable/fable,
+    devolvio {"tool": "Bash", ...} en el reintento aunque nunca se le
+    ofrecio "Bash") -- debe tratarse como texto final (y fallar la
+    validacion de forma explicita, no silenciosa) igual que hoy.
     """
+    if not offered_tool_names:
+        return None
+
     stripped = text.strip()
     if not (stripped.startswith("{") and stripped.endswith("}")):
         return None
@@ -187,12 +206,22 @@ def _text_as_fallback_tool_call(text: str, offered_tool_names: set) -> dict | No
         return None
     if not isinstance(parsed, dict):
         return None
+
     name = parsed.get("name")
-    if not isinstance(name, str) or "arguments" not in parsed:
+    arguments_key = "arguments"
+    if not (isinstance(name, str) and "arguments" in parsed):
+        # Confirmado real (juez, KAN-5, parable/fable): otro modelo narra su
+        # intento de tool-call con claves distintas -- {"tool": "...",
+        # "input": {...}} en vez de {"name": ..., "arguments": ...}. Mismo
+        # problema (message.tool_calls nunca se completa), forma distinta.
+        name = parsed.get("tool")
+        arguments_key = "input"
+        if not (isinstance(name, str) and arguments_key in parsed):
+            return None
+
+    if name not in offered_tool_names:
         return None
-    if offered_tool_names and name not in offered_tool_names:
-        return None
-    arguments = parsed.get("arguments")
+    arguments = parsed.get(arguments_key)
     return {"name": name, "arguments": arguments if isinstance(arguments, dict) else {}}
 
 

@@ -688,6 +688,44 @@ def test_judge_with_tools_retries_when_json_valid_but_verdict_key_missing(monkey
     assert result["reasoning"] == "corregido"
 
 
+def test_judge_with_tools_warns_but_accepts_hallucinated_verdict_from_json_retry(monkeypatch, caplog):
+    """Bug real confirmado esta sesion (investigacion KAN-5): el camino de
+    reintento de JSON invalido (_final_text_with_json_retry) devolvia su
+    resultado SIN pasar nunca por _verdict_is_self_contradictory ni
+    _reasoning_ignores_real_diff_files -- un bypass completo, no solo el
+    limite de "un solo empujon" que esos chequeos ya tienen en el camino
+    normal. Ahora debe loguear una advertencia real (visible en el stderr
+    que orchestration.py captura) aunque siga aceptando el veredicto (no
+    queda presupuesto para otro reintento real aca)."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es JSON en absoluto"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return (
+            '{"verdict": "FLAGGED", "reasoning": '
+            '"Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}',
+            {"input_tokens": 1, "output_tokens": 1},
+        )
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
+    with caplog.at_level("WARNING"):
+        result = asyncio.run(judge_agent.judge_with_tools(payload))
+
+    assert result["verdict"] == "FLAGGED"  # se acepta igual, no bloquea
+    assert any("alucinacion de contenido" in r.message for r in caplog.records)
+
+
 def test_judge_with_tools_raises_when_retry_also_lacks_valid_verdict(monkeypatch):
     monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
 

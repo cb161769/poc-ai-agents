@@ -17,6 +17,7 @@ from orchestration import (
     _check_not_epic,
     _comment_all,
     _deliver,
+    _find_open_branch_for_ticket,
     _format_conflicts_section,
     _handle_rejected,
     _resolve_single_repo,
@@ -561,6 +562,42 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     assert "C-2" not in comments  # el segundo hijo nunca se toco
 
 
+def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monkeypatch):
+    """Confirmado real (epica KAN-4): un humano mirando SOLO el ticket hijo
+    bloqueado no tenia forma de saber si el resto de la epica sigue o se
+    corta -- esa info solo vivia en el comentario-resumen final de la
+    epica. El comentario de bloqueo de ESE hijo ahora la incluye."""
+    children = [_fake_child("C-1"), _fake_child("C-2"), _fake_child("C-3")]
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia llegar al tercer hijo"))
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    # se corta en C-1 (el primero); C-2 y C-3 quedan sin tocar
+    blocked_comment = next(text for key, text in comments if key == "C-1" and "FALLARON" in text)
+    assert "C-2" in blocked_comment and "C-3" in blocked_comment
+
+
 def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypatch):
     """El comprobante tecnico (poblado por el LLM, no por texto fijo) se
     pide POR HISTORIA, con la evidencia real de esa historia puntual, y si
@@ -890,6 +927,125 @@ def test_retry_coding_agent_local_real_detects_commits_made_by_the_model_itself(
     result = orchestration.retry_coding_agent_local_real("T-1", "feedback", str(tmp_path))
 
     assert result["applied"] is True
+
+
+def _fake_branch_list_and_merge_base(monkeypatch, branch_list_stdout: str, merged: set):
+    """Comparte el mismo mock entre los tests de _find_open_branch_for_ticket:
+    responde a "git branch -a --list ..." con branch_list_stdout, y a
+    "git merge-base --is-ancestor {branch} {base}" con returncode=0 (ya
+    mergeada) si branch esta en `merged`, o 1 (todavia abierta) si no."""
+    def fake_run(cmd, **kwargs):
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout=branch_list_stdout)
+        if "merge-base" in cmd:
+            branch = cmd[-2]
+            return _fake_subprocess_result(returncode=0 if branch in merged else 1)
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+
+def test_find_open_branch_for_ticket_returns_none_when_no_branches_match(monkeypatch):
+    _fake_branch_list_and_merge_base(monkeypatch, branch_list_stdout="", merged=set())
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
+def test_find_open_branch_for_ticket_returns_branch_when_open_and_unmerged(monkeypatch):
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged=set()
+    )
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-100"
+
+
+def test_find_open_branch_for_ticket_ignores_already_merged_branch(monkeypatch):
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged={"copilot/KAN-2-100"}
+    )
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
+def test_find_open_branch_for_ticket_picks_most_recent_of_multiple_open(monkeypatch):
+    _fake_branch_list_and_merge_base(
+        monkeypatch,
+        branch_list_stdout="  copilot/KAN-2-100\n  remotes/origin/copilot/KAN-2-200\n",
+        merged=set(),
+    )
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-200"
+
+
+def test_run_coding_agent_local_real_reuses_existing_open_branch(monkeypatch, tmp_path):
+    """Confirmado real (epica KAN-4): sin esto, cada re-corrida de un ticket
+    (ej. un humano revierte el status en Jira pidiendo un redo) creaba una
+    rama nueva en paralelo, huerfana, en vez de retomar la existente."""
+    git_calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)  # todavia abierta
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["branch"] == "copilot/T-1-100"
+    assert result["resumed_branch"] is True
+    # Se hizo "checkout copilot/T-1-100", NUNCA "checkout -b" con una rama nueva
+    assert not any("-b" in cmd for cmd in git_calls if cmd[:3] == ["git", "-C", str(tmp_path)] and "checkout" in cmd)
+    assert any(cmd[-1] == "copilot/T-1-100" and "checkout" in cmd and "-b" not in cmd for cmd in git_calls)
+
+
+def test_run_coding_agent_local_real_does_not_delete_reused_branch_when_nothing_applied(monkeypatch, tmp_path):
+    """Una rama RETOMADA no se borra solo porque ESTE intento puntual no
+    sumo commits nuevos -- podria tener trabajo real de una corrida
+    anterior que se perderia con "branch -D"."""
+    git_calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "blocked", "summary": "", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)  # todavia abierta
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")  # nada nuevo
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="0\n")  # sin commits nuevos
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["applied"] is False
+    assert not any(cmd[-2:-1] == ["branch"] and "-D" in cmd for cmd in git_calls)
 
 
 def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):

@@ -17,6 +17,7 @@ from agent_loop import (
     _ollama_model_available,
     _ollama_response_to_blocks,
     _post_with_retry,
+    _text_as_fallback_tool_call,
     call_with_fallback,
     compact_old_tool_results,
 )
@@ -611,6 +612,52 @@ def test_ollama_response_to_blocks_real_tool_calls_take_priority_over_fallback(m
     # No aparece ningun bloque sintetizado por el fallback -- el tool_calls
     # real siempre tiene prioridad.
     assert all(b.get("id") != "ollama_call_fallback_0" for b in blocks)
+
+
+def test_text_as_fallback_tool_call_recognizes_name_arguments_shape():
+    """Forma confirmada real con qwen2.5-coder:7b -- regresion, no cambia."""
+    result = _text_as_fallback_tool_call(
+        '{"name": "read_file", "arguments": {"path": "README.md"}}', {"read_file"}
+    )
+    assert result == {"name": "read_file", "arguments": {"path": "README.md"}}
+
+
+def test_text_as_fallback_tool_call_recognizes_tool_input_shape():
+    """Caso real confirmado (juez, KAN-5, parable/fable): otro modelo narra
+    su tool-call con las claves {"tool": ..., "input": ...} en vez de
+    {"name": ..., "arguments": ...} -- forma nueva que agent_loop no
+    reconocia, dejando esa narracion caer como "respuesta final" y fallando
+    la validacion de esquema esperada aguas arriba."""
+    result = _text_as_fallback_tool_call(
+        '{"tool": "read_file", "input": {"path": "README.md"}}', {"read_file"}
+    )
+    assert result == {"name": "read_file", "arguments": {"path": "README.md"}}
+
+
+def test_text_as_fallback_tool_call_rejects_unknown_tool_name_for_both_shapes():
+    assert _text_as_fallback_tool_call('{"name": "algo", "arguments": {}}', {"read_file"}) is None
+    assert _text_as_fallback_tool_call('{"tool": "algo", "input": {}}', {"read_file"}) is None
+
+
+def test_text_as_fallback_tool_call_returns_none_when_no_tools_were_offered():
+    """Caso real confirmado (juez, reintento de correccion de JSON): con
+    offered_tool_names vacio (_final_text_with_json_retry pasa tools=[] a
+    proposito), NINGUNA forma se reconoce como tool-call -- incluso una que
+    nombra una tool real que en otro turno existiria, o una inventada como
+    "Bash" (que el juez nunca ofrece). Sin este guard, agregar la forma
+    tool/input haria que ese JSON se tratara como tool-call real durante el
+    reintento, dejando el texto final vacio en vez de la respuesta real del
+    modelo."""
+    assert _text_as_fallback_tool_call('{"name": "read_file", "arguments": {}}', set()) is None
+    assert _text_as_fallback_tool_call('{"tool": "Bash", "input": {"command": "ls"}}', set()) is None
+
+
+def test_json_correction_message_warns_no_tools_available():
+    """Caso real (juez, KAN-5): el modelo intento narrar una tool-call
+    ("Bash") en el reintento de correccion de JSON, donde nunca hay tools
+    disponibles -- el mensaje ahora se lo aclara explicitamente en vez de
+    solo pedir JSON valido."""
+    assert "NO hay ninguna herramienta disponible" in JSON_CORRECTION_MESSAGE
 
 
 def test_ollama_model_available_true_when_exact_name_present(monkeypatch):
