@@ -521,6 +521,45 @@ def run_coding_agent_cloud(ticket_id: str, summary: str, sanitized_prompt: str) 
 _AZURE_DEVOPS_REPO_PATTERN = re.compile(r"dev\.azure\.com/(?P<org>[^/]+)/(?P<project>[^/]+)/_git/(?P<repo>[^/]+)")
 
 
+def _find_azure_devops_prs_for_branch(target_repo_dir: str, branch: str) -> tuple:
+    """Compartido por _check_pr_rejected_for_branch y
+    _fetch_unresolved_pr_comments -- ambas necesitan encontrar la(s) PR(s)
+    reales de Azure DevOps asociadas a una rama, antes de mirar cosas
+    distintas de esa PR (status vs. threads de comentarios). Devuelve
+    (remote_info, prs): remote_info es {"org","project","repo","pat"} o
+    None si el remote no es Azure DevOps o falta AZURE_DEVOPS_PAT; prs es
+    la lista real devuelta por la API (searchCriteria.status=all), o []
+    si no hay ninguna o la consulta fallo. Nunca lanza (graceful-degradation,
+    mismo criterio que el resto de las funciones de Azure DevOps de esta
+    sesion).
+    """
+    remote_url = subprocess.run(
+        ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
+    ).stdout.strip()
+    if not remote_url or "dev.azure.com" not in remote_url:
+        return None, []
+
+    match = _AZURE_DEVOPS_REPO_PATTERN.search(remote_url)
+    pat = os.environ.get("AZURE_DEVOPS_PAT")
+    if not match or not pat:
+        return None, []
+    org, project, repo = match.group("org"), match.group("project"), match.group("repo")
+    remote_info = {"org": org, "project": project, "repo": repo, "pat": pat}
+
+    try:
+        resp = httpx.get(
+            f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests",
+            params={"searchCriteria.sourceRefName": f"refs/heads/{branch}", "searchCriteria.status": "all", "api-version": "7.1"},
+            auth=("", pat),
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        prs = resp.json().get("value", [])
+    except (httpx.HTTPError, ValueError):
+        prs = []
+    return remote_info, prs
+
+
 def _check_pr_rejected_for_branch(target_repo_dir: str, branch: str) -> bool:
     """Confirmado real (pregunta del usuario): _find_open_branch_for_ticket
     solo mira si la rama es ancestro de base_branch via git -- una PR
@@ -543,22 +582,7 @@ def _check_pr_rejected_for_branch(target_repo_dir: str, branch: str) -> bool:
         return False
 
     if "dev.azure.com" in remote_url:
-        match = _AZURE_DEVOPS_REPO_PATTERN.search(remote_url)
-        pat = os.environ.get("AZURE_DEVOPS_PAT")
-        if not match or not pat:
-            return False
-        org, project, repo = match.group("org"), match.group("project"), match.group("repo")
-        try:
-            resp = httpx.get(
-                f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests",
-                params={"searchCriteria.sourceRefName": f"refs/heads/{branch}", "searchCriteria.status": "all", "api-version": "7.1"},
-                auth=("", pat),
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            prs = resp.json().get("value", [])
-        except (httpx.HTTPError, ValueError):
-            return False
+        _remote_info, prs = _find_azure_devops_prs_for_branch(target_repo_dir, branch)
         if not prs:
             return False
         # Si hay al menos una PR todavia activa para esta rama, no se
@@ -580,6 +604,101 @@ def _check_pr_rejected_for_branch(target_repo_dir: str, branch: str) -> bool:
         return state == "CLOSED"  # "MERGED" es un caso distinto, ya cubierto por merge-base
 
     return False
+
+
+def _fetch_unresolved_pr_comments(target_repo_dir: str, branch: str) -> list:
+    """Confirmado real (usuario): el pipeline abre una PR real pero nunca
+    vuelve a consultarla -- un comentario de revision humano real dejado en
+    la PR abierta se ignoraba por completo. Busca la PR ACTIVA de esta rama
+    (Azure DevOps) y devuelve sus threads de comentarios sin resolver
+    (status "active", no generados por el sistema) como
+    [{"thread_id": int, "text": "..."}]. Best-effort total: sin PR activa,
+    sin AZURE_DEVOPS_PAT, o cualquier error de red/JSON, devuelve [] --
+    nunca lanza, nunca bloquea la corrida.
+    """
+    remote_info, prs = _find_azure_devops_prs_for_branch(target_repo_dir, branch)
+    if not remote_info:
+        return []
+    active_pr = next((pr for pr in prs if pr.get("status") == "active"), None)
+    if not active_pr or not active_pr.get("pullRequestId"):
+        return []
+
+    org, project, repo, pat = remote_info["org"], remote_info["project"], remote_info["repo"], remote_info["pat"]
+    try:
+        resp = httpx.get(
+            f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests/"
+            f"{active_pr['pullRequestId']}/threads",
+            params={"api-version": "7.1"},
+            auth=("", pat),
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        threads = resp.json().get("value", [])
+    except (httpx.HTTPError, ValueError):
+        return []
+
+    unresolved = []
+    for thread in threads:
+        if thread.get("status") != "active" or thread.get("isDeleted"):
+            continue
+        real_comments = [
+            c.get("content", "") for c in thread.get("comments", []) or []
+            if c.get("commentType") != "system" and c.get("content")
+        ]
+        if real_comments:
+            unresolved.append({"thread_id": thread["id"], "text": "\n".join(real_comments)})
+    return unresolved
+
+
+def _build_pr_feedback_section(pr_comments: list) -> str:
+    """Arma el bloque de texto que se le agrega al prompt del coding agent
+    cuando la rama retomada tiene comentarios de revision humana reales sin
+    resolver en la PR abierta -- mismo criterio que ya usa
+    _retry_after_no_changes para inyectar el feedback del juez al prompt."""
+    lines = "\n".join(f"- {c['text']}" for c in pr_comments)
+    return (
+        "\n\nAdemas, la PR real abierta para este ticket tiene comentarios de revision "
+        f"humana SIN resolver -- atendelos en este cambio:\n{lines}"
+    )
+
+
+def _resolve_pr_threads(target_repo_dir: str, branch: str, thread_ids: list) -> None:
+    """Marca como resueltos ("fixed") los threads de la PR real cuya
+    referencia se guardo en un turno anterior (ver _fetch_unresolved_pr_comments
+    / "pr_thread_ids_to_resolve") -- se llama cuando el coding agent aplico
+    un commit nuevo intentando atenderlos. Simplificacion explicita: no hay
+    forma barata de confirmar que CADA thread puntual quedo resuelto, asi
+    que se marcan todos los que estaban activos al arrancar el turno: si el
+    juez despues bloquea el cambio, eso ya queda visible via el
+    comentario/status BLOCKED normal, y un humano puede reabrir el thread a
+    mano si la correccion fue insuficiente. Best-effort total: nunca lanza.
+    """
+    if not thread_ids:
+        return
+    remote_info, prs = _find_azure_devops_prs_for_branch(target_repo_dir, branch)
+    if not remote_info:
+        return
+    active_pr = next((pr for pr in prs if pr.get("status") == "active"), None)
+    if not active_pr or not active_pr.get("pullRequestId"):
+        return
+
+    org, project, repo, pat = remote_info["org"], remote_info["project"], remote_info["repo"], remote_info["pat"]
+    for thread_id in thread_ids:
+        try:
+            resp = httpx.patch(
+                f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/{repo}/pullrequests/"
+                f"{active_pr['pullRequestId']}/threads/{thread_id}",
+                params={"api-version": "7.1"},
+                json={"status": "fixed"},
+                auth=("", pat),
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            # Funcion pure-ish (no es un @task) llamada desde run_coding_agent_local_real
+            # (que si es task, ya tiene contexto de Prefect) -- se usa el logger de
+            # modulo, no get_run_logger(), mismo criterio que _find_open_branch_for_ticket.
+            logger.warning(f"No se pudo marcar como resuelto el thread {thread_id} de la PR real: {exc}")
 
 
 def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
@@ -650,6 +769,12 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
     else:
         branch = f"copilot/{ticket_id}-{int(time.time())}"
         subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
+
+    pr_comments = _fetch_unresolved_pr_comments(target_repo_dir, existing_branch) if existing_branch else []
+    if pr_comments:
+        sanitized_prompt = sanitized_prompt + _build_pr_feedback_section(pr_comments)
+    pr_thread_ids_to_resolve = [c["thread_id"] for c in pr_comments]
+
     suggest = subprocess.run(["gh", "copilot", "suggest", "-t", "shell", sanitized_prompt], cwd=target_repo_dir)
     status = subprocess.run(
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
@@ -661,6 +786,7 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
         return {
             "applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest",
             "resumed_branch": bool(existing_branch), "resumed_pr_rejected": pr_rejected,
+            "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
@@ -715,6 +841,12 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     else:
         branch = f"copilot/{ticket_id}-{int(time.time())}"
         subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
+
+    pr_comments = _fetch_unresolved_pr_comments(target_repo_dir, existing_branch) if existing_branch else []
+    if pr_comments:
+        get_run_logger().info(f"{ticket_id}: {len(pr_comments)} comentario(s) de revision real sin resolver en la PR abierta -- se le pasan al coding agent.")
+        sanitized_prompt = sanitized_prompt + _build_pr_feedback_section(pr_comments)
+    pr_thread_ids_to_resolve = [c["thread_id"] for c in pr_comments]
 
     payload_file = SCRIPT_DIR / "logs" / f".coding_agent_payload_{ticket_id}_{int(time.time())}.json"
     payload_file.parent.mkdir(parents=True, exist_ok=True)
@@ -791,6 +923,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "self_review": self_review,
             "resumed_branch": bool(existing_branch),
             "resumed_pr_rejected": pr_rejected,
+            "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
@@ -1547,6 +1680,14 @@ def _deliver(
                 f"pendiente de revision humana (no en '{agent_result['base_branch']}').",
                 ticket_id, is_epic, child_ticket_keys,
             )
+            pr_thread_ids_to_resolve = agent_result.get("pr_thread_ids_to_resolve")
+            if pr_thread_ids_to_resolve:
+                _resolve_pr_threads(target_repo_dir, agent_result["branch"], pr_thread_ids_to_resolve)
+                _comment_all(
+                    f"💬 Se intento atender {len(pr_thread_ids_to_resolve)} comentario(s) de revision real de la PR "
+                    "abierta en este mismo commit -- revisar si la correccion fue suficiente.",
+                    ticket_id, is_epic, child_ticket_keys,
+                )
             diff_text = _run([
                 "git", "-C", target_repo_dir, "diff", f"{agent_result['base_branch']}..{agent_result['branch']}"
             ])
@@ -1647,6 +1788,7 @@ def _deliver(
                     branch = agent_result.get("branch")
                     backend = agent_result.get("backend") or backend
 
+    pr_result = None
     if judge_verdict is None:
         # Confirmado real (KAN-2, epica KAN-4): antes esto solo hacia
         # print() -- ni comentario en Jira ni transicion de status -- y el
@@ -1691,7 +1833,7 @@ def _deliver(
                 )
         _transition_all(JIRA_REVIEW_STATUS, ticket_id, is_epic, child_ticket_keys)
 
-    technical_report = generate_technical_report({
+    technical_report_evidence = {
         "ticket": ticket_id,
         "es_epica_combinada": is_epic,
         "backend_usado": backend or "ninguno",
@@ -1701,7 +1843,13 @@ def _deliver(
         "veredicto_juez": (judge_verdict or {}).get("verdict", "sin veredicto"),
         "razonamiento_juez": (judge_verdict or {}).get("reasoning", "no disponible"),
         "rama_git": branch or "ninguna",
-    })
+    }
+    # Confirmado real (usuario): pr_result ya estaba disponible aca (rama del
+    # veredicto OK) pero nunca se le pasaba al comprobante tecnico -- la
+    # documentacion del ticket no mencionaba la PR real aunque ya existiera.
+    if pr_result and pr_result.get("pr_url"):
+        technical_report_evidence["pr_url"] = pr_result["pr_url"]
+    technical_report = generate_technical_report(technical_report_evidence)
     if technical_report:
         _comment_all(technical_report, ticket_id, is_epic, child_ticket_keys)
 
@@ -1843,6 +1991,14 @@ def _deliver_epic_sequential(
             "pendiente de revision humana.",
             ticket_key=child_id,
         )
+        pr_thread_ids_to_resolve = agent_result.get("pr_thread_ids_to_resolve")
+        if pr_thread_ids_to_resolve:
+            _resolve_pr_threads(target_repo_dir, branch, pr_thread_ids_to_resolve)
+            comment_jira(
+                f"💬 Se intento atender {len(pr_thread_ids_to_resolve)} comentario(s) de revision real de la PR "
+                "abierta en este mismo commit -- revisar si la correccion fue suficiente.",
+                ticket_key=child_id,
+            )
 
         guard_result = run_output_guard(diff_text, jira_context)
         if not guard_result["clean"]:
@@ -1925,7 +2081,21 @@ def _deliver_epic_sequential(
 
     pr_result = None
     if branch and any(c["outcome"] in ("ok", "no-verdict") for c in completed):
-        pr_result = push_and_open_pr(target_repo_dir, branch, base_branch, epic_key, epic["summary"], epic["description"])
+        # Bug real confirmado (usuario, PR #238): antes esto pasaba
+        # epic["description"] tal cual -- el texto ORIGINAL/crudo de la
+        # epica (a veces un prompt de varios miles de caracteres), sin
+        # ninguna relacion con lo que esta rama puntual realmente cambio.
+        # Se arma un body real describiendo que historias se procesaron y
+        # con que resultado, no el pedido original completo.
+        children_by_id_for_pr = {c["ticket_id"]: c for c in ordered_children}
+        pr_body_lines = [f"Cambios aplicados por el pipeline de agentes de IA para la epica {epic_key} ({epic['summary']})."]
+        pr_body_lines.append("\nHistorias incluidas en esta rama:")
+        for c in completed:
+            child = children_by_id_for_pr.get(c["ticket_id"])
+            title = f" -- {child['summary']}" if child else ""
+            pr_body_lines.append(f"- {c['ticket_id']}{title} ({c['outcome']})")
+        pr_body = "\n".join(pr_body_lines)
+        pr_result = push_and_open_pr(target_repo_dir, branch, base_branch, epic_key, epic["summary"], pr_body)
 
     processed_ids = {c["ticket_id"] for c in completed} | ({blocked_at} if blocked_at else set())
     remaining = [c["ticket_id"] for c in ordered_children if c["ticket_id"] not in processed_ids]
@@ -1934,7 +2104,14 @@ def _deliver_epic_sequential(
         summary_lines.append(f"Se corto en {blocked_at} -- sin tocar: {', '.join(remaining) if remaining else 'ninguna'}.")
     if pr_result and pr_result.get("pr_url"):
         summary_lines.append(f"PR: {pr_result['pr_url']}")
-    comment_jira(" ".join(summary_lines), ticket_key=epic_key)
+    summary_text = " ".join(summary_lines)
+    comment_jira(summary_text, ticket_key=epic_key)
+    # Confirmado real (usuario): la linea "PR: ..." solo se posteaba a la
+    # epica -- las historias que realmente aportaron a esa rama/PR (outcome
+    # "ok"/"no-verdict") no tenian la URL real en su propia documentacion.
+    for c in completed:
+        if c["outcome"] in ("ok", "no-verdict"):
+            comment_jira(summary_text, ticket_key=c["ticket_id"])
 
     # Confirmado real (KAN-4): antes esto no existia -- la epica se
     # transicionaba a JIRA_IN_PROGRESS_STATUS al arrancar y nunca mas, asi

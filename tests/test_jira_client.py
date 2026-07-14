@@ -10,6 +10,7 @@ from jira_client import (
     _build_smoke_ticket_payload,
     _extract_figma_link,
     _has_sufficient_context,
+    _markdown_to_adf,
     fetch_epic_with_children,
 )
 
@@ -322,3 +323,110 @@ def test_fetch_epic_with_children_respects_custom_jql(mock_get, mock_post, monke
 
     search_call = mock_post.call_args_list[0]
     assert search_call.kwargs["json"]["jql"] == 'cf[10014] = "EPIC-1"'
+
+
+def test_markdown_to_adf_converts_hash_heading():
+    doc = _markdown_to_adf("## Resultado Real de la Corrida")
+    assert doc["type"] == "doc" and doc["version"] == 1
+    assert doc["content"][0] == {
+        "type": "heading",
+        "attrs": {"level": 2},
+        "content": [{"type": "text", "text": "Resultado Real de la Corrida"}],
+    }
+
+
+def test_markdown_to_adf_converts_bold_underline_heading_style():
+    """Confirmado real: tech_doc_agent.py genera encabezados con el estilo
+    "**Titulo**\n----" (no "## "), el mismo que usa el modelo real -- tiene
+    que reconocerse como heading tambien, no como parrafo con negrita."""
+    text = "**Resumen Ejecutivo y Objetivo**\n-----------------------------\n\nContenido real."
+    doc = _markdown_to_adf(text)
+    assert doc["content"][0]["type"] == "heading"
+    assert doc["content"][0]["content"][0]["text"] == "Resumen Ejecutivo y Objetivo"
+    assert doc["content"][1]["type"] == "paragraph"
+
+
+def test_markdown_to_adf_inline_bold_and_code():
+    doc = _markdown_to_adf("El backend fue **Ollama** con el modelo `ornith:9b`.")
+    inline = doc["content"][0]["content"]
+    bold_node = next(n for n in inline if n["text"] == "Ollama")
+    code_node = next(n for n in inline if n["text"] == "ornith:9b")
+    assert bold_node["marks"] == [{"type": "strong"}]
+    assert code_node["marks"] == [{"type": "code"}]
+
+
+def test_markdown_to_adf_bullet_list():
+    text = "- Backend utilizado: Ollama\n- Modelo Coding Agent: Ornith:9b\n"
+    doc = _markdown_to_adf(text)
+    assert doc["content"][0]["type"] == "bulletList"
+    items = doc["content"][0]["content"]
+    assert len(items) == 2
+    assert items[0]["type"] == "listItem"
+
+
+def test_markdown_to_adf_numbered_list():
+    text = "1. Primer paso\n2. Segundo paso\n"
+    doc = _markdown_to_adf(text)
+    assert doc["content"][0]["type"] == "orderedList"
+    assert len(doc["content"][0]["content"]) == 2
+
+
+def test_markdown_to_adf_code_block_with_language():
+    text = "```python\nprint('hola')\n```"
+    doc = _markdown_to_adf(text)
+    assert doc["content"][0] == {
+        "type": "codeBlock",
+        "attrs": {"language": "python"},
+        "content": [{"type": "text", "text": "print('hola')"}],
+    }
+
+
+def test_markdown_to_adf_blockquote():
+    doc = _markdown_to_adf("> The diff applies exactly the ticket's requested change.")
+    assert doc["content"][0]["type"] == "blockquote"
+
+
+def test_markdown_to_adf_rule():
+    text = "Antes\n\n---\n\nDespues"
+    doc = _markdown_to_adf(text)
+    types = [node["type"] for node in doc["content"]]
+    assert "rule" in types
+
+
+def test_markdown_to_adf_plain_text_single_paragraph():
+    doc = _markdown_to_adf("Copilot aplico un cambio en la rama 'X', pendiente de revision humana.")
+    assert doc["content"] == [{
+        "type": "paragraph",
+        "content": [{"type": "text", "text": "Copilot aplico un cambio en la rama 'X', pendiente de revision humana."}],
+    }]
+
+
+def test_markdown_to_adf_real_comprobante_tecnico_end_to_end():
+    """Caso real (recortado) confirmado en vivo esta sesion: el comprobante
+    tecnico limpio (post _strip_filler_sections) que efectivamente se
+    postea a Jira."""
+    text = (
+        "**Resumen Ejecutivo y Objetivo**\n"
+        "-----------------------------\n\n"
+        "La corrida realizada correspondio a la epica KAN-4.\n\n"
+        "**Ficha Tecnica del Modelo y Entorno**\n"
+        "-----------------------------------\n\n"
+        "* **Backend utilizado:** Ollama\n"
+        "* **Modelo Ollama Coding Agent:** Ornith:9b\n"
+    )
+    doc = _markdown_to_adf(text)
+    types = [node["type"] for node in doc["content"]]
+    assert types == ["heading", "paragraph", "heading", "bulletList"]
+
+
+@patch("jira_client.httpx.post")
+def test_post_audit_comment_sends_real_adf_body(mock_post, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_post.return_value = MagicMock(json=lambda: {"id": "1"})
+
+    jira_client.post_audit_comment("T-1", "## Titulo\n\nTexto real.")
+
+    sent_body = mock_post.call_args.kwargs["json"]["body"]
+    assert sent_body["content"][0]["type"] == "heading"

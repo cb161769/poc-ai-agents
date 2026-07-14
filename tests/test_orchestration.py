@@ -18,6 +18,8 @@ from orchestration import (
     _comment_all,
     _deliver,
     _check_pr_rejected_for_branch,
+    _fetch_unresolved_pr_comments,
+    _resolve_pr_threads,
     _find_open_branch_for_ticket,
     _format_conflicts_section,
     _handle_rejected,
@@ -644,6 +646,55 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
     assert ("EPIC-1", orchestration.JIRA_REVIEW_STATUS) in transitions
 
 
+def test_deliver_epic_sequential_pr_body_describes_real_changes_not_raw_epic_description(monkeypatch):
+    """Bug real confirmado (usuario, PR #238 real en Azure DevOps): el body
+    de la PR pasaba epic["description"] tal cual -- el texto ORIGINAL de la
+    epica (miles de caracteres de un prompt de planificacion), sin ninguna
+    relacion con lo que esa rama puntual realmente cambio. Ahora tiene que
+    describir que historias se procesaron."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    pr_calls = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(
+        orchestration, "retry_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "backend": "anthropic", "self_review": None, "conversation_file": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(
+        orchestration, "push_and_open_pr",
+        lambda target_repo_dir, branch, base_branch, ticket_id, summary, body_text: pr_calls.append(body_text) or {"pr_url": "https://x/pr/1", "pushed": True, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    huge_raw_description = "/ai Actua como un Product Owner Senior..." * 50
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": huge_raw_description}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert len(pr_calls) == 1
+    assert huge_raw_description not in pr_calls[0]
+    assert "C-1" in pr_calls[0] and "C-2" in pr_calls[0]
+    assert "ok" in pr_calls[0]
+
+
 def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeypatch):
     """Bug real confirmado en vivo (KAN-2, epica KAN-4): cuando el juez no
     puede evaluar un hijo, antes solo se comentaba -- el hijo quedaba
@@ -804,8 +855,13 @@ def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monk
         "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
     )
 
-    summary_comments = [text for _tk, text in comments if "Modo epica secuencial" in text]
-    assert len(summary_comments) == 1  # solo el resumen -- nada extra del comprobante
+    # El resumen final se postea a la epica Y se mirrorea a C-1 (outcome
+    # "ok", realmente aporto a la rama/PR) -- confirmado real (usuario): la
+    # URL de la PR tiene que verse tambien en la documentacion del ticket,
+    # no solo en la epica. Nada extra del comprobante (que devolvio None).
+    summary_comments = [(tk, text) for tk, text in comments if "Modo epica secuencial" in text]
+    assert len(summary_comments) == 2
+    assert {tk for tk, _text in summary_comments} == {"EPIC-1", "C-1"}
 
 
 def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
@@ -1161,6 +1217,141 @@ def test_check_pr_rejected_for_branch_github_false_when_open(monkeypatch):
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
 
     assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
+
+
+def _fake_remote_url_run(url: str):
+    def fake_run(cmd, **kwargs):
+        if "remote" in cmd and "get-url" in cmd:
+            return _fake_subprocess_result(stdout=url)
+        return _fake_subprocess_result()
+    return fake_run
+
+
+def test_fetch_unresolved_pr_comments_empty_without_active_pr(monkeypatch):
+    monkeypatch.setattr(orchestration.subprocess, "run", _fake_remote_url_run("https://dev.azure.com/org/proj/_git/repo\n"))
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"value": []}  # sin ninguna PR para esta rama
+
+    monkeypatch.setattr(orchestration.httpx, "get", lambda *a, **k: FakeResp())
+
+    assert _fetch_unresolved_pr_comments("/repo", "copilot/T-1-100") == []
+
+
+def test_fetch_unresolved_pr_comments_empty_without_pat(monkeypatch):
+    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+    monkeypatch.setattr(orchestration.subprocess, "run", _fake_remote_url_run("https://dev.azure.com/org/proj/_git/repo\n"))
+
+    assert _fetch_unresolved_pr_comments("/repo", "copilot/T-1-100") == []
+
+
+def test_fetch_unresolved_pr_comments_returns_real_unresolved_threads(monkeypatch):
+    """Caso real (pedido explicito del usuario): un comentario de revision
+    humano real dejado en la PR abierta tiene que llegar como feedback."""
+    monkeypatch.setattr(orchestration.subprocess, "run", _fake_remote_url_run("https://dev.azure.com/org/proj/_git/repo\n"))
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    calls = {"n": 0}
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeResp({"value": [{"status": "active", "pullRequestId": 238}]})
+        return FakeResp({
+            "value": [
+                {
+                    "id": 5, "status": "active", "isDeleted": False,
+                    "comments": [{"commentType": "text", "content": "Falta manejar el caso de token expirado."}],
+                },
+                {
+                    "id": 6, "status": "fixed", "isDeleted": False,
+                    "comments": [{"commentType": "text", "content": "ya resuelto, no deberia aparecer"}],
+                },
+                {
+                    "id": 7, "status": "active", "isDeleted": False,
+                    "comments": [{"commentType": "system", "content": "se subio una nueva iteracion"}],
+                },
+            ]
+        })
+
+    monkeypatch.setattr(orchestration.httpx, "get", fake_get)
+
+    result = _fetch_unresolved_pr_comments("/repo", "copilot/T-1-100")
+
+    assert result == [{"thread_id": 5, "text": "Falta manejar el caso de token expirado."}]
+
+
+def test_resolve_pr_threads_patches_each_thread(monkeypatch):
+    monkeypatch.setattr(orchestration.subprocess, "run", _fake_remote_url_run("https://dev.azure.com/org/proj/_git/repo\n"))
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    class FakeGetResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"value": [{"status": "active", "pullRequestId": 238}]}
+
+    monkeypatch.setattr(orchestration.httpx, "get", lambda *a, **k: FakeGetResp())
+
+    patched = []
+
+    class FakePatchResp:
+        def raise_for_status(self):
+            pass
+
+    def fake_patch(url, **kwargs):
+        patched.append((url, kwargs.get("json")))
+        return FakePatchResp()
+
+    monkeypatch.setattr(orchestration.httpx, "patch", fake_patch)
+
+    _resolve_pr_threads("/repo", "copilot/T-1-100", [5, 9])
+
+    assert len(patched) == 2
+    assert all(body == {"status": "fixed"} for _url, body in patched)
+    assert patched[0][0].endswith("/threads/5")
+    assert patched[1][0].endswith("/threads/9")
+
+
+def test_resolve_pr_threads_noop_for_empty_list(monkeypatch):
+    calls = []
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: calls.append(1) or _fake_subprocess_result())
+
+    _resolve_pr_threads("/repo", "copilot/T-1-100", [])
+
+    assert calls == []  # no llego ni a consultar el remote
+
+
+def test_resolve_pr_threads_does_not_raise_on_http_error(monkeypatch):
+    monkeypatch.setattr(orchestration.subprocess, "run", _fake_remote_url_run("https://dev.azure.com/org/proj/_git/repo\n"))
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+
+    class FakeGetResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"value": [{"status": "active", "pullRequestId": 238}]}
+
+    monkeypatch.setattr(orchestration.httpx, "get", lambda *a, **k: FakeGetResp())
+
+    def fake_patch(url, **kwargs):
+        raise orchestration.httpx.HTTPError("boom")
+
+    monkeypatch.setattr(orchestration.httpx, "patch", fake_patch)
+
+    _resolve_pr_threads("/repo", "copilot/T-1-100", [5])  # no debe lanzar
 
 
 def test_find_open_branch_for_ticket_returns_none_when_no_branches_match(monkeypatch):

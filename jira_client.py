@@ -386,10 +386,157 @@ def create_smoke_ticket(component: str) -> str:
     return resp.json()["key"]
 
 
+_INLINE_MARKUP_PATTERN = re.compile(r"\*\*(.+?)\*\*|`([^`]+?)`")
+_HEADING_HASH_PATTERN = re.compile(r"^(#{1,6})\s+(.*)$")
+_BOLD_HEADING_PATTERN = re.compile(r"^\*\*(.+?)\*\*\s*$")
+_UNDERLINE_PATTERN = re.compile(r"^[-=]{3,}\s*$")
+_RULE_PATTERN = re.compile(r"^-{3,}\s*$")
+_BULLET_PATTERN = re.compile(r"^[-*]\s+(.*)$")
+_NUMBERED_PATTERN = re.compile(r"^\d+\.\s+(.*)$")
+_QUOTE_PATTERN = re.compile(r"^>\s?(.*)$")
+_FENCE_PATTERN = re.compile(r"^```(\w*)\s*$")
+
+
+def _parse_inline_markdown(text: str) -> list:
+    """**negrita** y `codigo` inline -> nodos ADF text con "marks" -- no
+    soporta italics/anidamiento (no los usa el texto real que generan los
+    agentes de este pipeline, ver tech_doc_agent.py/judge_agent.py)."""
+    nodes = []
+    pos = 0
+    for m in _INLINE_MARKUP_PATTERN.finditer(text):
+        if m.start() > pos:
+            nodes.append({"type": "text", "text": text[pos:m.start()]})
+        if m.group(1) is not None:
+            nodes.append({"type": "text", "text": m.group(1), "marks": [{"type": "strong"}]})
+        else:
+            nodes.append({"type": "text", "text": m.group(2), "marks": [{"type": "code"}]})
+        pos = m.end()
+    if pos < len(text):
+        nodes.append({"type": "text", "text": text[pos:]})
+    return nodes or [{"type": "text", "text": text}]
+
+
+def _markdown_to_adf(text: str) -> dict:
+    """Convierte el Markdown real que generan los agentes de este pipeline
+    (tech_doc_agent.py, veredictos del juez, resumenes de orchestration.py)
+    a Atlassian Document Format real -- confirmado real esta sesion: antes
+    TODO se posteaba como un unico parrafo de texto plano, asi que
+    "**negrita**"/"## encabezados"/listas/bloques de codigo se veian como
+    asteriscos y numerales literales en Jira en vez de renderizarse.
+    Soporta: encabezados "# "/"## " y el estilo "**Titulo**\\n----" que usa
+    tech_doc_agent.py, negrita/codigo inline, listas con vinetas y
+    numeradas, bloques de codigo con fence, citas "> ", y "---" como regla
+    horizontal. No es un parser CommonMark completo -- cubre lo que el
+    texto real generado por este pipeline efectivamente usa.
+    """
+    lines = text.split("\n")
+    content = []
+    list_state = None  # (adf_list_type, [item_texts])
+
+    def flush_list():
+        nonlocal list_state
+        if list_state:
+            list_type, items = list_state
+            content.append({
+                "type": list_type,
+                "content": [
+                    {"type": "listItem", "content": [{"type": "paragraph", "content": _parse_inline_markdown(item)}]}
+                    for item in items
+                ],
+            })
+            list_state = None
+
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        if not stripped:
+            flush_list()
+            i += 1
+            continue
+
+        fence_match = _FENCE_PATTERN.match(stripped)
+        if fence_match:
+            flush_list()
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # saltea el fence de cierre
+            code_node = {"type": "codeBlock"}
+            if fence_match.group(1):
+                code_node["attrs"] = {"language": fence_match.group(1)}
+            if code_lines:
+                code_node["content"] = [{"type": "text", "text": "\n".join(code_lines)}]
+            content.append(code_node)
+            continue
+
+        heading_match = _HEADING_HASH_PATTERN.match(stripped)
+        if heading_match:
+            flush_list()
+            level = len(heading_match.group(1))
+            content.append({"type": "heading", "attrs": {"level": level}, "content": _parse_inline_markdown(heading_match.group(2))})
+            i += 1
+            continue
+
+        bold_heading_match = _BOLD_HEADING_PATTERN.match(stripped)
+        next_stripped = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if bold_heading_match and _UNDERLINE_PATTERN.match(next_stripped):
+            flush_list()
+            content.append({"type": "heading", "attrs": {"level": 2}, "content": _parse_inline_markdown(bold_heading_match.group(1))})
+            i += 2
+            continue
+
+        if _RULE_PATTERN.match(stripped):
+            flush_list()
+            content.append({"type": "rule"})
+            i += 1
+            continue
+
+        quote_match = _QUOTE_PATTERN.match(stripped)
+        if quote_match:
+            flush_list()
+            content.append({"type": "blockquote", "content": [{"type": "paragraph", "content": _parse_inline_markdown(quote_match.group(1))}]})
+            i += 1
+            continue
+
+        bullet_match = _BULLET_PATTERN.match(stripped)
+        if bullet_match:
+            if list_state and list_state[0] != "bulletList":
+                flush_list()
+            if not list_state:
+                list_state = ("bulletList", [])
+            list_state[1].append(bullet_match.group(1))
+            i += 1
+            continue
+
+        numbered_match = _NUMBERED_PATTERN.match(stripped)
+        if numbered_match:
+            if list_state and list_state[0] != "orderedList":
+                flush_list()
+            if not list_state:
+                list_state = ("orderedList", [])
+            list_state[1].append(numbered_match.group(1))
+            i += 1
+            continue
+
+        flush_list()
+        content.append({"type": "paragraph", "content": _parse_inline_markdown(stripped)})
+        i += 1
+
+    flush_list()
+    if not content:
+        content = [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]
+    return {"type": "doc", "version": 1, "content": content}
+
+
 def post_audit_comment(ticket_key: str, text: str) -> dict:
-    """Posts a plain-text audit comment on the real Jira ticket, so the
-    firewall's decision and whatever Copilot did are visible directly in
-    Jira's own comment history — not just in the local logs/*.jsonl files.
+    """Posts a Markdown-formatted audit comment on the real Jira ticket
+    (converted to real Atlassian Document Format -- ver _markdown_to_adf),
+    so el firewall's decision y lo que hizo Copilot/el juez/tech_doc_agent
+    se ven directamente en el historial de comentarios de Jira, CON el
+    formato real (encabezados/negrita/listas), no solo en los logs locales.
     """
     jira_url = os.environ["JIRA_URL"].rstrip("/")
     email = require_secret("JIRA_EMAIL")
@@ -398,11 +545,7 @@ def post_audit_comment(ticket_key: str, text: str) -> dict:
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
 
-    body_adf = {
-        "type": "doc",
-        "version": 1,
-        "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
-    }
+    body_adf = _markdown_to_adf(text)
 
     resp = httpx.post(
         f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
