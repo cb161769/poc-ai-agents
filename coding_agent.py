@@ -258,6 +258,14 @@ ser el REAL del sub-proyecto que tocaste (el que te dio detect_project_stack par
 `cwd` correspondiente) -- correr un comando generico desde la raiz, o el de un sub-proyecto distinto al \
 que modificaste, no cuenta como verificacion real del cambio.
 
+Si tu cambio agrega comportamiento nuevo visible para el usuario o el sistema (una pagina, un endpoint, una \
+funcion, una validacion) que los tests EXISTENTES no cubren, agrega vos mismo un test nuevo (unitario o \
+E2E, el que corresponda al stack real del sub-proyecto) que lo verifique -- correr solo la suite existente \
+sin sumar cobertura para lo nuevo NO cuenta como "tests_adequate": true, aunque esa suite pase entera. Si \
+genuinamente no hay forma de agregar un test (herramienta no disponible, cambio no testeable en este \
+contexto), explicalo en el summary y marca "tests_adequate": false con honestidad -- no te declares "done" \
+dandole al ticket por resuelto sin dejar constancia explicita de ese gap.
+
 Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
 objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \
 "summary": "que hiciste, que verificaste, o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...], \

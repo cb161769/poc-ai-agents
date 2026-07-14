@@ -317,7 +317,12 @@ def _normalize_policy_reference(verdict: dict) -> dict:
 
 _SAFE_SOUNDING_REASONING_PATTERN = re.compile(
     r"\b(inofensivo|no representa un riesgo|no introduce riesgos?|es seguro|"
-    r"sin riesgos? de seguridad|no hay riesgo)\b",
+    r"sin riesgos? de seguridad|no hay riesgo|"
+    # Confirmado real (KAN-5, parable/fable): el juez respondio en INGLES
+    # pese al prompt en espanol -- los modelos locales no garantizan el
+    # idioma de respuesta, asi que este patron necesita cubrir ambos.
+    r"harmless|low.risk|no risks?\b|no new risks?|without introducing (any )?risks?|"
+    r"poses no risk|is safe|safe to (apply|merge))\b",
     re.IGNORECASE,
 )
 _POSITIVE_ASSESSMENT_VALUES = {"ok", "correct", "correcto", "aprobado", "resuelto", "pasa", "passed"}
@@ -348,6 +353,49 @@ JUDGE_CONSISTENCY_NUDGE_MESSAGE = (
     "alcance pedido en el ticket), explicalo explicitamente en \"reasoning\" "
     "y asegurate de que el \"policy_reference\" elegido corresponda a ese "
     "problema real -- no repitas una descripcion que suena a aprobacion."
+)
+
+_DIFF_FILE_PATTERN = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)
+
+
+def _extract_diff_file_basenames(diff_text: str) -> list:
+    """Pure: nombres de archivo reales (sin ruta) que aparecen como destino
+    ("+++ b/...") en un diff de verdad -- usado para detectar si el
+    reasoning del juez habla del cambio real o de otra cosa."""
+    paths = _DIFF_FILE_PATTERN.findall(diff_text or "")
+    return [p.rsplit("/", 1)[-1] for p in paths if p and p != "/dev/null"]
+
+
+def _reasoning_ignores_real_diff_files(payload: dict, verdict: dict) -> bool:
+    """Confirmado real (KAN-5, parable/fable): el juez devolvio un veredicto
+    sintacticamente valido y sin la auto-contradiccion de tono de
+    _verdict_is_self_contradictory, pero su reasoning describia un cambio
+    ("selectBrowser"/"PLAYWRIGHT_BROWSER") que no tiene NADA que ver con los
+    archivos reales del diff (lazyLoader.ts, authGuard.ts,
+    httpInterceptor.ts) -- alucinacion de CONTENIDO, no de tono. Si el diff
+    real trae archivos identificables (`+++ b/...`) y el reasoning no
+    menciona NINGUNO de esos nombres, es una señal fuerte de que el juez no
+    reviso el diff real. Solo aplica en modo local_diff (en issue_only no
+    hay diff que citar, ver _build_user_prompt)."""
+    if payload.get("change_source") != "local_diff":
+        return False
+    basenames = _extract_diff_file_basenames(payload.get("change_description") or "")
+    if not basenames:
+        return False
+    reasoning = str(verdict.get("reasoning") or "")
+    if not reasoning:
+        return False
+    return not any(name.lower() in reasoning.lower() for name in basenames)
+
+
+JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE = (
+    "Tu reasoning no menciona ninguno de los archivos reales que aparecen "
+    'en el diff de arriba ("Contenido del cambio") -- releelo con cuidado: '
+    "tu razonamiento tiene que describir el cambio REAL (archivos, "
+    "funciones, comportamiento) que efectivamente aparece en ese diff, no "
+    "una interpretacion generica ni un cambio de otra corrida/contexto. "
+    "Volve a responder con el JSON completo, esta vez citando explicitamente "
+    "al menos un archivo real del diff en tu reasoning."
 )
 
 
@@ -533,7 +581,7 @@ async def judge_with_tools(payload: dict) -> dict:
                             raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
                         return _finalize(_normalize_policy_reference(retry_verdict))
 
-                    if _verdict_is_self_contradictory(verdict) and not consistency_nudge_given:
+                    if not consistency_nudge_given and _verdict_is_self_contradictory(verdict):
                         # Confirmado real (KAN-15): verdict=FLAGGED con
                         # reasoning/change_assessment que describen el
                         # cambio como inofensivo/OK -- un solo empujon, si
@@ -542,6 +590,16 @@ async def judge_with_tools(payload: dict) -> dict:
                         # de esta sesion, nunca bloquea infinito).
                         consistency_nudge_given = True
                         messages.append({"role": "user", "content": JUDGE_CONSISTENCY_NUDGE_MESSAGE})
+                        continue
+
+                    if not consistency_nudge_given and _reasoning_ignores_real_diff_files(payload, verdict):
+                        # Confirmado real (KAN-5): reasoning sintacticamente
+                        # coherente pero que describe un cambio que no
+                        # existe en el diff real -- mismo presupuesto de un
+                        # solo empujon que el chequeo de arriba (comparten
+                        # la bandera para no encadenar nudges sin limite).
+                        consistency_nudge_given = True
+                        messages.append({"role": "user", "content": JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE})
                         continue
 
                     return _finalize(verdict)

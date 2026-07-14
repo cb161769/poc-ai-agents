@@ -10,14 +10,17 @@ import pytest
 import judge_agent
 from judge_agent import (
     JUDGE_CONSISTENCY_NUDGE_MESSAGE,
+    JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE,
     JUDGE_POLICY_IDS,
     RETRYABLE_POLICY_REFERENCES,
     _build_user_prompt,
     _estimate_cost_usd,
+    _extract_diff_file_basenames,
     _extract_json,
     _messages_to_ollama,
     _normalize_policy_reference,
     _ollama_response_to_blocks,
+    _reasoning_ignores_real_diff_files,
     _redact_payload_for_logging,
     _verdict_is_self_contradictory,
 )
@@ -203,6 +206,22 @@ def test_verdict_is_self_contradictory_true_for_safe_sounding_reasoning():
     assert _verdict_is_self_contradictory(verdict) is True
 
 
+def test_verdict_is_self_contradictory_true_for_safe_sounding_reasoning_in_english():
+    """Caso real confirmado (KAN-5, parable/fable via Ollama): el juez
+    respondio en INGLES pese al prompt en espanol -- "low-risk... resolves
+    the ticket without introducing risks" con verdict=FLAGGED. El patron
+    original solo cubria frases en espanol y no detecto la contradiccion."""
+    verdict = {
+        "verdict": "FLAGGED",
+        "reasoning": (
+            "This is a low-risk addition (a single utility function with no side effects) "
+            "and matches the user's request. No new secrets were introduced, and the tests "
+            "pass, so the change resolves the ticket without introducing risks."
+        ),
+    }
+    assert _verdict_is_self_contradictory(verdict) is True
+
+
 def test_verdict_is_self_contradictory_false_for_ok_verdict():
     verdict = {"verdict": "OK", "change_assessment": "OK", "reasoning": "todo perfecto, inofensivo"}
     assert _verdict_is_self_contradictory(verdict) is False
@@ -215,6 +234,60 @@ def test_verdict_is_self_contradictory_false_when_reasoning_explains_real_proble
         "reasoning": "El diff solo crea 404.html pero el ticket tambien pide una pagina 500 -- alcance incompleto.",
     }
     assert _verdict_is_self_contradictory(verdict) is False
+
+
+_REAL_DIFF_TEXT = """diff --git a/frontend/src/lazyLoader.ts b/frontend/src/lazyLoader.ts
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/lazyLoader.ts
+@@
++export class LazyLoader {}
+diff --git a/frontend/src/guards/authGuard.ts b/frontend/src/guards/authGuard.ts
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/guards/authGuard.ts
+@@
++export class AuthGuard {}
+"""
+
+
+def test_extract_diff_file_basenames_reads_real_plus_plus_plus_lines():
+    assert _extract_diff_file_basenames(_REAL_DIFF_TEXT) == ["lazyLoader.ts", "authGuard.ts"]
+
+
+def test_extract_diff_file_basenames_empty_for_no_diff_markers():
+    assert _extract_diff_file_basenames("solo texto plano, no es un diff") == []
+
+
+def test_reasoning_ignores_real_diff_files_true_for_unrelated_content():
+    """Caso real confirmado (KAN-5, parable/fable): el diff real crea
+    lazyLoader.ts/authGuard.ts, pero el juez describio un `selectBrowser`/
+    `PLAYWRIGHT_BROWSER` que no tiene nada que ver -- alucinacion de
+    contenido, no de tono (el veredicto en si no era autocontradictorio)."""
+    payload = {"change_source": "local_diff", "change_description": _REAL_DIFF_TEXT}
+    verdict = {
+        "verdict": "FLAGGED",
+        "reasoning": "Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER, falling back to Chromium.",
+    }
+    assert _reasoning_ignores_real_diff_files(payload, verdict) is True
+
+
+def test_reasoning_ignores_real_diff_files_false_when_reasoning_cites_real_file():
+    payload = {"change_source": "local_diff", "change_description": _REAL_DIFF_TEXT}
+    verdict = {"verdict": "OK", "reasoning": "El cambio agrega lazyLoader.ts para carga diferida, sin riesgos reales."}
+    assert _reasoning_ignores_real_diff_files(payload, verdict) is False
+
+
+def test_reasoning_ignores_real_diff_files_false_when_no_basenames_in_diff():
+    payload = {"change_source": "local_diff", "change_description": "diff"}
+    verdict = {"verdict": "FLAGGED", "reasoning": "cualquier cosa"}
+    assert _reasoning_ignores_real_diff_files(payload, verdict) is False
+
+
+def test_reasoning_ignores_real_diff_files_false_in_issue_only_mode():
+    payload = {"change_source": "issue_only", "change_description": _REAL_DIFF_TEXT}
+    verdict = {"verdict": "FLAGGED", "reasoning": "no hay diff real todavia"}
+    assert _reasoning_ignores_real_diff_files(payload, verdict) is False
 
 
 def _base_judge_payload(**overrides):
@@ -505,6 +578,52 @@ def test_judge_with_tools_nudges_once_on_self_contradictory_verdict_and_accepts_
     # el 2do llamado tiene que haber visto el mensaje de nudge en la conversacion
     assert any(
         m.get("content") == JUDGE_CONSISTENCY_NUDGE_MESSAGE
+        for m in seen_messages[1]
+        if isinstance(m, dict)
+    )
+
+
+def test_judge_with_tools_nudges_once_on_content_hallucination_and_accepts_correction(monkeypatch):
+    """Caso real (KAN-5): el 1er veredicto cita un cambio que no existe en
+    el diff real -- tiene que recibir el nudge de contenido y, si el 2do
+    intento corrige citando un archivo real, devolver ese veredicto."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    call_count = {"n": 0}
+    seen_messages = []
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        seen_messages.append(list(messages))
+        if call_count["n"] == 1:
+            content = [{
+                "type": "text",
+                "text": (
+                    '{"verdict": "FLAGGED", "reasoning": '
+                    '"Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}'
+                ),
+            }]
+        else:
+            content = [{
+                "type": "text",
+                "text": '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida, sin problemas reales."}',
+            }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
+    result = asyncio.run(judge_agent.judge_with_tools(payload))
+
+    assert call_count["n"] == 2
+    assert result["verdict"] == "OK"
+    assert any(
+        m.get("content") == JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE
         for m in seen_messages[1]
         if isinstance(m, dict)
     )

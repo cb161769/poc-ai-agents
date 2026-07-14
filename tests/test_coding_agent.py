@@ -1013,3 +1013,14 @@ def test_system_prompt_forbids_inventing_architecture():
 
 def test_system_prompt_requires_real_verification_command_for_correct_subproject():
     assert "no cuenta como verificacion real del cambio" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_new_test_for_new_user_facing_behavior():
+    """Auditoria real: un diff que agrega paginas/endpoints nuevos (ej. KAN-15,
+    404.html/500.html) sin ningun test nuevo no deberia poder auto-certificarse
+    como tests_adequate=true solo por correr la suite existente."""
+    assert "agrega comportamiento nuevo visible" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert (
+        "sin sumar cobertura para lo nuevo NO cuenta como \"tests_adequate\": true"
+        in ca.CODING_AGENT_SYSTEM_PROMPT
+    )
