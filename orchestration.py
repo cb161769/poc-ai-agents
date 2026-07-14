@@ -560,9 +560,26 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
     ).stdout
 
+    # Bug real confirmado esta sesion (KAN-15): el modelo puede llamar "git
+    # commit" el mismo via run_shell_command, en vez de solo escribir
+    # archivos y dejar que ESTE codigo comitee -- en ese caso git status
+    # queda LIMPIO (ya esta commiteado), y mirar solo el working tree hacia
+    # que un commit real se interpretara como "no aplico nada", BORRANDO la
+    # rama con el commit real adentro. Por eso ademas se chequea si HEAD
+    # tiene commits reales por encima de base_branch, no solo si el working
+    # tree esta sucio.
+    commits_ahead = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-list", "--count", f"{base_branch}..HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    has_own_commits = commits_ahead.isdigit() and int(commits_ahead) > 0
+
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
         subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
+        has_own_commits = True
+
+    if has_own_commits:
         return {
             "applied": True,
             "branch": branch,
@@ -613,6 +630,16 @@ def retry_coding_agent_local_real(
     else:
         payload["sanitized_prompt"] = feedback_text
 
+    # Checkpoint de HEAD ANTES del turno -- mismo motivo que
+    # run_coding_agent_local_real: el modelo puede commitear el mismo via
+    # run_shell_command, dejando git status limpio aunque haya un commit
+    # real nuevo. Aca no hay un base_branch fijo (se reusa la rama del
+    # primer intento), asi que el checkpoint es el HEAD real justo antes de
+    # este turno puntual.
+    checkpoint = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
     payload_file = SCRIPT_DIR / "logs" / f".coding_agent_retry_payload_{ticket_id}_{int(time.time())}.json"
     payload_file.parent.mkdir(parents=True, exist_ok=True)
     payload_file.write_text(json.dumps(payload), encoding="utf-8")
@@ -646,13 +673,19 @@ def retry_coding_agent_local_real(
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
     ).stdout
 
-    if not status.strip():
+    head_now = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    has_own_commits = bool(checkpoint) and head_now != checkpoint
+
+    if not status.strip() and not has_own_commits:
         return {"applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file}
 
-    subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
-    subprocess.run(
-        ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
-    )
+    if status.strip():
+        subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
+        )
     # Ya no se borra aca -- el llamador decide: _retry_local_diff es siempre
     # el ultimo intento de esa cadena y limpia el archivo el mismo; el modo
     # epica secuencial (_deliver_epic_sequential) en cambio necesita este

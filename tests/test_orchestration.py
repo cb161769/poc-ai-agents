@@ -817,6 +817,81 @@ def test_run_tests_uses_host_target_repo_dir_for_docker_outside_of_docker(monkey
     assert captured["cmd"][-2:] == ["/target-repo", "/c/Users/real/scratchpad/ai-agents-code"]
 
 
+def _fake_subprocess_result(returncode=0, stdout="", stderr=""):
+    class R:
+        pass
+    r = R()
+    r.returncode = returncode
+    r.stdout = stdout
+    r.stderr = stderr
+    return r
+
+
+def test_run_coding_agent_local_real_detects_commits_made_by_the_model_itself(monkeypatch, tmp_path):
+    """Bug real confirmado esta sesion (KAN-15): el modelo puede llamar
+    "git commit" el mismo via run_shell_command, en vez de solo escribir
+    archivos y dejar que run_coding_agent_local_real() comitee -- en ese
+    caso 'git status --porcelain' queda LIMPIO (ya esta commiteado). Mirar
+    solo el working tree hacia que ese commit real se interpretara como
+    "no aplico nada", BORRANDO la rama con el commit real adentro.
+    """
+    git_calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")  # limpio -- el modelo ya commiteo el mismo
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")  # 1 commit real por encima de base_branch
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["applied"] is True
+    assert result["branch"] is not None
+    # NO se llamo "branch -D" (la rama con el commit real no se borro)
+    assert not any(cmd[-2:-1] == ["branch"] and "-D" in cmd for cmd in git_calls)
+
+
+def test_retry_coding_agent_local_real_detects_commits_made_by_the_model_itself(monkeypatch, tmp_path):
+    """Mismo bug que run_coding_agent_local_real, para el camino de
+    reintento -- aca no hay base_branch fijo (se reusa la rama del primer
+    intento), asi que se compara HEAD antes/despues del turno (checkpoint)."""
+    heads = iter(["hash-antes\n", "hash-despues\n"])  # checkpoint, luego el head_now final
+
+    def fake_git(cmd, **kwargs):
+        if cmd[-1:] == ["HEAD"] and "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=next(heads, "hash-despues\n"))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")  # limpio -- el modelo ya commiteo el mismo
+        return _fake_subprocess_result()
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        return fake_git(cmd, **kwargs)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.retry_coding_agent_local_real("T-1", "feedback", str(tmp_path))
+
+    assert result["applied"] is True
+
+
 def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):
     class R:
         returncode = 0
