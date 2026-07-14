@@ -580,29 +580,50 @@ async def judge_with_tools(payload: dict) -> dict:
                         if retry_verdict.get("verdict") not in ("OK", "FLAGGED"):
                             raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
                         retry_verdict = _normalize_policy_reference(retry_verdict)
-                        # Bug real confirmado esta sesion (investigacion KAN-5):
-                        # este camino (JSON invalido en el primer turno) devolvia
-                        # el veredicto del reintento SIN pasar nunca por los
-                        # chequeos de auto-contradiccion/alucinacion de contenido
-                        # de abajo -- un bypass completo, no solo el limite de
-                        # "un solo empujon" que ya tienen esos chequeos en el
-                        # camino normal. Ya no queda presupuesto para otro
-                        # reintento real aca (este YA es el reintento de JSON
-                        # invalido), asi que solo se deja constancia real en el
-                        # log -- visible en el stderr que orchestration.py
-                        # captura, a diferencia del nudge en memoria de abajo
-                        # que hoy no deja ningun rastro -- y se acepta igual
-                        # (mismo criterio de nunca bloquear infinito).
+                        # Bug real confirmado esta sesion (investigacion KAN-5,
+                        # dos vueltas): este camino (JSON invalido en el primer
+                        # turno) devolvia el veredicto del reintento SIN pasar
+                        # nunca por los chequeos de auto-contradiccion/
+                        # alucinacion de abajo -- un bypass completo. La
+                        # primera correccion (solo loguear y aceptar) seguia
+                        # posteando el veredicto contradictorio real a Jira
+                        # sin darle al modelo ninguna chance de corregirse --
+                        # confirmado en vivo (KAN-5: "FLAGGED" con reasoning
+                        # 100% positivo, logueado pero igual publicado). Ahora
+                        # se le da UN empujon real aca tambien (mismo
+                        # presupuesto que el camino normal: una sola
+                        # correccion extra, nunca bloqueo infinito) antes de
+                        # aceptar.
+                        nudge_message = None
                         if _verdict_is_self_contradictory(retry_verdict):
-                            logger.warning(
-                                "juez: el veredicto del reintento de JSON es auto-contradictorio "
-                                f"(verdict=FLAGGED con tono de aprobacion) -- se acepta igual: {retry_text[:500]!r}"
-                            )
+                            nudge_message = JUDGE_CONSISTENCY_NUDGE_MESSAGE
                         elif _reasoning_ignores_real_diff_files(payload, retry_verdict):
-                            logger.warning(
-                                "juez: el reasoning del veredicto del reintento no menciona ningun archivo "
-                                f"real del diff -- posible alucinacion de contenido, se acepta igual: {retry_text[:500]!r}"
+                            nudge_message = JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE
+
+                        if nudge_message is not None:
+                            messages.append({"role": "user", "content": nudge_message})
+                            nudge_content, _nudge_stop, nudge_usage = await _call_model_turn(
+                                client, backend, messages, [], JUDGE_SYSTEM_PROMPT,
+                                ollama_model=JUDGE_OLLAMA_MODEL, force_json=True,
                             )
+                            messages.append({"role": "assistant", "content": nudge_content})
+                            total_input_tokens += nudge_usage.get("input_tokens", 0)
+                            total_output_tokens += nudge_usage.get("output_tokens", 0)
+                            nudge_text = next((b["text"] for b in nudge_content if b.get("type") == "text"), "")
+                            try:
+                                corrected_verdict = _extract_json(nudge_text)
+                                if corrected_verdict.get("verdict") in ("OK", "FLAGGED"):
+                                    retry_verdict = _normalize_policy_reference(corrected_verdict)
+                                else:
+                                    logger.warning(
+                                        f"juez: la correccion post-reintento tampoco trajo un 'verdict' valido -- "
+                                        f"se acepta el veredicto anterior igual: {nudge_text[:500]!r}"
+                                    )
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    f"juez: la correccion post-reintento no fue JSON valido -- se acepta el "
+                                    f"veredicto anterior igual: {nudge_text[:500]!r}"
+                                )
                         return _finalize(retry_verdict)
 
                     if not consistency_nudge_given and _verdict_is_self_contradictory(verdict):

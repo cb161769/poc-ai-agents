@@ -688,15 +688,15 @@ def test_judge_with_tools_retries_when_json_valid_but_verdict_key_missing(monkey
     assert result["reasoning"] == "corregido"
 
 
-def test_judge_with_tools_warns_but_accepts_hallucinated_verdict_from_json_retry(monkeypatch, caplog):
-    """Bug real confirmado esta sesion (investigacion KAN-5): el camino de
-    reintento de JSON invalido (_final_text_with_json_retry) devolvia su
-    resultado SIN pasar nunca por _verdict_is_self_contradictory ni
-    _reasoning_ignores_real_diff_files -- un bypass completo, no solo el
-    limite de "un solo empujon" que esos chequeos ya tienen en el camino
-    normal. Ahora debe loguear una advertencia real (visible en el stderr
-    que orchestration.py captura) aunque siga aceptando el veredicto (no
-    queda presupuesto para otro reintento real aca)."""
+def test_judge_with_tools_nudges_and_corrects_hallucinated_verdict_from_json_retry(monkeypatch):
+    """Bug real confirmado en vivo esta sesion (investigacion KAN-5, dos
+    vueltas): el camino de reintento de JSON invalido (_final_text_with_json_retry)
+    devolvia su resultado SIN pasar nunca por _verdict_is_self_contradictory
+    ni _reasoning_ignores_real_diff_files -- un bypass completo. Un primer
+    fix solo lo logueaba (aceptaba igual, el usuario vio ese comentario
+    contradictorio real publicado en Jira y reacciono con frustracion) --
+    ahora tiene que darle al modelo una correccion real (un llamado mas, no
+    solo el nudge en memoria) antes de aceptar."""
     monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
 
     async def fake_connect_mcp_servers(stack, servers, label="agente"):
@@ -715,15 +715,61 @@ def test_judge_with_tools_warns_but_accepts_hallucinated_verdict_from_json_retry
             {"input_tokens": 1, "output_tokens": 1},
         )
 
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
+        # La correccion real -- esta vez el modelo cita un archivo real del diff.
+        content = [{
+            "type": "text",
+            "text": '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida, sin problemas reales."}',
+        }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
     monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
+
+    payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
+    result = asyncio.run(judge_agent.judge_with_tools(payload))
+
+    assert result["verdict"] == "OK"  # la correccion real reemplazo el veredicto alucinado
+    assert result["reasoning"] == "Agrega lazyLoader.ts para carga diferida, sin problemas reales."
+
+
+def test_judge_with_tools_accepts_original_verdict_if_correction_also_fails(monkeypatch, caplog):
+    """Si la correccion post-reintento TAMPOCO trae un verdict valido, se
+    acepta el veredicto original (detectado como sospechoso) igual -- nunca
+    bloquea infinito -- pero con una advertencia real en el log."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es JSON en absoluto"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return (
+            '{"verdict": "FLAGGED", "reasoning": '
+            '"Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}',
+            {"input_tokens": 1, "output_tokens": 1},
+        )
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
+        content = [{"type": "text", "text": "sigo sin poder devolver JSON valido"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
 
     payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
     with caplog.at_level("WARNING"):
         result = asyncio.run(judge_agent.judge_with_tools(payload))
 
-    assert result["verdict"] == "FLAGGED"  # se acepta igual, no bloquea
-    assert any("alucinacion de contenido" in r.message for r in caplog.records)
+    assert result["verdict"] == "FLAGGED"  # veredicto original, se acepta igual
+    assert any("no fue JSON valido" in r.message for r in caplog.records)
 
 
 def test_judge_with_tools_raises_when_retry_also_lacks_valid_verdict(monkeypatch):
