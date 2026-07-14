@@ -41,6 +41,7 @@ without standing up Prefect — both drive the exact same scripts underneath.
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,6 +63,7 @@ load_dotenv()
 
 import httpx
 from prefect import flow, get_run_logger, task
+from prefect.artifacts import create_markdown_artifact
 
 import epic_planner
 import graph_writer
@@ -295,8 +297,13 @@ def transition_jira(status: str, ticket_key: str | None = None):
     except Exception as exc:
         # Best-effort (igual que antes, con check=False) pero YA NO en
         # silencio -- antes un fallo real de Jira (nombre de transicion
-        # invalido, red caida) desaparecia sin dejar rastro.
-        logger.warning(f"No se pudo transicionar el ticket {key} a '{status}': {exc}")
+        # invalido, red caida) desaparecia sin dejar rastro. Gap real de
+        # observabilidad (Prefect): esto usaba el logger de log_utils
+        # (stderr crudo del contenedor), invisible en la UI de Prefect --
+        # aunque la tarea agota sus 2 reintentos y "completa" igual (best-
+        # effort a proposito), get_run_logger() deja el fallo real visible
+        # en los logs de ESA tarea puntual en vez de perderse en stderr.
+        get_run_logger().warning(f"No se pudo transicionar el ticket {key} a '{status}': {exc}")
 
 
 @task(retries=2, retry_delay_seconds=5, name="comment-jira")
@@ -305,7 +312,7 @@ def comment_jira(text: str, ticket_key: str | None = None):
     try:
         jira_client.post_audit_comment(key, text)
     except Exception as exc:
-        logger.warning(f"No se pudo comentar en el ticket {key}: {exc}")
+        get_run_logger().warning(f"No se pudo comentar en el ticket {key}: {exc}")
 
 
 def _post_child_technical_report(epic_key: str, child_id: str, backend: str | None, resultado: str, extra: dict | None = None) -> None:
@@ -526,17 +533,28 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     finally:
         payload_file.unlink(missing_ok=True)
 
+    # Gap real de observabilidad (Prefect): esta corrida usa print() en vez
+    # de get_run_logger(), asi que nunca aparecia en los logs de tarea de
+    # Prefect -- solo en el stdout crudo del contenedor. stderr sigue sin
+    # capturarse a proposito (ver comentario arriba del subprocess.run): si
+    # lo capturamos ahi perdemos la confirmacion interactiva [s/n] en vivo,
+    # que es mas importante que la observabilidad aca. Un returncode
+    # distinto de cero SI se loguea -- antes ni eso quedaba registrado.
+    run_logger = get_run_logger()
+    if result.returncode != 0:
+        run_logger.warning(f"coding_agent.py salio con returncode={result.returncode} para {ticket_id} (stderr no capturado, ver confirmacion interactiva en la terminal real).")
+
     agent_backend = None
     conversation_file = None
     self_review = None
     try:
         agent_result = json.loads(result.stdout)
-        print(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
+        run_logger.info(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
         agent_backend = agent_result.get("_meta", {}).get("backend")
         conversation_file = agent_result.get("_conversation_file")
         self_review = agent_result.get("self_review")
     except json.JSONDecodeError:
-        print("El agente no devolvio un JSON valido en stdout.")
+        run_logger.warning(f"El agente no devolvio un JSON valido en stdout para {ticket_id}.")
 
     status = subprocess.run(
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
@@ -608,17 +626,21 @@ def retry_coding_agent_local_real(
     finally:
         payload_file.unlink(missing_ok=True)
 
+    run_logger = get_run_logger()
+    if result.returncode != 0:
+        run_logger.warning(f"coding_agent.py (segundo intento) salio con returncode={result.returncode} para {ticket_id}.")
+
     backend = None
     retry_conversation_file = None
     self_review = None
     try:
         agent_result = json.loads(result.stdout)
-        print(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
+        run_logger.info(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
         backend = agent_result.get("_meta", {}).get("backend")
         retry_conversation_file = agent_result.get("_conversation_file")
         self_review = agent_result.get("self_review")
     except json.JSONDecodeError:
-        print("El agente no devolvio un JSON valido en stdout en el segundo intento.")
+        run_logger.warning(f"El agente no devolvio un JSON valido en stdout en el segundo intento para {ticket_id}.")
 
     status = subprocess.run(
         ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
@@ -654,6 +676,11 @@ def run_output_guard(diff_text: str, jira_context: dict) -> dict:
 @task(retries=0, name="testing-agent")
 def run_tests(target_repo_dir: str) -> dict:
     if shutil.which("docker") is None:
+        # Gap real de observabilidad (Prefect): esto devuelve passed=True
+        # sin correr NINGUN test real -- Prefect mostraba esta tarea como
+        # "Completed" identica a una corrida real que si paso, sin forma de
+        # distinguir un salto silencioso de una validacion real.
+        get_run_logger().warning(f"testing-agent omitido para {target_repo_dir}: docker no disponible en el host -- NO se corrio ningun test real.")
         return {"passed": True, "output": "(testing agent omitido: docker no disponible en el host)"}
 
     result = subprocess.run(
@@ -794,6 +821,14 @@ def run_judge(
     )
     if result.returncode != 0:
         raise RuntimeError(f"juez fallo: {result.stderr.strip()}")
+    # Gap real de observabilidad (Prefect): con returncode==0, result.stderr
+    # se descartaba siempre en silencio -- ahi es donde judge_agent.py loguea
+    # cosas como "juez: usando backend 'X'", warnings de modelo no
+    # descargado, o errores de tool-calls individuales que el loop ya
+    # atrapo y siguio (ej. un CypherSyntaxError real de una query mal
+    # armada) -- info real que nunca llegaba a los logs de Prefect.
+    if result.stderr.strip():
+        get_run_logger().info(f"judge_agent.py stderr:\n{result.stderr.strip()[-4000:]}")
     return json.loads(result.stdout)
 
 
@@ -810,11 +845,19 @@ def get_falco_summary(since_iso: str) -> dict | None:
         capture_output=True,
         text=True,
     )
+    # Gap real de observabilidad (Prefect): result.stderr se descartaba
+    # SIEMPRE, incluso cuando el script realmente fallaba (returncode!=0) --
+    # esta tarea nunca lanzaba, asi que Prefect la mostraba "Completed" sin
+    # ningun rastro de que el chequeo de Falco ni siquiera corrio.
+    if result.returncode != 0:
+        get_run_logger().warning(f"check_falco_alerts.py fallo (returncode={result.returncode}): {result.stderr.strip()[-2000:]}")
+        return None
     if not result.stdout.strip():
         return None
     try:
         summary = json.loads(result.stdout)
     except json.JSONDecodeError:
+        get_run_logger().warning(f"check_falco_alerts.py no devolvio JSON valido: {result.stdout.strip()[:500]!r}")
         return None
     if not summary.get("count"):
         return None
@@ -898,16 +941,49 @@ def _build_graph_payload(
     }
 
 
+def _post_judge_verdict_artifact(jira_context: dict, verdict: dict) -> None:
+    """Gap real de observabilidad (Prefect): el veredicto completo del juez
+    (reasoning, policy_reference, los *_assessment) solo vivia en el dict
+    que devuelve la tarea -- nunca aparecia en la UI de Prefect como algo
+    navegable, solo si se lee el resultado crudo de la tarea. Un artifact
+    markdown lo deja ahi mismo, ligado a esta corrida especifica -- mismo
+    punto de entrada para TODOS los caminos que llaman al juez
+    (_run_judge_safe es compartido). Best-effort: nunca bloquea la corrida
+    real si Prefect no puede crear el artifact.
+    """
+    ticket_id = str(jira_context.get("ticket_id") or "desconocido")
+    try:
+        body = (
+            f"**Ticket:** {ticket_id}\n\n"
+            f"**Veredicto:** {verdict.get('verdict')}\n\n"
+            f"**Policy reference:** {verdict.get('policy_reference')}\n\n"
+            f"**Firewall assessment:** {verdict.get('firewall_assessment')}\n\n"
+            f"**Change assessment:** {verdict.get('change_assessment')}\n\n"
+            f"**Reasoning:**\n\n{verdict.get('reasoning')}"
+        )
+        safe_key = re.sub(r"[^a-z0-9-]", "-", ticket_id.lower()).strip("-") or "ticket"
+        create_markdown_artifact(
+            key=f"judge-verdict-{safe_key}",
+            markdown=body,
+            description=f"Veredicto real del juez para {ticket_id}",
+        )
+    except Exception as exc:
+        get_run_logger().warning(f"No se pudo crear el artifact del veredicto del juez para {ticket_id}: {exc}")
+
+
 def _run_judge_safe(*args, **kwargs) -> dict | None:
     """Same tolerance as run_poc_loop.sh: if the judge can't run at all (no
     ANTHROPIC_API_KEY, no reachable Ollama, network failure), the pipeline
     continues without a verdict instead of failing the whole flow.
     """
     try:
-        return run_judge(*args, **kwargs)
+        verdict = run_judge(*args, **kwargs)
     except Exception as exc:
-        print(f"El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad): {exc}")
+        get_run_logger().warning(f"El juez no pudo evaluar esta corrida (revisa ANTHROPIC_API_KEY, Ollama local, o conectividad): {exc}")
         return None
+    jira_context = args[0] if args else {}
+    _post_judge_verdict_artifact(jira_context, verdict)
+    return verdict
 
 
 def _evaluate_new_diff_after_retry(

@@ -46,8 +46,9 @@ KNOWN_REPOS = {
 ROVO_AUTHOR_MATCH = os.environ.get("ROVO_AUTHOR_NAME_MATCH", "rovo").lower()
 
 
-def _adf_to_text(node) -> str:
-    """Flatten Atlassian Document Format into plain text."""
+def _adf_to_text_raw(node) -> str:
+    """Flatten Atlassian Document Format into plain text (recursive core --
+    see _adf_to_text for the normalized public entry point)."""
     if node is None:
         return ""
     if isinstance(node, str):
@@ -57,13 +58,25 @@ def _adf_to_text(node) -> str:
         if node.get("type") == "text":
             text_parts.append(node.get("text", ""))
         for child in node.get("content", []) or []:
-            text_parts.append(_adf_to_text(child))
+            text_parts.append(_adf_to_text_raw(child))
         if node.get("type") in ("paragraph", "heading"):
             text_parts.append("\n")
     elif isinstance(node, list):
         for child in node:
-            text_parts.append(_adf_to_text(child))
+            text_parts.append(_adf_to_text_raw(child))
     return "".join(text_parts)
+
+
+def _adf_to_text(node) -> str:
+    """Flatten Atlassian Document Format into plain text, normalizado --
+    auditoria real de esta sesion: el texto plano se le pasa directo al
+    coding agent/juez como parte del prompt, sin ninguna limpieza de ruido.
+    Parrafos vacios consecutivos en el ADF (comun en descripciones editadas
+    a mano) generaban corridas largas de saltos de linea que no aportaban
+    nada -- se colapsan a un maximo de una linea en blanco entre parrafos.
+    """
+    raw = _adf_to_text_raw(node)
+    return re.sub(r"\n{3,}", "\n\n", raw).strip()
 
 
 def _adf_has_code_block(node) -> bool:
@@ -180,6 +193,20 @@ def _resolve_repository_origen(fields: dict, known_repos: set | None = None) -> 
     )
 
 
+# Auditoria real de esta sesion: el pipeline asumia que un ticket "trae
+# suficiente contexto" con solo tener un summary -- una descripcion vacia o
+# casi vacia (ej. "arreglar esto") llegaba igual hasta el coding agent/juez
+# sin ninguna señal de que el contexto es insuficiente para trabajar en
+# serio. No bloquea la corrida (eso ya lo decide el firewall/el juez con
+# mas contexto real que esto), solo deja la señal explicita en el ticket
+# resuelto para que el caller decida que hacer.
+_MIN_DESCRIPTION_CHARS = 20
+
+
+def _has_sufficient_context(summary: str, description: str) -> bool:
+    return bool((summary or "").strip()) and len((description or "").strip()) >= _MIN_DESCRIPTION_CHARS
+
+
 def _auth_headers() -> dict:
     email = require_secret("JIRA_EMAIL")
     token = require_secret("JIRA_API_TOKEN")
@@ -225,6 +252,7 @@ def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = N
         "status": (fields.get("status") or {}).get("name"),
         "issue_type": (fields.get("issuetype") or {}).get("name"),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
+        "has_sufficient_context": _has_sufficient_context(fields.get("summary", ""), description_text),
         "figma_link": _extract_figma_link(description_text),
         **attachment_info,
     }
@@ -529,6 +557,12 @@ def main():
                     "detail": f"El ticket {ticket.get('ticket_id')} no tiene ningun Component ni etiqueta en {sorted(KNOWN_REPOS)}. "
                     "Asigna el campo Components de Jira (recomendado, Settings > Components de tu proyecto) o una "
                     "etiqueta (label) con el nombre exacto del nodo del grafo afectado.",
+                    # Auditoria real: antes solo se mostraba la lista de
+                    # nombres conocidos, nunca lo que el ticket SI tenia --
+                    # sin esto, un typo real en el Component/label quedaba
+                    # invisible (ej. "AuthServices" en vez de "AuthService").
+                    "ticket_components": ticket.get("components", []),
+                    "ticket_labels": ticket.get("labels", []),
                 }
             ),
             file=sys.stderr,

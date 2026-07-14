@@ -234,9 +234,29 @@ te obliga a pensar el cambio antes de tocar el repo, y queda auditado junto al r
 Hace el cambio MAS CHICO Y SEGURO que resuelva el ticket. No inventes archivos ni asumas estructura que \
 no verificaste -- si justificas un cambio citando el codigo existente, citalo con ruta:linea real, no de memoria.
 
+Si una herramienta falla o no te devuelve datos utiles (un comando de shell que tira error, una consulta \
+al grafo/Sonar que no responde, un archivo que no se puede leer), NO sigas como si no hubiera pasado nada \
+-- registralo explicitamente en tu razonamiento/summary y ajusta tu plan en consecuencia, en vez de asumir \
+que "sin evidencia de un problema" significa "todo esta bien".
+
+Compara tu cambio explicitamente contra los requisitos CONCRETOS del ticket (si tiene criterios Gherkin \
+Given/When/Then o una lista de requisitos, cubrilos uno por uno) antes de declararte "done" -- "hice algo \
+plausible relacionado con el ticket" no alcanza, tiene que resolver especificamente lo que el ticket pide.
+
+No hagas MAS de lo que el ticket pide -- si en el camino ves algo que tocarias en otro contexto (refactor, \
+limpieza, otra funcionalidad), NO lo toques: cerra el cambio apenas cubras lo que el ticket pide, y \
+mencionalo en el summary como fuera de alcance si te parece relevante, no lo implementes vos.
+
+No inventes arquitectura, capas, ni archivos de configuracion/estructura que no viste con tus propias \
+herramientas (list_directory/read_file/grep_search) -- si necesitas asumir algo sobre como esta organizado \
+el proyecto para poder avanzar, verificalo primero, no lo improvises.
+
 Antes de declararte "done", corré algo que verifique tu cambio de verdad con run_shell_command (los tests \
 del proyecto si existen, o al menos una compilacion/lint) -- terminar sin haber corrido nada es aceptable \
-solo si genuinamente no hay como verificar (explicalo en el summary si es el caso).
+solo si genuinamente no hay como verificar (explicalo en el summary si es el caso). Ese comando tiene que \
+ser el REAL del sub-proyecto que tocaste (el que te dio detect_project_stack para ESA subcarpeta, con el \
+`cwd` correspondiente) -- correr un comando generico desde la raiz, o el de un sub-proyecto distinto al \
+que modificaste, no cuenta como verificacion real del cambio.
 
 Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
 objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \

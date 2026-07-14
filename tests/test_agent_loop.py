@@ -774,3 +774,31 @@ def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkey
     assert usage == {"input_tokens": 5, "output_tokens": 3}
     assert messages[-2] == {"role": "user", "content": JSON_CORRECTION_MESSAGE}
     assert messages[-1]["role"] == "assistant"
+
+
+class _FakeMcpTool:
+    def __init__(self, name, description="desc"):
+        self.name = name
+        self.description = description
+        self.inputSchema = {"type": "object", "properties": {}}
+
+
+def test_normalize_tool_schema_excludes_broken_get_neo4j_schema():
+    """Bug real confirmado esta sesion: mcp-neo4j-cypher arma internamente
+    'CALL apoc.meta.schema({sample: None})...' (el None de Python en vez del
+    null de Cypher) -- SIEMPRE tira CypherSyntaxError y quema turnos hasta
+    agotar MAX_TOOL_TURNS. No es algo que el prompt pueda arreglar (es
+    codigo del servidor MCP externo), se excluye directo."""
+    tools = agent_loop._normalize_tool_schema(
+        "neo4j-cypher", [_FakeMcpTool("get_neo4j_schema"), _FakeMcpTool("read_neo4j_cypher")]
+    )
+
+    names = [t["name"] for t in tools]
+    assert "neo4j-cypher__get_neo4j_schema" not in names
+    assert "neo4j-cypher__read_neo4j_cypher" in names
+
+
+def test_normalize_tool_schema_does_not_exclude_unrelated_tools():
+    tools = agent_loop._normalize_tool_schema("qdrant-rag", [_FakeMcpTool("qdrant-find")])
+
+    assert [t["name"] for t in tools] == ["qdrant-rag__qdrant-find"]

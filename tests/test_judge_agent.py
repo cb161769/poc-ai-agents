@@ -336,6 +336,44 @@ def test_judge_system_prompt_requires_reasoning_consistent_with_verdict():
     assert "consistentes con tu \"verdict\"" in judge_agent.JUDGE_SYSTEM_PROMPT
 
 
+def test_judge_system_prompt_requires_evidence_not_absence_of_doubt():
+    """Auditoria real del prompt: 'evidencia insuficiente' no debe leerse
+    como 'todo esta bien' -- el juez tiene que marcar FLAGGED ante duda, no
+    asumir OK por falta de evidencia en contra."""
+    assert "Evidencia insuficiente NO es lo mismo que evidencia de que todo está bien" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_treats_tool_failures_as_risk_signal():
+    assert "tratalo como una señal de riesgo real" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_distinguishes_proposed_from_applied_change():
+    assert "\"cambio propuesto\"" in judge_agent.JUDGE_SYSTEM_PROMPT
+    assert "\"cambio realmente aplicado\"" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_requires_tests_match_same_revision():
+    assert "MISMA versión del cambio" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_requires_comparison_against_acceptance_criteria():
+    assert "criterios de aceptación" in judge_agent.JUDGE_SYSTEM_PROMPT
+    assert "Gherkin" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_requires_verifiable_evidence_in_reasoning():
+    assert "una frase cualitativa sin evidencia citada" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_system_prompt_warns_against_deprecated_cypher_exists_syntax():
+    """Bug real confirmado esta sesion: el juez (parable/fable) escribia
+    Cypher con la sintaxis vieja exists(x.prop) (deprecada en Neo4j 5.x),
+    gastaba varios de sus 6 turnos en CypherSyntaxError, y terminaba
+    agotando MAX_TOOL_TURNS sin dar veredicto (judge_agent.py:512)."""
+    assert "IS NOT NULL" in judge_agent.JUDGE_SYSTEM_PROMPT
+    assert "exists(variable.propiedad)" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
 def test_retryable_policy_references_excludes_security_criteria():
     assert "data-leak-evidence" not in RETRYABLE_POLICY_REFERENCES
     assert "jailbreak-evidence" not in RETRYABLE_POLICY_REFERENCES

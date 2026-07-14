@@ -981,21 +981,31 @@ def test_comment_jira_calls_jira_client_directly(monkeypatch):
 def test_comment_jira_logs_instead_of_raising_on_failure(monkeypatch):
     """Antes un fallo real de Jira en comment_jira/transition_jira
     desaparecia en silencio (subprocess con check=False, resultado
-    descartado) -- ahora se loggea, sin dejar de ser best-effort (no
-    levanta excepcion, no bloquea la corrida). log_utils.get_logger() usa
-    propagate=False, asi que caplog no lo captura -- se mockea logger.warning
-    directo.
+    descartado), despues se loggeaba con log_utils.get_logger() (invisible
+    en la UI de Prefect, gap real identificado esta sesion) -- ahora usa
+    get_run_logger() para que quede visible en los logs de ESA tarea de
+    Prefect, sin dejar de ser best-effort (no levanta excepcion, no
+    bloquea la corrida). Se llama al Task (no .fn()) para que Prefect le
+    arme su propio contexto de tarea, que es lo que get_run_logger()
+    necesita.
     """
     def fake_post(ticket_key, text):
         raise RuntimeError("Jira esta caido")
 
-    warnings = []
+    class _FakeLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, msg):
+            self.warnings.append(msg)
+
+    fake_logger = _FakeLogger()
     monkeypatch.setattr(orchestration.jira_client, "post_audit_comment", fake_post)
-    monkeypatch.setattr(orchestration.logger, "warning", lambda msg: warnings.append(msg))
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: fake_logger)
 
-    orchestration.comment_jira.fn("hola", ticket_key="T-1")  # no debe lanzar
+    orchestration.comment_jira("hola", ticket_key="T-1")  # no debe lanzar
 
-    assert any("Jira esta caido" in w for w in warnings)
+    assert any("Jira esta caido" in w for w in fake_logger.warnings)
 
 
 def test_transition_jira_calls_jira_client_directly(monkeypatch):

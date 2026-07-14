@@ -990,3 +990,26 @@ def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path
 
     assert result["status"] == "blocked"
     assert (tmp_path / "f.py").read_text() == "original\n"
+
+
+def test_system_prompt_requires_treating_tool_failures_as_signal():
+    """Auditoria real del prompt: si una herramienta falla o no devuelve
+    datos utiles, el agente no debe seguir como si no hubiera pasado nada."""
+    assert "NO sigas como si no hubiera pasado nada" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_comparing_against_concrete_ticket_requirements():
+    assert "requisitos CONCRETOS del ticket" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "Gherkin" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_forbids_scope_creep():
+    assert "No hagas MAS de lo que el ticket pide" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_forbids_inventing_architecture():
+    assert "No inventes arquitectura" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_real_verification_command_for_correct_subproject():
+    assert "no cuenta como verificacion real del cambio" in ca.CODING_AGENT_SYSTEM_PROMPT

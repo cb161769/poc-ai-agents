@@ -9,6 +9,7 @@ from jira_client import (
     _adf_to_text,
     _build_smoke_ticket_payload,
     _extract_figma_link,
+    _has_sufficient_context,
     fetch_epic_with_children,
 )
 
@@ -28,6 +29,41 @@ def test_adf_to_text_flattens_nested_paragraphs():
     result = _adf_to_text(doc)
     assert "Hola" in result
     assert "Mundo" in result
+
+
+def test_adf_to_text_collapses_consecutive_blank_paragraphs():
+    """Auditoria real: parrafos vacios consecutivos (comun en descripciones
+    editadas a mano) generaban corridas largas de saltos de linea que se le
+    pasaban tal cual al coding agent/juez como ruido en el prompt."""
+    doc = {
+        "type": "doc",
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Antes"}]},
+            {"type": "paragraph", "content": []},
+            {"type": "paragraph", "content": []},
+            {"type": "paragraph", "content": []},
+            {"type": "paragraph", "content": [{"type": "text", "text": "Despues"}]},
+        ],
+    }
+    result = _adf_to_text(doc)
+    assert "\n\n\n" not in result
+    assert "Antes" in result and "Despues" in result
+
+
+def test_has_sufficient_context_true_for_real_description():
+    assert _has_sufficient_context("Fix login bug", "El boton de login no responde en Safari 17.") is True
+
+
+def test_has_sufficient_context_false_for_empty_description():
+    assert _has_sufficient_context("Fix login bug", "") is False
+
+
+def test_has_sufficient_context_false_for_too_short_description():
+    assert _has_sufficient_context("Fix it", "arreglar esto") is False
+
+
+def test_has_sufficient_context_false_for_empty_summary():
+    assert _has_sufficient_context("", "Una descripcion larga y detallada de verdad sobre el problema real.") is False
 
 
 def test_adf_has_code_block_true_when_present_anywhere_nested():

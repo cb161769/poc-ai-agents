@@ -578,6 +578,19 @@ async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: 
     return sessions
 
 
+# Confirmado real esta sesion (juez, corrida real contra KAN-15): el paquete
+# de terceros mcp-neo4j-cypher tiene un bug real en su propia implementacion
+# de get_neo4j_schema -- arma la query interna con el None de Python en vez
+# del null de Cypher ("CALL apoc.meta.schema({sample: None}) YIELD value
+# RETURN value"), lo que SIEMPRE tira CypherSyntaxError y quema turnos hasta
+# agotar MAX_TOOL_TURNS (confirmado: la corrida completa termino en "el juez
+# agoto los turnos... " por esto). No es algo que un prompt mas fuerte pueda
+# arreglar -- es codigo del servidor MCP externo, no algo que el modelo
+# escribe -- asi que se excluye directamente de las tools ofrecidas, para
+# ambos agentes (coding agent y juez comparten este mismo servidor MCP).
+_BROKEN_MCP_TOOLS = {"neo4j-cypher__get_neo4j_schema"}
+
+
 def _normalize_tool_schema(server_name: str, tools) -> list:
     """Normaliza tools listadas por un servidor MCP al formato interno
     compartido (bloques con "name"/"description"/"input_schema") -- el
@@ -585,7 +598,8 @@ def _normalize_tool_schema(server_name: str, tools) -> list:
     todo este modulo. Anthropic es uno de los backends que lo consume tal
     cual; Ollama pasa por _tools_to_ollama_format() para adaptarlo -- ambos
     son adaptadores simetricos de este formato neutral, no hay un backend
-    "nativo" y otro "adaptado".
+    "nativo" y otro "adaptado". Filtra _BROKEN_MCP_TOOLS -- ver comentario
+    arriba.
     """
     return [
         {
@@ -594,6 +608,7 @@ def _normalize_tool_schema(server_name: str, tools) -> list:
             "input_schema": t.inputSchema,
         }
         for t in tools
+        if f"{server_name}__{t.name}" not in _BROKEN_MCP_TOOLS
     ]
 
 
