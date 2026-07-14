@@ -683,8 +683,17 @@ def run_tests(target_repo_dir: str) -> dict:
         get_run_logger().warning(f"testing-agent omitido para {target_repo_dir}: docker no disponible en el host -- NO se corrio ningun test real.")
         return {"passed": True, "output": "(testing agent omitido: docker no disponible en el host)"}
 
+    # Docker-outside-of-Docker: cuando orchestration.py corre DENTRO de un
+    # contenedor (poc-ai-agents-testrunner, con /var/run/docker.sock
+    # montado), el docker run ANIDADO que dispara run_module_tests.sh lo
+    # ejecuta el daemon real del HOST -- que no puede montar target_repo_dir
+    # (un path que solo existe DENTRO de este contenedor). HOST_TARGET_REPO_DIR
+    # (opcional, seteada solo en corridas via Docker-outside-of-Docker) le
+    # pasa el path real y visible para el host, para el -v del docker run
+    # anidado. Sin ella (host real, no DooD), cae al mismo target_repo_dir.
+    host_target_repo_dir = os.environ.get("HOST_TARGET_REPO_DIR", target_repo_dir)
     result = subprocess.run(
-        ["bash", str(SCRIPT_DIR / "scripts" / "run_module_tests.sh"), target_repo_dir],
+        ["bash", str(SCRIPT_DIR / "scripts" / "run_module_tests.sh"), target_repo_dir, host_target_repo_dir],
         capture_output=True,
         text=True,
     )

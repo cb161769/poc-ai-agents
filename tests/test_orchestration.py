@@ -736,6 +736,55 @@ def test_check_log_evidence_skips_bug_that_already_has_evidence(monkeypatch):
     assert calls == []
 
 
+def test_run_tests_passes_target_repo_dir_as_host_path_by_default(monkeypatch):
+    """Sin HOST_TARGET_REPO_DIR seteada (host real, no Docker-outside-of-
+    Docker), el segundo argumento para run_module_tests.sh cae al mismo
+    target_repo_dir -- comportamiento identico al de antes de este fix."""
+    captured = {}
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class R:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_tests("/target-repo")
+
+    assert result["passed"] is True
+    assert captured["cmd"][-2:] == ["/target-repo", "/target-repo"]
+
+
+def test_run_tests_uses_host_target_repo_dir_for_docker_outside_of_docker(monkeypatch):
+    """Confirmado real esta sesion: corriendo DENTRO de un contenedor con
+    /var/run/docker.sock montado, el docker run ANIDADO de
+    run_module_tests.sh lo ejecuta el daemon del HOST -- que no puede
+    montar /target-repo (un path que solo existe dentro de ESTE
+    contenedor). HOST_TARGET_REPO_DIR le pasa el path real del host."""
+    captured = {}
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setenv("HOST_TARGET_REPO_DIR", "/c/Users/real/scratchpad/ai-agents-code")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        class R:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    orchestration.run_tests("/target-repo")
+
+    assert captured["cmd"][-2:] == ["/target-repo", "/c/Users/real/scratchpad/ai-agents-code"]
+
+
 def test_check_copilot_assignable_returns_yes_when_login_present(monkeypatch):
     class R:
         returncode = 0
