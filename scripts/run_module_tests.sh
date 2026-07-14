@@ -119,7 +119,17 @@ detect_stack() {
       TEST_CMD="npm install --silent && echo 'sin script \"test\" en package.json, se omite'"
     fi
     if [ -d "${dir}/tests" ] || [ -f "${dir}/playwright.config.ts" ]; then
-      TEST_CMD="${TEST_CMD} && npx playwright test"
+      # Bug real confirmado en una corrida real (KAN-15, frontend/): la
+      # imagen de arriba trae una version de Chromium fija (v1.44.1), pero
+      # package.json suele declarar un rango semver (ej. "^1.44.1") -- npm
+      # install real resolvio 1.61.1, y el Chromium viejo pre-instalado no
+      # coincide ("Executable doesn't exist... Looks like Playwright was
+      # just updated"). En vez de pinnear/parsear una version exacta
+      # (fragil, se desincroniza en cuanto package.json suba de version),
+      # se descargan los navegadores reales que coincidan con la version
+      # YA instalada en node_modules -- funciona sin importar que version
+      # resuelva npm install, siempre.
+      TEST_CMD="${TEST_CMD} && npx playwright install --with-deps chromium && npx playwright test"
     fi
     if [ -f "${dir}/.eslintrc.json" ] || [ -f "${dir}/.eslintrc.js" ] || [ -f "${dir}/.eslintrc.cjs" ] || [ -f "${dir}/eslint.config.js" ] || [ -f "${dir}/eslint.config.mjs" ]; then
       LINT_CMD="npx eslint ."

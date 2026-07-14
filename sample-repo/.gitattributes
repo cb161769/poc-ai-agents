@@ -1,0 +1,9 @@
+# Fuerza LF para todo el codigo de texto, sin importar el core.autocrlf del
+# git de quien clone -- bug real confirmado esta sesion: git commit desde
+# Windows (Git for Windows trae core.autocrlf=true por default a nivel
+# sistema) renormalizo archivos de texto existentes a CRLF en el propio
+# objeto git via un "git add -A" real, y el contenedor Linux del pipeline
+# (git sin autocrlf) los veia "modificados" solo por fin de linea -- eso
+# hacia fallar el dirty-tree-gate de orchestration.py en TODA corrida real,
+# incluso sin ningun cambio real de contenido.
+* text=auto eol=lf

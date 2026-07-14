@@ -537,3 +537,55 @@ def test_judge_with_tools_accepts_verdict_if_still_contradictory_after_one_nudge
 
     assert call_count["n"] == 2  # 1 original + 1 nudge, no un 3ro
     assert result["verdict"] == "FLAGGED"  # se acepta igual, sin loop infinito
+
+
+def test_judge_with_tools_retries_when_json_valid_but_verdict_key_missing(monkeypatch):
+    """Bug real confirmado esta sesion (KeyError: 'verdict' en
+    orchestration.py::_deliver): el juez puede devolver JSON sintacticamente
+    valido pero sin la clave "verdict" (o con un valor invalido) -- eso NO
+    dispara json.JSONDecodeError, asi que sin este chequeo el resultado
+    ambiguo se aceptaba tal cual. Tiene que disparar el mismo reintento de
+    correccion que un JSON invalido."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"status": "ok", "reasoning": "listo"}'}]  # sin "verdict"
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "corregido"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert result["verdict"] == "OK"
+    assert result["reasoning"] == "corregido"
+
+
+def test_judge_with_tools_raises_when_retry_also_lacks_valid_verdict(monkeypatch):
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"status": "ok"}'}]  # sin "verdict"
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    with pytest.raises(RuntimeError, match="verdict"):
+        asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))

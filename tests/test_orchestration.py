@@ -1120,6 +1120,31 @@ def test_push_and_open_pr_pushes_and_creates_pr(monkeypatch):
     assert "--base" in pr_cmd and "main" in pr_cmd
 
 
+def test_push_and_open_pr_degrades_gracefully_when_gh_is_not_installed(monkeypatch):
+    """Bug real confirmado esta sesion (repo objetivo real en Azure DevOps,
+    no GitHub): "gh" ni siquiera esta instalado, y subprocess.run lanza
+    FileNotFoundError (no un returncode!=0) -- el docstring de esta funcion
+    ya prometia "best-effort, nunca bloquea la corrida" para este caso, pero
+    el codigo solo atajaba "gh corrio y fallo", no "gh no existe". El push
+    real (que no depende de gh) ya funciono para cuando esto pasa."""
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        if cmd[:2] == ["gh", "pr"]:
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'gh'")
+        class R:
+            returncode = 0
+            stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    result = orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    assert result["pushed"] is True
+    assert result["pr_url"] is None
+    assert "gh" in result["reason"]
+
+
 def test_comment_jira_calls_jira_client_directly(monkeypatch):
     """comment_jira() ya no shellea a 'python3 jira_client.py comment' --
     importa jira_client y llama post_audit_comment() directo."""

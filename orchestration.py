@@ -387,10 +387,25 @@ def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket
     # cwd=target_repo_dir (no --repo explicito) para que gh auto-detecte el
     # owner/repo del remote local -- a diferencia de Camino A, que corre
     # desde SCRIPT_DIR y por eso SI necesita GITHUB_REPO.
-    pr_result = subprocess.run(
-        ["gh", "pr", "create", "--title", summary, "--body", pr_body, "--base", base_branch, "--head", branch],
-        capture_output=True, text=True, cwd=target_repo_dir,
-    )
+    try:
+        # Bug real confirmado esta sesion: "gh" es especifico de GitHub -- un
+        # repo objetivo real en Azure DevOps (u otro remote no-GitHub) ni
+        # siquiera tiene el binario "gh" instalado, lo que antes reventaba
+        # toda la corrida con FileNotFoundError (subprocess.run no encuentra
+        # el ejecutable) DESPUES de que el push YA habia funcionado -- el
+        # docstring de esta funcion ya prometia "best-effort, nunca bloquea
+        # la corrida" para este caso, pero el codigo solo manejaba "gh corrio
+        # y fallo" (returncode!=0), no "gh no existe".
+        pr_result = subprocess.run(
+            ["gh", "pr", "create", "--title", summary, "--body", pr_body, "--base", base_branch, "--head", branch],
+            capture_output=True, text=True, cwd=target_repo_dir,
+        )
+    except FileNotFoundError:
+        return {
+            "pushed": True, "pr_url": None,
+            "reason": "el CLI 'gh' no esta disponible (repo objetivo no-GitHub, ej. Azure DevOps) -- "
+            "la rama ya se pusheo, abri el PR/pull request a mano en tu plataforma real",
+        }
     if pr_result.returncode != 0:
         return {"pushed": True, "pr_url": None, "reason": f"gh pr create fallo: {pr_result.stderr.strip()[:300]}"}
 

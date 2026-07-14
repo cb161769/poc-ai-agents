@@ -506,7 +506,18 @@ async def judge_with_tools(payload: dict) -> dict:
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
                     try:
-                        verdict = _normalize_policy_reference(_extract_json(final_text))
+                        verdict = _extract_json(final_text)
+                        if verdict.get("verdict") not in ("OK", "FLAGGED"):
+                            # Bug real confirmado esta sesion (mismo patron
+                            # que coding_agent.py con ornith:9b): un modelo
+                            # puede devolver JSON sintacticamente valido pero
+                            # SIN la clave "verdict" (o con un valor
+                            # invalido) -- sin este chequeo, orchestration.py
+                            # revienta con KeyError('verdict') al leer el
+                            # resultado. Se trata igual que JSON invalido:
+                            # dispara el mismo reintento de correccion.
+                            raise json.JSONDecodeError("falta 'verdict' valido (OK/FLAGGED) en el JSON", final_text, 0)
+                        verdict = _normalize_policy_reference(verdict)
                     except json.JSONDecodeError:
                         # Un solo reintento acotado -- si el modelo tampoco
                         # devuelve JSON valido esta vez, se deja propagar y
@@ -517,7 +528,10 @@ async def judge_with_tools(payload: dict) -> dict:
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)
-                        return _finalize(_normalize_policy_reference(_extract_json(retry_text)))
+                        retry_verdict = _extract_json(retry_text)
+                        if retry_verdict.get("verdict") not in ("OK", "FLAGGED"):
+                            raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
+                        return _finalize(_normalize_policy_reference(retry_verdict))
 
                     if _verdict_is_self_contradictory(verdict) and not consistency_nudge_given:
                         # Confirmado real (KAN-15): verdict=FLAGGED con
