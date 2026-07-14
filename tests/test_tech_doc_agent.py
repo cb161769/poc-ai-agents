@@ -97,6 +97,27 @@ def test_strip_filler_sections_removes_real_boilerplate_observed_live():
     assert "**Resultado:** Bloqueada" in cleaned
 
 
+def test_strip_filler_sections_removes_plural_conjugation_observed_live():
+    """Caso real confirmado en vivo (KAN-5, segunda corrida despues del
+    primer fix): "No se proporcionAN metricas..." (plural) no matcheaba con
+    el patron anterior (solo cubria singular/pasado), asi que esta seccion
+    de relleno seguia colandose pese al fix."""
+    text = (
+        "**Métricas de Rendimiento y Eficiencia (KPIs)**\n"
+        "--------------------------------------------\n\n"
+        "No se proporcionan métricas de rendimiento ni eficiencia.\n"
+    )
+    assert _strip_filler_sections(text) == text  # sin otras secciones, se devuelve el original (nunca vacio)
+
+    text_with_real_section = (
+        "**Resumen Ejecutivo**\n---------------------\n\nContenido real con datos concretos de la corrida.\n\n"
+        + text
+    )
+    cleaned = _strip_filler_sections(text_with_real_section)
+    assert "Resumen Ejecutivo" in cleaned
+    assert "Métricas de Rendimiento" not in cleaned
+
+
 def test_strip_filler_sections_keeps_section_with_real_content():
     text = (
         "**Ficha Tecnica del Modelo y Entorno**\n"

@@ -71,8 +71,13 @@ def _format_evidence(evidence: dict) -> str:
 # obedezca, se limpia el resultado con codigo despues: cualquier seccion
 # cuyo CUERPO entero sea puro relleno de este tipo se elimina.
 _FILLER_PATTERN = re.compile(
-    r"no se (proporciona|proporcion[oó]|midieron|mencionan?|menciona|especifica|incluy(?:e|eron))\b"
-    r"|no fue(?:ron)? provist"
+    # Confirmado real (KAN-5, segunda vuelta): "no se proporcionAN" (plural)
+    # no matcheaba con el patron anterior (solo cubria "proporciona"
+    # singular y "proporcion[oó]" pasado) -- se usa el stem del verbo
+    # (\w* al final) para cubrir cualquier conjugacion, no una lista fija.
+    r"no se (?:proporcion|mencion|especific|incluy)\w*"
+    r"|no se midi\w*"
+    r"|no fue(?:ron)? provist\w*"
     r"|no (?:esta|est[aá]) disponible"
     r"|sin informaci[oó]n disponible"
     r"|no se puede incluir informaci[oó]n",
