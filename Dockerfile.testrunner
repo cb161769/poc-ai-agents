@@ -12,16 +12,18 @@ FROM python:3.10-slim
 WORKDIR /repo
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git jq curl openjdk-21-jre-headless docker.io \
+    && apt-get install -y --no-install-recommends git jq curl openjdk-21-jre-headless docker-cli \
     && rm -rf /var/lib/apt/lists/*
-# docker.io: el CLI del testing-agent real (scripts/run_module_tests.sh)
-# necesita "docker" para levantar el contenedor throwaway con el
-# runtime real (Playwright/Maven/Go/etc). Docker-outside-of-Docker: en
-# runtime hay que montar el socket real del host (-v
-# /var/run/docker.sock:/var/run/docker.sock) para que este CLI hable con el
-# daemon real -- ver HOST_TARGET_REPO_DIR en orchestration.py::run_tests()
-# para el problema de paths que esto trae (el daemon del host no puede
-# montar un path que solo existe DENTRO de este contenedor).
+# docker-cli (NO docker.io -- confirmado real: docker.io en Debian trae el
+# DAEMON (dockerd) via Depends, pero el binario /usr/bin/docker en si es un
+# paquete separado, docker-cli, que --no-install-recommends se salteaba
+# porque ahi es solo un Recommends de docker.io). Solo necesitamos el
+# cliente: Docker-outside-of-Docker habla con el daemon REAL del host via
+# el socket montado en runtime (-v /var/run/docker.sock:/var/run/docker.sock),
+# nunca corre un daemon propio dentro de este contenedor -- ver
+# HOST_TARGET_REPO_DIR en orchestration.py::run_tests() para el problema de
+# paths que el DooD trae (el daemon del host no puede montar un path que
+# solo existe DENTRO de este contenedor).
 
 # cypher-shell: distribuido por Neo4j como paquete standalone, no via apt.
 RUN curl -fsSL -o /tmp/cypher-shell.deb \
