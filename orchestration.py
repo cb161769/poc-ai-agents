@@ -594,8 +594,16 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
     ).stdout.strip()
 
     existing_branch = _find_open_branch_for_ticket(target_repo_dir, ticket_id, base_branch)
+    pr_rejected = False
     if existing_branch:
-        get_run_logger().info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        pr_rejected = _check_pr_rejected_for_branch(target_repo_dir, existing_branch)
+        run_logger = get_run_logger()
+        run_logger.info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        if pr_rejected:
+            run_logger.warning(
+                f"{ticket_id}: la rama retomada '{existing_branch}' tiene una PR previa RECHAZADA/cerrada sin "
+                "mergear -- se reusa igual, pero revisar si el codigo previo sigue siendo valido."
+            )
         branch = existing_branch
         subprocess.run(["git", "-C", target_repo_dir, "checkout", branch], check=True)
     else:
@@ -609,7 +617,10 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
     if suggest.returncode == 0 and status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
         subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Copilot suggestion for {ticket_id}"], check=True)
-        return {"applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest"}
+        return {
+            "applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest",
+            "resumed_branch": bool(existing_branch), "resumed_pr_rejected": pr_rejected,
+        }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     if not existing_branch:
@@ -648,8 +659,16 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     ).stdout.strip()
 
     existing_branch = _find_open_branch_for_ticket(target_repo_dir, ticket_id, base_branch)
+    pr_rejected = False
     if existing_branch:
-        get_run_logger().info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        pr_rejected = _check_pr_rejected_for_branch(target_repo_dir, existing_branch)
+        run_logger = get_run_logger()
+        run_logger.info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
+        if pr_rejected:
+            run_logger.warning(
+                f"{ticket_id}: la rama retomada '{existing_branch}' tiene una PR previa RECHAZADA/cerrada sin "
+                "mergear -- se reusa igual, pero revisar si el codigo previo sigue siendo valido."
+            )
         branch = existing_branch
         subprocess.run(["git", "-C", target_repo_dir, "checkout", branch], check=True)
     else:
@@ -730,6 +749,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "conversation_file": conversation_file,
             "self_review": self_review,
             "resumed_branch": bool(existing_branch),
+            "resumed_pr_rejected": pr_rejected,
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
@@ -1475,10 +1495,11 @@ def _deliver(
         backend = agent_result.get("backend")
 
         if agent_result["applied"]:
-            resumed_note = (
-                " (retoma una rama existente de una corrida anterior de este ticket, no empieza de cero)"
-                if agent_result.get("resumed_branch") else ""
-            )
+            resumed_note = ""
+            if agent_result.get("resumed_branch"):
+                resumed_note = " (retoma una rama existente de una corrida anterior de este ticket, no empieza de cero)"
+                if agent_result.get("resumed_pr_rejected"):
+                    resumed_note += " -- OJO: la PR anterior de esta rama fue RECHAZADA/cerrada sin mergear, revisar si el codigo previo sigue siendo valido"
             _comment_all(
                 f"🤖 Copilot (Prefect): AI Firewall aprobo la solicitud (redacciones: {firewall_result['redactions_applied']}). "
                 f"Copilot aplico un cambio en la rama '{agent_result['branch']}' de {target_repo_dir}{resumed_note}, "
@@ -1759,10 +1780,11 @@ def _deliver_epic_sequential(
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
 
-        resumed_note = (
-            " (retoma una rama existente de una corrida anterior de esta epica, no empieza de cero)"
-            if agent_result.get("resumed_branch") else ""
-        )
+        resumed_note = ""
+        if agent_result.get("resumed_branch"):
+            resumed_note = " (retoma una rama existente de una corrida anterior de esta epica, no empieza de cero)"
+            if agent_result.get("resumed_pr_rejected"):
+                resumed_note += " -- OJO: la PR anterior de esta rama fue RECHAZADA/cerrada sin mergear, revisar si el codigo previo sigue siendo valido"
         comment_jira(
             f"🤖 Copilot (Prefect, modo epica secuencial): AI Firewall aprobo {child_id} "
             f"(redacciones: {firewall_result['redactions_applied']}). Copilot aplico un cambio en la rama '{branch}'{resumed_note}, "

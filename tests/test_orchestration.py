@@ -17,6 +17,7 @@ from orchestration import (
     _check_not_epic,
     _comment_all,
     _deliver,
+    _check_pr_rejected_for_branch,
     _find_open_branch_for_ticket,
     _format_conflicts_section,
     _handle_rejected,
@@ -943,6 +944,103 @@ def _fake_branch_list_and_merge_base(monkeypatch, branch_list_stdout: str, merge
         return _fake_subprocess_result()
 
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+
+def _fake_remote_url(monkeypatch, url: str):
+    def fake_run(cmd, **kwargs):
+        if "remote" in cmd and "get-url" in cmd:
+            return _fake_subprocess_result(stdout=url)
+        return _fake_subprocess_result()
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+
+def test_check_pr_rejected_for_branch_false_when_no_remote(monkeypatch):
+    _fake_remote_url(monkeypatch, url="")
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
+
+
+def test_check_pr_rejected_for_branch_azure_devops_false_without_pat(monkeypatch):
+    """Confirmado real: el repo objetivo real de esta sesion es Azure
+    DevOps -- sin AZURE_DEVOPS_PAT seteada, no hay forma de consultar el
+    estado real de la PR (graceful-degradation, nunca lanza)."""
+    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+    _fake_remote_url(monkeypatch, url="https://dev.azure.com/org/proj/_git/repo\n")
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
+
+
+def test_check_pr_rejected_for_branch_azure_devops_true_when_only_abandoned(monkeypatch):
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+    _fake_remote_url(monkeypatch, url="https://dev.azure.com/org/proj/_git/repo\n")
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"value": [{"status": "abandoned"}]}
+
+    monkeypatch.setattr(orchestration.httpx, "get", lambda *a, **k: FakeResp())
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is True
+
+
+def test_check_pr_rejected_for_branch_azure_devops_false_when_still_active(monkeypatch):
+    """Aunque exista una PR vieja "abandoned", si TAMBIEN hay una activa
+    para la misma rama, no se considera rechazada."""
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+    _fake_remote_url(monkeypatch, url="https://dev.azure.com/org/proj/_git/repo\n")
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"value": [{"status": "abandoned"}, {"status": "active"}]}
+
+    monkeypatch.setattr(orchestration.httpx, "get", lambda *a, **k: FakeResp())
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
+
+
+def test_check_pr_rejected_for_branch_azure_devops_false_on_http_error(monkeypatch):
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+    _fake_remote_url(monkeypatch, url="https://dev.azure.com/org/proj/_git/repo\n")
+
+    def fake_get(*a, **k):
+        raise orchestration.httpx.HTTPError("boom")
+
+    monkeypatch.setattr(orchestration.httpx, "get", fake_get)
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
+
+
+def test_check_pr_rejected_for_branch_github_true_when_closed(monkeypatch):
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def fake_run(cmd, **kwargs):
+        if "remote" in cmd and "get-url" in cmd:
+            return _fake_subprocess_result(stdout="https://github.com/org/repo.git\n")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return _fake_subprocess_result(stdout=json.dumps({"state": "CLOSED"}))
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is True
+
+
+def test_check_pr_rejected_for_branch_github_false_when_open(monkeypatch):
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def fake_run(cmd, **kwargs):
+        if "remote" in cmd and "get-url" in cmd:
+            return _fake_subprocess_result(stdout="https://github.com/org/repo.git\n")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return _fake_subprocess_result(stdout=json.dumps({"state": "OPEN"}))
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert _check_pr_rejected_for_branch("/repo", "copilot/T-1-100") is False
 
 
 def test_find_open_branch_for_ticket_returns_none_when_no_branches_match(monkeypatch):
