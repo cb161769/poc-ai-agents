@@ -9,6 +9,7 @@ import pytest
 
 import judge_agent
 from judge_agent import (
+    JUDGE_CONSISTENCY_NUDGE_MESSAGE,
     JUDGE_POLICY_IDS,
     RETRYABLE_POLICY_REFERENCES,
     _build_user_prompt,
@@ -18,6 +19,7 @@ from judge_agent import (
     _normalize_policy_reference,
     _ollama_response_to_blocks,
     _redact_payload_for_logging,
+    _verdict_is_self_contradictory,
 )
 
 
@@ -184,6 +186,37 @@ def test_judge_policy_ids_include_other_as_fallback():
     assert "other" in JUDGE_POLICY_IDS
 
 
+def test_verdict_is_self_contradictory_true_for_positive_change_assessment():
+    """Caso real confirmado (KAN-15, parable/fable): verdict=FLAGGED con
+    change_assessment="OK" -- el propio juez contradice su veredicto."""
+    verdict = {"verdict": "FLAGGED", "change_assessment": "OK", "reasoning": "algo raro"}
+    assert _verdict_is_self_contradictory(verdict) is True
+
+
+def test_verdict_is_self_contradictory_true_for_safe_sounding_reasoning():
+    """Caso real confirmado (KAN-15): reasoning dice 'inofensivo' pero el
+    veredicto es FLAGGED."""
+    verdict = {
+        "verdict": "FLAGGED",
+        "reasoning": "El cambio es un archivo HTML estatico... el cambio es inofensivo desde una perspectiva de seguridad.",
+    }
+    assert _verdict_is_self_contradictory(verdict) is True
+
+
+def test_verdict_is_self_contradictory_false_for_ok_verdict():
+    verdict = {"verdict": "OK", "change_assessment": "OK", "reasoning": "todo perfecto, inofensivo"}
+    assert _verdict_is_self_contradictory(verdict) is False
+
+
+def test_verdict_is_self_contradictory_false_when_reasoning_explains_real_problem():
+    verdict = {
+        "verdict": "FLAGGED",
+        "change_assessment": "incompleto",
+        "reasoning": "El diff solo crea 404.html pero el ticket tambien pide una pagina 500 -- alcance incompleto.",
+    }
+    assert _verdict_is_self_contradictory(verdict) is False
+
+
 def _base_judge_payload(**overrides):
     payload = {
         "ticket": {"ticket_id": "T-1", "summary": "Fix login", "description": "desc", "repository_origen": "AuthService"},
@@ -299,6 +332,10 @@ def test_judge_system_prompt_embeds_policy_rubric():
     assert "graph-impact-unverified" in judge_agent.JUDGE_SYSTEM_PROMPT
 
 
+def test_judge_system_prompt_requires_reasoning_consistent_with_verdict():
+    assert "consistentes con tu \"verdict\"" in judge_agent.JUDGE_SYSTEM_PROMPT
+
+
 def test_retryable_policy_references_excludes_security_criteria():
     assert "data-leak-evidence" not in RETRYABLE_POLICY_REFERENCES
     assert "jailbreak-evidence" not in RETRYABLE_POLICY_REFERENCES
@@ -387,3 +424,78 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
 
     assert result["verdict"] == "OK"
     mock_get_issues.assert_called_once_with("AuthService")
+
+
+def test_judge_with_tools_nudges_once_on_self_contradictory_verdict_and_accepts_correction(monkeypatch):
+    """Caso real (KAN-15): el 1er veredicto es FLAGGED con reasoning que
+    dice "inofensivo" -- tiene que recibir el nudge de consistencia y, si
+    el 2do intento corrige a OK, devolver ese veredicto corregido."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    call_count = {"n": 0}
+    seen_messages = []
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        seen_messages.append(list(messages))
+        if call_count["n"] == 1:
+            content = [{
+                "type": "text",
+                "text": (
+                    '{"verdict": "FLAGGED", "firewall_assessment": "ok", '
+                    '"change_assessment": "OK", "reasoning": "el cambio es inofensivo desde una perspectiva de seguridad."}'
+                ),
+            }]
+        else:
+            content = [{
+                "type": "text",
+                "text": '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "corregido, no hay problema real"}',
+            }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert call_count["n"] == 2
+    assert result["verdict"] == "OK"
+    # el 2do llamado tiene que haber visto el mensaje de nudge en la conversacion
+    assert any(
+        m.get("content") == JUDGE_CONSISTENCY_NUDGE_MESSAGE
+        for m in seen_messages[1]
+        if isinstance(m, dict)
+    )
+
+
+def test_judge_with_tools_accepts_verdict_if_still_contradictory_after_one_nudge(monkeypatch):
+    """Un solo empujon -- si el 2do intento repite la misma contradiccion,
+    se acepta igual (no bloquea infinito, mismo criterio que el resto de
+    los nudges de esta sesion)."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    call_count = {"n": 0}
+    contradictory_text = (
+        '{"verdict": "FLAGGED", "firewall_assessment": "ok", '
+        '"change_assessment": "OK", "reasoning": "el cambio es inofensivo desde una perspectiva de seguridad."}'
+    )
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert call_count["n"] == 2  # 1 original + 1 nudge, no un 3ro
+    assert result["verdict"] == "FLAGGED"  # se acepta igual, sin loop infinito

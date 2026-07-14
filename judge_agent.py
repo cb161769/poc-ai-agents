@@ -42,6 +42,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import sys
 import time
 from contextlib import AsyncExitStack
@@ -174,6 +175,12 @@ insufficient-test-coverage, graph-impact-unverified, firewall-false-negative, \
 other (solo si ninguno de los anteriores aplica, explicando el motivo en \
 "reasoning"). Un veredicto OK no necesita policy_reference -- dejalo en null.
 
+Tu "reasoning" (y "change_assessment"/"firewall_assessment") tienen que ser \
+consistentes con tu "verdict": si marcás FLAGGED, "reasoning" tiene que \
+explicar EXPLICITAMENTE qué problema real dispara ese bloqueo -- nunca \
+marques FLAGGED describiendo el cambio como seguro/correcto/inofensivo sin \
+citar el problema real.
+
 Modo de evaluación: si el contexto que te dan incluye una "Respuesta de \
 referencia (gold standard)", estás en modo reference-grounded — compará el \
 cambio real explícitamente contra esa referencia, y marcá FLAGGED si se \
@@ -264,6 +271,42 @@ def _normalize_policy_reference(verdict: dict) -> dict:
     if verdict.get("policy_reference") not in JUDGE_POLICY_IDS:
         verdict["policy_reference"] = "other"
     return verdict
+
+
+_SAFE_SOUNDING_REASONING_PATTERN = re.compile(
+    r"\b(inofensivo|no representa un riesgo|no introduce riesgos?|es seguro|"
+    r"sin riesgos? de seguridad|no hay riesgo)\b",
+    re.IGNORECASE,
+)
+_POSITIVE_ASSESSMENT_VALUES = {"ok", "correct", "correcto", "aprobado", "resuelto", "pasa", "passed"}
+
+
+def _verdict_is_self_contradictory(verdict: dict) -> bool:
+    """Confirmado real esta sesion (KAN-15, parable/fable): el juez puede
+    marcar verdict=FLAGGED mientras su propio reasoning/change_assessment
+    describen el cambio como inofensivo/OK -- _extract_json solo valida
+    que sea JSON parseable, nunca que el contenido sea internamente
+    consistente. Dos señales independientes, cualquiera dispara el nudge.
+    """
+    if verdict.get("verdict") != "FLAGGED":
+        return False
+    for field in ("change_assessment", "firewall_assessment"):
+        if str(verdict.get(field) or "").strip().lower() in _POSITIVE_ASSESSMENT_VALUES:
+            return True
+    return bool(_SAFE_SOUNDING_REASONING_PATTERN.search(str(verdict.get("reasoning") or "")))
+
+
+JUDGE_CONSISTENCY_NUDGE_MESSAGE = (
+    "Tu respuesta anterior es internamente inconsistente: marcaste "
+    '"verdict": "FLAGGED", pero tu propio reasoning/change_assessment/'
+    "firewall_assessment describen el cambio o la decision como segura/"
+    "correcta, sin explicar que problema REAL dispara el bloqueo. Revisa: "
+    "si de verdad no hay ningun problema real, corregi el veredicto a OK. "
+    "Si SI hay un problema real (por ejemplo, el cambio no cubre todo el "
+    "alcance pedido en el ticket), explicalo explicitamente en \"reasoning\" "
+    "y asegurate de que el \"policy_reference\" elegido corresponda a ese "
+    "problema real -- no repitas una descripcion que suena a aprobacion."
+)
 
 
 def _build_user_prompt(payload: dict) -> str:
@@ -383,6 +426,7 @@ async def judge_with_tools(payload: dict) -> dict:
     total_input_tokens = 0
     total_output_tokens = 0
     consulted_risk_graph = False
+    consistency_nudge_given = False
 
     def _finalize(verdict: dict) -> dict:
         verdict["consulted_risk_graph"] = consulted_risk_graph
@@ -420,7 +464,7 @@ async def judge_with_tools(payload: dict) -> dict:
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
                     try:
-                        return _finalize(_normalize_policy_reference(_extract_json(final_text)))
+                        verdict = _normalize_policy_reference(_extract_json(final_text))
                     except json.JSONDecodeError:
                         # Un solo reintento acotado -- si el modelo tampoco
                         # devuelve JSON valido esta vez, se deja propagar y
@@ -432,6 +476,19 @@ async def judge_with_tools(payload: dict) -> dict:
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)
                         return _finalize(_normalize_policy_reference(_extract_json(retry_text)))
+
+                    if _verdict_is_self_contradictory(verdict) and not consistency_nudge_given:
+                        # Confirmado real (KAN-15): verdict=FLAGGED con
+                        # reasoning/change_assessment que describen el
+                        # cambio como inofensivo/OK -- un solo empujon, si
+                        # en el reintento sigue contradictorio se acepta
+                        # igual (mismo criterio que el resto de los nudges
+                        # de esta sesion, nunca bloquea infinito).
+                        consistency_nudge_given = True
+                        messages.append({"role": "user", "content": JUDGE_CONSISTENCY_NUDGE_MESSAGE})
+                        continue
+
+                    return _finalize(verdict)
 
                 tool_results = []
                 for block in content:
