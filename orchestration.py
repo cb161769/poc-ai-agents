@@ -697,7 +697,15 @@ def run_tests(target_repo_dir: str) -> dict:
         capture_output=True,
         text=True,
     )
-    return {"passed": result.returncode == 0, "output": result.stdout + result.stderr}
+    output = result.stdout + result.stderr
+    if result.returncode != 0:
+        # Gap real de observabilidad (Prefect): la salida real de
+        # run_module_tests.sh (que test/lint fallo, con que error) solo
+        # viajaba dentro del dict que se le pasa al juez -- si los tests
+        # fallan, el juez ni se llama (PipelineBlocked), asi que esa salida
+        # real quedaba completamente invisible en Prefect Y en Jira.
+        get_run_logger().warning(f"testing-agent: los tests reales fallaron para {target_repo_dir}:\n{output[-4000:]}")
+    return {"passed": result.returncode == 0, "output": output}
 
 
 @task(retries=1, retry_delay_seconds=5, name="fetch-epic")

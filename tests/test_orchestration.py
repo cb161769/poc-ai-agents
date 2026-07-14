@@ -760,6 +760,38 @@ def test_run_tests_passes_target_repo_dir_as_host_path_by_default(monkeypatch):
     assert captured["cmd"][-2:] == ["/target-repo", "/target-repo"]
 
 
+def test_run_tests_logs_real_output_on_failure(monkeypatch):
+    """Gap real de observabilidad: si los tests fallan, el juez ni se llama
+    (PipelineBlocked antes de eso), asi que la salida real de
+    run_module_tests.sh quedaba completamente invisible en Prefect/Jira."""
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    class _FakeLogger:
+        def __init__(self):
+            self.warnings = []
+
+        def warning(self, msg):
+            self.warnings.append(msg)
+
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: fake_logger)
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stdout = "FAIL frontend/public/404.html: elemento no encontrado\n"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_tests("/target-repo")
+
+    assert result["passed"] is False
+    assert any("elemento no encontrado" in w for w in fake_logger.warnings)
+
+
 def test_run_tests_uses_host_target_repo_dir_for_docker_outside_of_docker(monkeypatch):
     """Confirmado real esta sesion: corriendo DENTRO de un contenedor con
     /var/run/docker.sock montado, el docker run ANIDADO de
