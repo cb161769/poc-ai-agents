@@ -83,6 +83,22 @@ JIRA_BLOCKED_STATUS = os.environ.get("JIRA_BLOCKED_STATUS", "Blocked")
 # Corrida exitosa (juez OK) -- antes no habia NINGUNA transicion de exito, un
 # ticket que pasaba todo el pipeline se quedaba atascado en JIRA_IN_PROGRESS_STATUS.
 JIRA_REVIEW_STATUS = os.environ.get("JIRA_REVIEW_STATUS", "Code Review")
+# Confirmado real (usuario, "encuentra gaps en jira de cara al development
+# cycle"): el pipeline nunca transicionaba nada a Done -- llegaba como mucho
+# a JIRA_REVIEW_STATUS y de ahi en mas dependia de que un humano se acuerde
+# de cerrar el ticket a mano cuando mergea la PR. Ver _find_merged_branch_for_ticket/
+# _check_already_completed.
+JIRA_DONE_STATUS = os.environ.get("JIRA_DONE_STATUS", "Done")
+# Gap real (usuario, "gaps en el scrum agent"): fetch_epic_with_children() no
+# filtra por status -- trae TODOS los hijos de la epica, incluidos los ya
+# terminales. Se le pasaban tal cual al scrum agent (epic_planner.py), que
+# gastaba un turno real de LLM + grafo razonando sobre historias cerradas, y
+# cuya validacion exige que TODOS los ids devueltos coincidan -- una sola
+# historia vieja podia degradar el ordenamiento real. Lista separada por
+# comas para instancias con "Won't Do"/"Cancelled"/etc. ademas de Done.
+JIRA_EPIC_TERMINAL_STATUSES = {
+    s.strip() for s in os.environ.get("JIRA_EPIC_TERMINAL_STATUSES", JIRA_DONE_STATUS).split(",") if s.strip()
+}
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_COPILOT_ASSIGNEE = os.environ.get("GITHUB_COPILOT_ASSIGNEE", "copilot-swe-agent")
 FIREWALL_API_KEY = os.environ.get("FIREWALL_API_KEY", "")
@@ -701,18 +717,12 @@ def _resolve_pr_threads(target_repo_dir: str, branch: str, thread_ids: list) -> 
             logger.warning(f"No se pudo marcar como resuelto el thread {thread_id} de la PR real: {exc}")
 
 
-def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
-    """Confirmado real (epica KAN-4): antes de este chequeo, cada re-corrida
-    de un ticket (ej. un humano revierte manualmente el status en Jira
-    pidiendo un redo) creaba una rama copilot/{ticket_id}-{timestamp} NUEVA
-    e incondicional -- sin mirar si ya habia una abierta de una corrida
-    anterior, dejando ramas huerfanas en paralelo sin ningun vinculo con el
-    trabajo/comentarios/veredicto previos. Esto busca una rama real (local o
-    remota) para ESE ticket que todavia no este mergeada en base_branch, para
-    que la corrida pueda retomarla en vez de empezar de cero. Pure-ish (solo
-    lee vía git, no escribe nada) -- devuelve None si no hay ninguna abierta,
-    mismo comportamiento que hoy.
-    """
+def _list_ticket_branch_candidates(target_repo_dir: str, ticket_id: str) -> list:
+    """Lista real (local + remota) de ramas copilot/{ticket_id}-* para este
+    ticket, sin filtrar por mergeada/no mergeada -- compartido por
+    _find_open_branch_for_ticket (busca las NO mergeadas, para retomar) y
+    _find_merged_branch_for_ticket (busca las YA mergeadas, para detectar
+    que el ticket ya se completo)."""
     listed = subprocess.run(
         ["git", "-C", target_repo_dir, "branch", "-a", "--list", f"*copilot/{ticket_id}-*"],
         capture_output=True, text=True,
@@ -725,6 +735,22 @@ def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_bran
         name = name.removeprefix("remotes/origin/")
         if name not in candidates:
             candidates.append(name)
+    return candidates
+
+
+def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
+    """Confirmado real (epica KAN-4): antes de este chequeo, cada re-corrida
+    de un ticket (ej. un humano revierte manualmente el status en Jira
+    pidiendo un redo) creaba una rama copilot/{ticket_id}-{timestamp} NUEVA
+    e incondicional -- sin mirar si ya habia una abierta de una corrida
+    anterior, dejando ramas huerfanas en paralelo sin ningun vinculo con el
+    trabajo/comentarios/veredicto previos. Esto busca una rama real (local o
+    remota) para ESE ticket que todavia no este mergeada en base_branch, para
+    que la corrida pueda retomarla en vez de empezar de cero. Pure-ish (solo
+    lee vía git, no escribe nada) -- devuelve None si no hay ninguna abierta,
+    mismo comportamiento que hoy.
+    """
+    candidates = _list_ticket_branch_candidates(target_repo_dir, ticket_id)
 
     open_branches = []
     for branch in candidates:
@@ -745,6 +771,67 @@ def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_bran
             f"'{open_branches[0]}', las demas quedan sin tocar (revisar a mano): {open_branches[1:]}"
         )
     return open_branches[0]
+
+
+def _find_merged_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
+    """Gap real (usuario, "encuentra gaps en jira de cara al development
+    cycle"): el pipeline detecta ramas SIN mergear para retomarlas
+    (_find_open_branch_for_ticket) pero nunca miraba el caso inverso -- una
+    rama copilot/{ticket_id}-* que YA esta mergeada en base_branch significa
+    que un humano ya revisó y mergeó ese trabajo, pero el ticket de Jira
+    nunca se enteraba (se quedaba clavado en JIRA_REVIEW_STATUS para
+    siempre). Pure-ish, best-effort: devuelve la rama mergeada mas reciente,
+    o None si no hay ninguna.
+    """
+    candidates = _list_ticket_branch_candidates(target_repo_dir, ticket_id)
+
+    merged_branches = []
+    for branch in candidates:
+        merged = subprocess.run(
+            ["git", "-C", target_repo_dir, "merge-base", "--is-ancestor", branch, base_branch],
+            capture_output=True,
+        )
+        if merged.returncode == 0:  # es ancestro de base_branch -> ya mergeada
+            merged_branches.append(branch)
+
+    if not merged_branches:
+        return None
+    merged_branches.sort(key=lambda b: b.rsplit("-", 1)[-1], reverse=True)
+    return merged_branches[0]
+
+
+def _check_already_completed(
+    ticket_id: str, jira_context: dict, target_repo_dir: str,
+    is_epic: bool = False, child_ticket_keys: list | None = None,
+) -> bool:
+    """Gap real (usuario): (1) si el ticket ya esta en JIRA_DONE_STATUS,
+    reprocesarlo de cero (ej. un webhook viejo/duplicado) no tiene sentido;
+    (2) si nadie marco Done a mano pero la rama real de este ticket YA esta
+    mergeada en base_branch, es evidencia real de que el trabajo se
+    completo y revisó -- se cierra el loop transicionando a Done en vez de
+    dejarlo clavado en Code Review para siempre. Devuelve True si no hay
+    que seguir procesando este ticket en esta corrida.
+    """
+    if jira_context.get("status") == JIRA_DONE_STATUS:
+        return True
+
+    base_branch = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    if not base_branch:
+        return False
+
+    merged_branch = _find_merged_branch_for_ticket(target_repo_dir, ticket_id, base_branch)
+    if not merged_branch:
+        return False
+
+    _comment_all(
+        f"✅ Se detecto que la rama '{merged_branch}' de este ticket ya esta mergeada en "
+        f"'{base_branch}' -- se marca como completado sin volver a correr el pipeline.",
+        ticket_id, is_epic, child_ticket_keys,
+    )
+    _transition_all(JIRA_DONE_STATUS, ticket_id, is_epic, child_ticket_keys)
+    return True
 
 
 @task(retries=0, name="coding-agent-local-fallback")
@@ -881,12 +968,21 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     agent_backend = None
     conversation_file = None
     self_review = None
+    self_verified = None
+    consulted_risk_graph = None
     try:
         agent_result = json.loads(result.stdout)
         run_logger.info(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
         agent_backend = agent_result.get("_meta", {}).get("backend")
         conversation_file = agent_result.get("_conversation_file")
         self_review = agent_result.get("self_review")
+        # Gap real (usuario, "hay gaps en el coding agent"): coding_agent.py
+        # calcula self_verified/consulted_risk_graph (evidencia real, no
+        # autoreportada) pero antes de esto nadie los leia del JSON del
+        # subprocess -- se perdian ahi mismo, nunca llegaban a un comentario
+        # de Jira ni al comprobante tecnico.
+        self_verified = agent_result.get("self_verified")
+        consulted_risk_graph = agent_result.get("consulted_risk_graph")
     except json.JSONDecodeError:
         run_logger.warning(f"El agente no devolvio un JSON valido en stdout para {ticket_id}.")
 
@@ -921,6 +1017,8 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "backend": agent_backend,
             "conversation_file": conversation_file,
             "self_review": self_review,
+            "self_verified": self_verified,
+            "consulted_risk_graph": consulted_risk_graph,
             "resumed_branch": bool(existing_branch),
             "resumed_pr_rejected": pr_rejected,
             "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
@@ -941,6 +1039,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     return {
         "applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend,
         "conversation_file": conversation_file, "self_review": None,
+        "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
     }
 
 
@@ -966,6 +1065,12 @@ def retry_coding_agent_local_real(
             "has_investigated": conversation_state.get("has_investigated", False),
             "has_run_verification": conversation_state.get("has_run_verification", False),
             "initial_plan": conversation_state.get("initial_plan"),
+            # Gap real (usuario, "hay gaps en el coding agent"): antes se
+            # perdia esta bandera en cada reintento -- si el primer intento ya
+            # consulto el grafo de riesgo, el segundo turno la resetea a
+            # False aunque coding_agent.py SI la acepta como seed
+            # (resume_state.get("consulted_risk_graph")).
+            "consulted_risk_graph": conversation_state.get("consulted_risk_graph", False),
         }
         Path(conversation_file).unlink(missing_ok=True)
     else:
@@ -1001,12 +1106,16 @@ def retry_coding_agent_local_real(
     backend = None
     retry_conversation_file = None
     self_review = None
+    self_verified = None
+    consulted_risk_graph = None
     try:
         agent_result = json.loads(result.stdout)
         run_logger.info(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
         backend = agent_result.get("_meta", {}).get("backend")
         retry_conversation_file = agent_result.get("_conversation_file")
         self_review = agent_result.get("self_review")
+        self_verified = agent_result.get("self_verified")
+        consulted_risk_graph = agent_result.get("consulted_risk_graph")
     except json.JSONDecodeError:
         run_logger.warning(f"El agente no devolvio un JSON valido en stdout en el segundo intento para {ticket_id}.")
 
@@ -1020,7 +1129,10 @@ def retry_coding_agent_local_real(
     has_own_commits = bool(checkpoint) and head_now != checkpoint
 
     if not status.strip() and not has_own_commits:
-        return {"applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file}
+        return {
+            "applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
+            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+        }
 
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
@@ -1032,7 +1144,10 @@ def retry_coding_agent_local_real(
     # epica secuencial (_deliver_epic_sequential) en cambio necesita este
     # conversation_file intacto para pasarselo como continuacion al proximo
     # hijo de la epica.
-    return {"applied": True, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file}
+    return {
+        "applied": True, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
+        "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+    }
 
 
 @task(retries=0, name="output-guard")
@@ -1127,6 +1242,21 @@ def _check_not_epic(ticket: dict) -> None:
             f"{ticket['ticket_id']} es una Epica -- correla con --epic {ticket['ticket_id']} en vez de "
             "como ticket normal, o el pipeline no le va a resolver los hijos."
         )
+
+
+def _filter_active_children(children: list, terminal_statuses: set) -> tuple:
+    """Pure: separa los hijos de una epica en (activos, ya_terminales) segun
+    su status real de Jira -- ver JIRA_EPIC_TERMINAL_STATUSES. Un child sin
+    status (JQL viejo, o el campo no vino) se considera activo por
+    default (fail-safe: nunca se excluye por falta de dato).
+    """
+    active, already_terminal = [], []
+    for child in children:
+        if child.get("status") in terminal_statuses:
+            already_terminal.append(child)
+        else:
+            active.append(child)
+    return active, already_terminal
 
 
 def _format_conflicts_section(conflicts: list) -> str:
@@ -1440,6 +1570,12 @@ def _evaluate_new_diff_after_retry(
         )
         raise PipelineBlocked(f"tests reales fallaron en el {label}")
 
+    _comment_all(
+        f"🧪 Testing agent (Prefect): los tests reales PASARON en el {label} de '{branch}'.\n"
+        f"```\n{test_result['output'][-1500:]}\n```",
+        ticket_id, is_epic, child_ticket_keys,
+    )
+
     new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
 
     return _run_judge_safe(
@@ -1678,10 +1814,14 @@ def _deliver(
     historias hijas -- se le manda al juez ademas de al coding agent, para
     que verifique si el diff real los tuvo en cuenta.
     """
+    if _check_already_completed(ticket_id, jira_context, target_repo_dir, is_epic, child_ticket_keys):
+        return {"firewall": firewall_result, "agent": None, "judge": None, "skipped": "already_completed"}
+
     sanitized = firewall_result["sanitized_prompt"]
     _transition_all(JIRA_IN_PROGRESS_STATUS, ticket_id, is_epic, child_ticket_keys)
     falco_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     components = (jira_context.get("repository_origen") or "").split(",")
+    test_result = None
 
     if GITHUB_REPO:
         agent_result = run_coding_agent_cloud(ticket_id, summary, sanitized)
@@ -1775,6 +1915,18 @@ def _deliver(
                     )
                 )
                 raise PipelineBlocked("tests reales fallaron")
+
+            # Confirmado real (usuario): "no hay visibilidad de las pruebas" --
+            # antes, cuando los tests PASABAN, run_tests() devolvia el output
+            # real pero nada lo mostraba en ningun lado visible para un humano
+            # (solo llegaba al prompt del juez). Un comentario real con un
+            # extracto de la salida real deja evidencia de que efectivamente
+            # corrieron tests reales y no fue un passed=True vacio.
+            _comment_all(
+                f"🧪 Testing agent (Prefect): los tests reales PASARON en '{agent_result['branch']}'.\n"
+                f"```\n{test_result['output'][-1500:]}\n```",
+                ticket_id, is_epic, child_ticket_keys,
+            )
 
             new_sonar_issues = rescan_sonar(target_repo_dir, components[0]) if components else []
 
@@ -1889,12 +2041,23 @@ def _deliver(
         "veredicto_juez": (judge_verdict or {}).get("verdict", "sin veredicto"),
         "razonamiento_juez": (judge_verdict or {}).get("reasoning", "no disponible"),
         "rama_git": branch or "ninguna",
+        # Gap real (usuario, "hay gaps en el coding agent"): self_verified/
+        # consulted_risk_graph son evidencia real (no autoreportada) de que
+        # el agente corrio algo antes de terminar -- antes se calculaban y
+        # se perdian, nunca llegaban a ningun lado visible para un humano.
+        "self_verified": (agent_result or {}).get("self_verified"),
+        "consulto_grafo_de_riesgo": (agent_result or {}).get("consulted_risk_graph"),
+        # Gap real (usuario, "gaps en el workflow"): informativo -- en que
+        # sprint estaba el ticket cuando el pipeline lo proceso.
+        "sprint": (jira_context.get("sprint") or {}).get("name"),
     }
     # Confirmado real (usuario): pr_result ya estaba disponible aca (rama del
     # veredicto OK) pero nunca se le pasaba al comprobante tecnico -- la
     # documentacion del ticket no mencionaba la PR real aunque ya existiera.
     if pr_result and pr_result.get("pr_url"):
         technical_report_evidence["pr_url"] = pr_result["pr_url"]
+    if test_result:
+        technical_report_evidence["salida_tests"] = test_result["output"][:2000]
     technical_report = generate_technical_report(technical_report_evidence)
     if technical_report:
         _comment_all(technical_report, ticket_id, is_epic, child_ticket_keys)
@@ -1983,8 +2146,14 @@ def _deliver_epic_sequential(
             "summary": child["summary"],
             "description": child["description"],
             "repository_origen": child["repository_origen"],
+            "status": child.get("status"),
+            "sprint": child.get("sprint"),
         }
         components = [child["repository_origen"]]
+
+        if _check_already_completed(child_id, jira_context, target_repo_dir):
+            completed.append({"ticket_id": child_id, "outcome": "already-completed"})
+            continue
 
         firewall_result = evaluate_firewall(child_prompt, jira_context, sonar_errors)
         last_firewall_result = firewall_result
@@ -2084,6 +2253,12 @@ def _deliver_epic_sequential(
             blocked_at = child_id
             break
 
+        comment_jira(
+            f"🧪 Testing agent (Prefect): los tests reales PASARON procesando {child_id}.\n"
+            f"```\n{test_result['output'][-1500:]}\n```",
+            ticket_key=child_id,
+        )
+
         new_sonar_issues = rescan_sonar(target_repo_dir, child["repository_origen"])
         judge_verdict = _run_judge_safe(
             jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
@@ -2131,7 +2306,16 @@ def _deliver_epic_sequential(
         else:
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
             transition_jira(JIRA_REVIEW_STATUS, ticket_key=child_id)
-            _post_child_technical_report(epic_key, child_id, backend, "OK -- listo para revision humana", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})
+            _post_child_technical_report(
+                epic_key, child_id, backend, "OK -- listo para revision humana",
+                {
+                    "veredicto_juez": judge_verdict["reasoning"], "rama_git": branch,
+                    "salida_tests": test_result["output"][:2000],
+                    "self_verified": agent_result.get("self_verified"),
+                    "consulto_grafo_de_riesgo": agent_result.get("consulted_risk_graph"),
+                    "sprint": (jira_context.get("sprint") or {}).get("name"),
+                },
+            )
             completed.append({"ticket_id": child_id, "outcome": "ok"})
 
     pr_result = None
@@ -2178,10 +2362,21 @@ def _deliver_epic_sequential(
     # listo para revision humana, en revision si al menos una historia lo
     # esta (mismo criterio que la condicion de arriba para abrir la PR).
     has_reviewable_work = branch and any(c["outcome"] in ("ok", "no-verdict") for c in completed)
-    if blocked_at or not has_reviewable_work:
+    # Gap real (usuario): si TODAS las historias de esta corrida ya estaban
+    # completadas de antes (rama mergeada, detectado por
+    # _check_already_completed), no hay branch nuevo ni nada para revisar --
+    # pero tampoco esta "bloqueada", asi que antes hubiera caido en Blocked
+    # por descarte. Si ademas ninguna quedo sin procesar (bloqueada a mitad
+    # de camino), la epica en si ya esta terminada.
+    all_already_completed = bool(completed) and all(c["outcome"] == "already-completed" for c in completed)
+    if blocked_at:
         transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key)
-    else:
+    elif has_reviewable_work:
         transition_jira(JIRA_REVIEW_STATUS, ticket_key=epic_key)
+    elif all_already_completed:
+        transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key)
+    else:
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key)
 
     if conversation_file:
         Path(conversation_file).unlink(missing_ok=True)
@@ -2237,6 +2432,8 @@ def run_pipeline():
         "summary": ticket["summary"],
         "description": ticket["description"],
         "repository_origen": component,
+        "status": ticket.get("status"),
+        "sprint": ticket.get("sprint"),
     }
 
     firewall_result = evaluate_firewall(prompt, jira_context, [i["message"] for i in sonar_result["issues"]])
@@ -2276,6 +2473,28 @@ def run_epic_pipeline(epic_key: str):
             "Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md "
             "(Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
         )
+
+    # Gap real (usuario, "gaps en el scrum agent"): antes se le pasaban TODOS
+    # los hijos (incluidos los ya terminales) al scrum agent (epic_planner.py)
+    # -- gastaba un turno real de LLM + grafo razonando sobre historias
+    # cerradas, y una sola de ellas podia degradar el ordenamiento real (ver
+    # _filter_active_children).
+    children, already_terminal = _filter_active_children(children, JIRA_EPIC_TERMINAL_STATUSES)
+    if already_terminal:
+        excluded_text = ", ".join(f"{c['ticket_id']} ({c.get('status')})" for c in already_terminal)
+        comment_jira(
+            f"✅ Modo epica (Prefect): {len(already_terminal)} historia(s) ya estaban en un status terminal, "
+            f"se excluyen de esta corrida: {excluded_text}.",
+            ticket_key=epic_key,
+        )
+    if not children:
+        comment_jira(
+            f"✅ Modo epica (Prefect): las {len(already_terminal)} historias hijas de {epic_key} ya estan "
+            "completadas -- nada que procesar en esta corrida.",
+            ticket_key=epic_key,
+        )
+        transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key)
+        return {"completed": [], "blocked_at": None, "branch": None, "pr": None}
 
     unresolved = [c["ticket_id"] for c in children if not c.get("repository_origen")]
     if unresolved:
@@ -2357,6 +2576,8 @@ def run_epic_pipeline(epic_key: str):
         "summary": epic["summary"],
         "description": epic["description"],
         "repository_origen": ",".join(distinct_components),
+        "status": epic.get("status"),
+        "sprint": epic.get("sprint"),
     }
 
     firewall_result = evaluate_firewall(prompt, jira_context, sonar_errors)

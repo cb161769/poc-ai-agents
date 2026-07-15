@@ -11,6 +11,7 @@ from jira_client import (
     _extract_figma_link,
     _has_sufficient_context,
     _markdown_to_adf,
+    _parse_sprint_field,
     fetch_epic_with_children,
 )
 
@@ -174,6 +175,26 @@ def test_fetch_ticket_live_includes_issue_type(mock_get, monkeypatch):
 
 
 @patch("jira_client.httpx.get")
+def test_fetch_ticket_live_includes_sprint(mock_get, monkeypatch):
+    """Gap real (usuario, "gaps en el workflow"): fetch_ticket_live() no
+    pedia el campo Sprint hasta este cambio."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setenv("JIRA_TICKET_KEY", "T-1")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService"})
+    resp = _fake_issue_response(components=["AuthService"], labels=[])
+    resp.json.return_value["fields"][jira_client.JIRA_SPRINT_FIELD_ID] = [{"name": "Sprint 12", "state": "active"}]
+    mock_get.return_value = resp
+
+    ticket = jira_client.fetch_ticket_live()
+
+    assert ticket["sprint"] == {"name": "Sprint 12", "state": "active"}
+    requested_fields = mock_get.call_args.kwargs["params"]["fields"]
+    assert jira_client.JIRA_SPRINT_FIELD_ID in requested_fields
+
+
+@patch("jira_client.httpx.get")
 def test_fetch_ticket_live_falls_back_to_labels_when_no_matching_component(mock_get, monkeypatch):
     monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
     monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
@@ -301,11 +322,150 @@ def test_fetch_epic_with_children_shape(mock_get, mock_post, monkeypatch):
         "summary": "Boton nuevo",
         "description": "",
         "repository_origen": "Frontend",
+        "status": None,
+        "sprint": None,
     }
     assert result["children"][1]["repository_origen"] == "AuthService"
 
     search_call = mock_post.call_args_list[0]
     assert search_call.kwargs["json"]["jql"] == 'parent = "EPIC-1"'
+
+
+@patch("jira_client.httpx.post")
+@patch("jira_client.httpx.get")
+def test_fetch_epic_with_children_includes_status(mock_get, mock_post, monkeypatch):
+    """Gap real (usuario, "encuentra gaps en jira de cara al development
+    cycle"): orchestration.py necesita saber si la epica/hijos YA estan en
+    Done antes de reprocesarlos (ej. un webhook viejo/duplicado) -- ni la
+    epica ni sus hijos traian el campo status hasta este cambio."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService", "Frontend"})
+
+    epic_resp = MagicMock()
+    epic_resp.raise_for_status.return_value = None
+    epic_resp.json.return_value = {
+        "key": "EPIC-1",
+        "fields": {
+            "summary": "Rehacer el login", "description": None, "labels": [],
+            "components": [{"name": "AuthService"}], "status": {"name": "Done"},
+        },
+    }
+    mock_get.return_value = epic_resp
+
+    search_resp = MagicMock()
+    search_resp.raise_for_status.return_value = None
+    search_resp.json.return_value = {
+        "issues": [
+            {
+                "key": "T-10",
+                "fields": {
+                    "summary": "Boton nuevo", "description": None, "labels": [],
+                    "components": [{"name": "Frontend"}], "status": {"name": "Done"},
+                },
+            },
+        ]
+    }
+    mock_post.return_value = search_resp
+
+    result = fetch_epic_with_children("EPIC-1")
+
+    assert result["epic"]["status"] == "Done"
+    assert result["children"][0]["status"] == "Done"
+    search_call = mock_post.call_args_list[0]
+    assert "status" in search_call.kwargs["json"]["fields"]
+    assert "status" in mock_get.call_args.kwargs["params"]["fields"]
+
+
+def test_parse_sprint_field_none_or_empty_returns_none():
+    assert _parse_sprint_field(None) is None
+    assert _parse_sprint_field([]) is None
+    assert _parse_sprint_field("not a list") is None
+
+
+def test_parse_sprint_field_modern_dict_shape():
+    raw = [{"id": 1, "name": "Sprint 12", "state": "active", "boardId": 5}]
+    assert _parse_sprint_field(raw) == {"name": "Sprint 12", "state": "active"}
+
+
+def test_parse_sprint_field_legacy_string_shape():
+    """Instancias viejas de Jira devuelven el campo Sprint como una lista de
+    strings serializados estilo Greenhopper, no dicts."""
+    raw = [
+        "com.atlassian.greenhopper.service.sprint.Sprint@1a2b3c4d[id=1,rapidViewId=5,"
+        "state=ACTIVE,name=Sprint 12,startDate=2026-07-01,goal=]"
+    ]
+    assert _parse_sprint_field(raw) == {"name": "Sprint 12", "state": "active"}
+
+
+def test_parse_sprint_field_prefers_active_among_multiple():
+    raw = [
+        {"name": "Sprint 11", "state": "closed"},
+        {"name": "Sprint 12", "state": "active"},
+    ]
+    assert _parse_sprint_field(raw) == {"name": "Sprint 12", "state": "active"}
+
+
+def test_parse_sprint_field_falls_back_to_last_when_none_active():
+    raw = [
+        {"name": "Sprint 10", "state": "closed"},
+        {"name": "Sprint 11", "state": "closed"},
+    ]
+    assert _parse_sprint_field(raw) == {"name": "Sprint 11", "state": "closed"}
+
+
+def test_parse_sprint_field_ignores_malformed_entries():
+    raw = [{"id": 1, "state": "active"}, "garbage without brackets", 42]
+    assert _parse_sprint_field(raw) is None
+
+
+@patch("jira_client.httpx.post")
+@patch("jira_client.httpx.get")
+def test_fetch_epic_with_children_includes_sprint(mock_get, mock_post, monkeypatch):
+    """Gap real (usuario, "gaps en el workflow"): ningun fetch de Jira traia
+    el campo Sprint -- el pipeline no tenia forma de saber en que sprint
+    estaba una historia."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    monkeypatch.setattr(jira_client, "KNOWN_REPOS", {"AuthService", "Frontend"})
+
+    epic_resp = MagicMock()
+    epic_resp.raise_for_status.return_value = None
+    epic_resp.json.return_value = {
+        "key": "EPIC-1",
+        "fields": {
+            "summary": "Rehacer el login", "description": None, "labels": [],
+            "components": [{"name": "AuthService"}],
+            jira_client.JIRA_SPRINT_FIELD_ID: [{"name": "Sprint 12", "state": "active"}],
+        },
+    }
+    mock_get.return_value = epic_resp
+
+    search_resp = MagicMock()
+    search_resp.raise_for_status.return_value = None
+    search_resp.json.return_value = {
+        "issues": [
+            {
+                "key": "T-10",
+                "fields": {
+                    "summary": "Boton nuevo", "description": None, "labels": [],
+                    "components": [{"name": "Frontend"}],
+                    jira_client.JIRA_SPRINT_FIELD_ID: [{"name": "Sprint 12", "state": "active"}],
+                },
+            },
+        ]
+    }
+    mock_post.return_value = search_resp
+
+    result = fetch_epic_with_children("EPIC-1")
+
+    assert result["epic"]["sprint"] == {"name": "Sprint 12", "state": "active"}
+    assert result["children"][0]["sprint"] == {"name": "Sprint 12", "state": "active"}
+    search_call = mock_post.call_args_list[0]
+    assert jira_client.JIRA_SPRINT_FIELD_ID in search_call.kwargs["json"]["fields"]
+    assert jira_client.JIRA_SPRINT_FIELD_ID in mock_get.call_args.kwargs["params"]["fields"]
 
 
 @patch("jira_client.httpx.post")

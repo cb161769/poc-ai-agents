@@ -45,6 +45,55 @@ KNOWN_REPOS = {
 # if your org's Rovo integration shows up under a different display name.
 ROVO_AUTHOR_MATCH = os.environ.get("ROVO_AUTHOR_NAME_MATCH", "rovo").lower()
 
+# Gap real (usuario, "gaps en el workflow"): el pipeline no tenia NINGUNA
+# nocion de Sprint -- ni epic_planner.py, ni ningun fetch. El campo Sprint de
+# Jira es un custom field cuyo ID varia por instancia (customfield_10020 es
+# el default mas comun en Jira Cloud, pero no esta garantizado) -- override
+# via env si tu instancia usa otro. Se usa solo como metadata informativa,
+# nunca para filtrar/bloquear que historias se procesan.
+JIRA_SPRINT_FIELD_ID = os.environ.get("JIRA_SPRINT_FIELD_ID", "customfield_10020")
+
+_LEGACY_SPRINT_FIELD_PATTERN = re.compile(r"\[(.*)\]")
+
+
+def _parse_sprint_field(raw) -> dict | None:
+    """Pure, best-effort: el campo Sprint de Jira puede venir como lista de
+    dicts (Jira Cloud moderno: [{"id":1,"name":"Sprint 12","state":"active",
+    ...}]) o como lista de strings serializados al estilo Greenhopper viejo
+    ("com.atlassian.greenhopper.service.sprint.Sprint@...[id=1,name=Sprint
+    12,state=ACTIVE,...]"). Cualquier formato inesperado devuelve None --
+    nunca lanza, esto es metadata informativa, no debe poder romper un fetch
+    real. Si hay varios sprints, prioriza el "active"; si ninguno lo esta,
+    devuelve el ultimo de la lista (mas reciente).
+    """
+    if not raw:
+        return None
+    if not isinstance(raw, list):
+        return None
+
+    parsed = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = item.get("name")
+            state = item.get("state")
+            if name:
+                parsed.append({"name": name, "state": (state or "").lower() or None})
+        elif isinstance(item, str):
+            match = _LEGACY_SPRINT_FIELD_PATTERN.search(item)
+            if not match:
+                continue
+            fields = {}
+            for pair in match.group(1).split(","):
+                if "=" in pair:
+                    key, _, value = pair.partition("=")
+                    fields[key.strip()] = value.strip()
+            if fields.get("name"):
+                parsed.append({"name": fields["name"], "state": (fields.get("state") or "").lower() or None})
+
+    if not parsed:
+        return None
+    return next((s for s in parsed if s["state"] == "active"), parsed[-1])
+
 
 def _adf_to_text_raw(node) -> str:
     """Flatten Atlassian Document Format into plain text (recursive core --
@@ -229,7 +278,7 @@ def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = N
         r = httpx.get(
             f"{jira_url}/rest/api/3/issue/{ticket_key}",
             headers=headers,
-            params={"fields": "summary,description,labels,status,attachment,components,issuetype"},
+            params={"fields": f"summary,description,labels,status,attachment,components,issuetype,{JIRA_SPRINT_FIELD_ID}"},
             timeout=15.0,
         )
         r.raise_for_status()
@@ -251,6 +300,7 @@ def fetch_ticket_live(ticket_key: str | None = None, known_repos: set | None = N
         "repository_origen": _resolve_repository_origen(fields, known_repos),
         "status": (fields.get("status") or {}).get("name"),
         "issue_type": (fields.get("issuetype") or {}).get("name"),
+        "sprint": _parse_sprint_field(fields.get(JIRA_SPRINT_FIELD_ID)),
         "has_log_evidence": _adf_has_code_block(fields.get("description")),
         "has_sufficient_context": _has_sufficient_context(fields.get("summary", ""), description_text),
         "figma_link": _extract_figma_link(description_text),
@@ -278,7 +328,7 @@ def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> d
         r = httpx.get(
             f"{jira_url}/rest/api/3/issue/{epic_key}",
             headers=headers,
-            params={"fields": "summary,description,labels,status,components"},
+            params={"fields": f"summary,description,labels,status,components,{JIRA_SPRINT_FIELD_ID}"},
             timeout=15.0,
         )
         r.raise_for_status()
@@ -292,6 +342,8 @@ def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> d
         "summary": epic_fields.get("summary", ""),
         "description": _adf_to_text(epic_fields.get("description")).strip(),
         "repository_origen": _resolve_repository_origen(epic_fields, known_repos),
+        "status": (epic_fields.get("status") or {}).get("name"),
+        "sprint": _parse_sprint_field(epic_fields.get(JIRA_SPRINT_FIELD_ID)),
     }
 
     jql_template = os.environ.get("JIRA_EPIC_LINK_JQL", 'parent = "{epic_key}"')
@@ -303,7 +355,7 @@ def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> d
         r = httpx.post(
             f"{jira_url}/rest/api/3/search/jql",
             headers=headers,
-            json={"jql": jql, "fields": ["summary", "description", "labels", "components"]},
+            json={"jql": jql, "fields": ["summary", "description", "labels", "components", "status", JIRA_SPRINT_FIELD_ID]},
             timeout=15.0,
         )
         r.raise_for_status()
@@ -316,6 +368,8 @@ def fetch_epic_with_children(epic_key: str, known_repos: set | None = None) -> d
             "summary": issue.get("fields", {}).get("summary", ""),
             "description": _adf_to_text(issue.get("fields", {}).get("description")).strip(),
             "repository_origen": _resolve_repository_origen(issue.get("fields", {}), known_repos),
+            "status": (issue.get("fields", {}).get("status") or {}).get("name"),
+            "sprint": _parse_sprint_field(issue.get("fields", {}).get(JIRA_SPRINT_FIELD_ID)),
         }
         for issue in search_resp.json().get("issues", [])
     ]

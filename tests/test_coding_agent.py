@@ -223,7 +223,7 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         if call_count["n"] == 2:
             content = [
-                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo verificado"}}
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "npm test"}}
             ]
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo y verificado", "files_changed": []}'}]
@@ -236,6 +236,40 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
 
     assert result["status"] == "done"
     assert result["self_verified"] is True
+
+
+def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(monkeypatch, tmp_path):
+    """Gap real (usuario, "hay gaps en el coding agent"): antes, CUALQUIER
+    run_shell_command (incluso "ls" o "echo listo") marcaba self_verified=True
+    -- el modelo podia satisfacer el empujon de verificacion sin correr nada
+    que realmente pruebe el cambio. Ahora exige que el comando se parezca a
+    una verificacion real (test/build/lint/compile)."""
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo listo"}}
+            ]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    assert result["self_verified"] is False
 
 
 def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypatch, tmp_path):
@@ -609,7 +643,7 @@ def test_run_coding_agent_accepts_done_with_valid_self_review_no_extra_nudge(mon
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         if call_count["n"] == 2:
             content = [
-                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo verificado"}}
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "npm test"}}
             ]
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         final = {
@@ -644,7 +678,7 @@ def test_run_coding_agent_nudges_once_for_missing_self_review(monkeypatch, tmp_p
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         if call_count["n"] == 2:
             content = [
-                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "echo ok"}}
+                {"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "npm test"}}
             ]
             return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
         # Ya investigo y verifico (has_run_verification=True), pero nunca

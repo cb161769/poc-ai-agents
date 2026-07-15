@@ -8,7 +8,7 @@ import asyncio
 import pytest
 
 import epic_planner
-from epic_planner import _extract_json, _fallback_result, _validate_result, plan_epic
+from epic_planner import _build_user_prompt, _extract_json, _fallback_result, _format_sprint_suffix, _validate_result, plan_epic
 
 
 def _children():
@@ -20,6 +20,38 @@ def _children():
 
 def test_extract_json_strips_fenced_code_block():
     assert _extract_json('```json\n{"ordered_children": []}\n```') == {"ordered_children": []}
+
+
+def test_format_sprint_suffix_none_is_empty():
+    assert _format_sprint_suffix(None) == ""
+    assert _format_sprint_suffix({"name": None}) == ""
+
+
+def test_format_sprint_suffix_includes_name_and_state():
+    assert _format_sprint_suffix({"name": "Sprint 12", "state": "active"}) == " (sprint: Sprint 12, active)"
+
+
+def test_format_sprint_suffix_omits_state_when_missing():
+    assert _format_sprint_suffix({"name": "Sprint 12", "state": None}) == " (sprint: Sprint 12)"
+
+
+def test_build_user_prompt_includes_sprint_info_when_present():
+    """Gap real (usuario, "gaps en el workflow"): el scrum agent no tenia
+    ninguna nocion de sprint -- ahora es contexto informativo en el prompt."""
+    children = [
+        {"ticket_id": "JIRA-1", "summary": "s1", "description": "d1", "repository_origen": "AuthService",
+         "sprint": {"name": "Sprint 12", "state": "active"}},
+    ]
+    prompt = _build_user_prompt({"key": "EPIC-1", "summary": "e", "description": "d"}, children)
+    assert "(sprint: Sprint 12, active)" in prompt
+
+
+def test_build_user_prompt_omits_sprint_suffix_when_absent():
+    children = [
+        {"ticket_id": "JIRA-1", "summary": "s1", "description": "d1", "repository_origen": "AuthService"},
+    ]
+    prompt = _build_user_prompt({"key": "EPIC-1", "summary": "e", "description": "d"}, children)
+    assert "sprint:" not in prompt
 
 
 def test_fallback_result_keeps_original_order():

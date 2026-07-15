@@ -165,6 +165,16 @@ TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION = (
     "AHORA, no respondas con otra explicacion."
 )
 
+# Gap real (usuario, "hay gaps en el coding agent"): antes, has_run_verification
+# (-> self_verified) se marcaba True con CUALQUIER llamado a run_shell_command,
+# incluido uno trivial como "ls" o "echo listo" -- el modelo podia satisfacer
+# el empujon de verificacion sin correr nada que realmente pruebe el cambio.
+# Exige que el comando se PAREZCA a una verificacion real (test/build/lint/
+# compilacion), mismas palabras clave que los comandos sugeridos por
+# _STACK_MARKERS (npm test, mvn test, go test, cargo test, bundle exec rspec,
+# pytest, dotnet test).
+_VERIFICATION_COMMAND_PATTERN = re.compile(r"\b(test|rspec|lint|build|compile)\b", re.IGNORECASE)
+
 _SELF_REVIEW_FIELDS = ("scope_matches_ticket", "no_secrets_introduced", "tests_adequate")
 
 
@@ -953,7 +963,7 @@ async def run_coding_agent(
                             output = LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input)
                             if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
                                 has_investigated = True
-                            if name == "run_shell_command":
+                            if name == "run_shell_command" and _VERIFICATION_COMMAND_PATTERN.search(str(tool_input.get("command", ""))):
                                 has_run_verification = True
                         else:
                             if name.startswith("neo4j-cypher__"):

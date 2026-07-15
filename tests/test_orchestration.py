@@ -19,6 +19,7 @@ from orchestration import (
     _deliver,
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
+    _filter_active_children,
     _resolve_pr_threads,
     _find_open_branch_for_ticket,
     _format_conflicts_section,
@@ -28,6 +29,45 @@ from orchestration import (
     _retry_local_diff,
     _transition_all,
 )
+
+
+def test_filter_active_children_excludes_terminal_status():
+    """Gap real (usuario, "gaps en el scrum agent"): el planificador
+    (epic_planner.py) gastaba un turno real razonando sobre historias ya
+    Done -- este filtro las saca ANTES de que le lleguen."""
+    children = [
+        {"ticket_id": "C-1", "status": "Done"},
+        {"ticket_id": "C-2", "status": "In Progress"},
+    ]
+
+    active, already_terminal = _filter_active_children(children, {"Done"})
+
+    assert active == [{"ticket_id": "C-2", "status": "In Progress"}]
+    assert already_terminal == [{"ticket_id": "C-1", "status": "Done"}]
+
+
+def test_filter_active_children_treats_missing_status_as_active():
+    """Fail-safe: un child sin status (JQL viejo, o el campo no vino) nunca
+    se excluye por falta de dato."""
+    children = [{"ticket_id": "C-1"}, {"ticket_id": "C-2", "status": None}]
+
+    active, already_terminal = _filter_active_children(children, {"Done"})
+
+    assert active == children
+    assert already_terminal == []
+
+
+def test_filter_active_children_respects_custom_terminal_statuses():
+    children = [
+        {"ticket_id": "C-1", "status": "Won't Do"},
+        {"ticket_id": "C-2", "status": "Done"},
+        {"ticket_id": "C-3", "status": "In Progress"},
+    ]
+
+    active, already_terminal = _filter_active_children(children, {"Done", "Won't Do"})
+
+    assert active == [{"ticket_id": "C-3", "status": "In Progress"}]
+    assert {c["ticket_id"] for c in already_terminal} == {"C-1", "C-2"}
 
 
 def test_resolve_single_repo_ok_when_all_agree():
@@ -295,6 +335,7 @@ def test_deliver_retries_and_recovers_when_no_changes_applied_but_judge_flags(mo
     """
     monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
     monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: False)
     monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
@@ -347,6 +388,7 @@ def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict
     de una corrida que sigue en curso de verdad."""
     monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
     monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: False)
     monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
@@ -374,6 +416,285 @@ def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict
     assert result["judge"] is None
     assert (orchestration.JIRA_BLOCKED_STATUS, "T-1") in transitions
     assert any("no pudo evaluar" in text for _key, text in comments)
+
+
+def test_retry_for_inadequate_tests_preserves_branch_when_retry_omits_it(monkeypatch):
+    """retry_coding_agent_local_real() nunca devuelve branch/base_branch (
+    reusa la rama ya checked out por el primer intento) -- si
+    _retry_for_inadequate_tests() devolviera el resultado del reintento tal
+    cual, el resto de _deliver perderia la referencia a la rama real donde
+    esta el commit nuevo. Este test confirma que branch/base_branch del
+    agent_result original sobreviven al merge.
+    """
+    captured = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        captured["ticket_id"] = ticket_id
+        captured["feedback_text"] = feedback_text
+        captured["conversation_file"] = conversation_file
+        return {"applied": True, "backend": "anthropic", "self_review": {"tests_adequate": True}, "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+
+    original = {
+        "applied": True, "branch": "copilot/T-1-123", "base_branch": "main",
+        "backend": "ollama", "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": False},
+    }
+
+    result = orchestration._retry_for_inadequate_tests("T-1", "/repo", original)
+
+    assert result["branch"] == "copilot/T-1-123"
+    assert result["base_branch"] == "main"
+    assert result["conversation_file"] == "/tmp/conv2.json"
+    assert result["self_review"] == {"tests_adequate": True}
+    assert captured["ticket_id"] == "T-1"
+    assert captured["conversation_file"] == "/tmp/conv1.json"
+    assert "test real" in captured["feedback_text"]
+
+
+def test_retry_for_inadequate_tests_returns_original_when_retry_applies_nothing(monkeypatch):
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": False})
+
+    original = {
+        "applied": True, "branch": "copilot/T-1-123", "base_branch": "main",
+        "backend": "ollama", "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": False},
+    }
+
+    result = orchestration._retry_for_inadequate_tests("T-1", "/repo", original)
+
+    assert result is original
+
+
+def test_deliver_retries_coding_agent_when_self_review_flags_inadequate_tests(monkeypatch):
+    """El coding agent se autoevalua honestamente con tests_adequate=False
+    (confirmado real en KAN-15/KAN-5) pero antes nadie actuaba sobre eso --
+    _deliver() ahora le da un turno mas ANTES de correr tests/juez."""
+    retry_calls = []
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": False},
+        },
+    )
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        retry_calls.append((ticket_id, conversation_file))
+        return {
+            "applied": True, "backend": "ollama",
+            "self_review": {"tests_adequate": True}, "conversation_file": "/tmp/conv2.json",
+        }
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "3 passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+
+    result = _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert retry_calls == [("T-1", "/tmp/conv1.json")]
+    # branch/base_branch del intento original sobreviven al merge, aunque
+    # retry_coding_agent_local_real() no los devuelva.
+    assert result["agent"]["branch"] == "copilot/T-1-1"
+
+
+def test_deliver_does_not_retry_when_tests_adequate_true_or_missing(monkeypatch):
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        },
+    )
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: pytest.fail("no deberia reintentar"))
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "3 passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+
+def test_deliver_comments_real_test_output_when_tests_pass(monkeypatch):
+    """Confirmado real (usuario): "no hay visibilidad de las pruebas" --
+    cuando run_tests() PASA, el output real nunca llegaba a ningun lado
+    visible para un humano. Este test confirma que ahora se postea un
+    comentario real con el output."""
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        },
+    )
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "======== 7 passed in 1.2s ========"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(text))
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert any("PASARON" in text and "7 passed in 1.2s" in text for text in comments)
+
+
+def test_deliver_includes_salida_tests_in_technical_report(monkeypatch):
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        },
+    )
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "7 passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+
+    captured_evidence = {}
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda evidence: captured_evidence.update(evidence) or None)
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert captured_evidence["salida_tests"] == "7 passed"
+
+
+def test_deliver_skips_pipeline_when_already_completed(monkeypatch):
+    """Gap real (usuario): _deliver() no deberia correr firewall/coding
+    agent/tests si _check_already_completed() ya determino que no hace
+    falta -- ni un solo llamado a run_coding_agent_local_real."""
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: True)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: pytest.fail("no deberia correr el coding agent"),
+    )
+    monkeypatch.setattr(orchestration, "_transition_all", lambda *a, **k: pytest.fail("no deberia transicionar de nuevo"))
+
+    result = _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend", "status": orchestration.JIRA_DONE_STATUS}, "/repo",
+    )
+
+    assert result == {
+        "firewall": {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        "agent": None, "judge": None, "skipped": "already_completed",
+    }
+
+
+def test_deliver_epic_sequential_skips_already_completed_child_but_processes_siblings(monkeypatch):
+    """Mismo gap, en modo epica: un hijo ya mergeado no deberia volver a
+    pasar por firewall/coding agent, pero sus hermanos SI tienen que
+    seguir procesandose con normalidad."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    firewall_calls = []
+
+    def fake_check_already_completed(ticket_id, jira_context, target_repo_dir, is_epic=False, child_ticket_keys=None):
+        return ticket_id == "C-1"
+
+    monkeypatch.setattr(orchestration, "_check_already_completed", fake_check_already_completed)
+
+    def fake_firewall(prompt, jira_context, sonar_errors):
+        firewall_calls.append(jira_context["ticket_id"])
+        return {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None}
+
+    monkeypatch.setattr(orchestration, "evaluate_firewall", fake_firewall)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert firewall_calls == ["C-2"]  # C-1 nunca llego al firewall
+    assert result["completed"] == [
+        {"ticket_id": "C-1", "outcome": "already-completed"},
+        {"ticket_id": "C-2", "outcome": "ok"},
+    ]
+
+
+def test_deliver_epic_sequential_transitions_epic_to_done_when_all_children_already_completed(monkeypatch):
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    transitions = []
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert result["completed"] == [
+        {"ticket_id": "C-1", "outcome": "already-completed"},
+        {"ticket_id": "C-2", "outcome": "already-completed"},
+    ]
+    assert ("EPIC-1", orchestration.JIRA_DONE_STATUS) in transitions
 
 
 def test_comment_all_posts_once_in_ticket_mode(monkeypatch):
@@ -734,6 +1055,106 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
     assert any("no pudo evaluar" in text for _key, text in comments if _key == "C-1")
 
 
+def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate_tests(monkeypatch):
+    """Mismo mecanismo que en modo ticket unico, pero para el fan-out de
+    hijos de una epica: el coding agent se autoevalua con
+    tests_adequate=False para un hijo especifico -- se le da un turno mas
+    ANTES de correr tests/juez para ESE hijo."""
+    children = [_fake_child("C-1")]
+    retry_calls = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic",
+            "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": False},
+        },
+    )
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        retry_calls.append((ticket_id, conversation_file))
+        return {
+            "applied": True, "backend": "anthropic",
+            "self_review": {"tests_adequate": True}, "conversation_file": "/tmp/conv2.json",
+        }
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    # _retry_for_inadequate_tests() en modo epica usa epic_key como ticket_id
+    # (mismo criterio ya establecido por _retry_local_diff/_retry_after_no_changes
+    # para este modo), no el child_id.
+    assert retry_calls == [("EPIC-1", "/tmp/conv1.json")]
+    assert result["completed"] == [{"ticket_id": "C-1", "outcome": "ok"}]
+
+
+def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_child(monkeypatch):
+    """Confirmado real (usuario): "no hay visibilidad de las pruebas" en modo
+    epica tambien -- ahora el comentario de tests pasando y el comprobante
+    tecnico final del hijo OK incluyen la salida real."""
+    children = [_fake_child("C-1")]
+    comments = []
+    report_calls = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        },
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "==== 4 passed ===="})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    def fake_generate_report(evidence):
+        report_calls.append(evidence)
+        return None
+
+    monkeypatch.setattr(orchestration, "generate_technical_report", fake_generate_report)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert any("PASARON" in text and "4 passed" in text for _key, text in comments if _key == "C-1")
+    ok_reports = [ev for ev in report_calls if ev.get("resultado", "").startswith("OK")]
+    assert ok_reports and ok_reports[0]["salida_tests"] == "==== 4 passed ===="
+
+
 def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monkeypatch):
     """Confirmado real (epica KAN-4): un humano mirando SOLO el ticket hijo
     bloqueado no tenia forma de saber si el resto de la epica sigue o se
@@ -1077,6 +1498,80 @@ def test_run_coding_agent_local_real_detects_commits_made_by_the_model_itself(mo
     assert not any(cmd[-2:-1] == ["branch"] and "-D" in cmd for cmd in git_calls)
 
 
+def test_run_coding_agent_local_real_surfaces_self_verified_and_risk_graph(monkeypatch, tmp_path):
+    """Gap real (usuario, "hay gaps en el coding agent"): coding_agent.py
+    calcula self_verified/consulted_risk_graph (evidencia real, no
+    autoreportada) pero antes se perdian ahi mismo -- run_coding_agent_local_real()
+    nunca los leia del JSON del subprocess."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "done", "summary": "listo", "_meta": {"backend": "ollama"},
+            "self_verified": True, "consulted_risk_graph": True,
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout=" M archivo.txt\n")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="0\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["self_verified"] is True
+    assert result["consulted_risk_graph"] is True
+
+
+def test_retry_coding_agent_local_real_preserves_consulted_risk_graph_across_turns(monkeypatch, tmp_path):
+    """Gap real: antes, cada reintento perdia consulted_risk_graph aunque
+    coding_agent.py SI lo acepta como seed (resume_state) -- si el primer
+    intento ya consulto el grafo de riesgo, el segundo turno lo reseteaba a
+    False."""
+    conversation_file = tmp_path / "conv.json"
+    conversation_file.write_text(json.dumps({
+        "messages": [], "has_investigated": True, "has_run_verification": True,
+        "initial_plan": "plan", "consulted_risk_graph": True,
+    }), encoding="utf-8")
+
+    captured_payload = {}
+    heads = iter(["checkpoint\n", "checkpoint\n"])  # sin commits nuevos
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "blocked", "summary": "no pude", "_meta": {"backend": "ollama"},
+            "self_verified": True, "consulted_risk_graph": True,
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = cmd[2]
+            captured_payload.update(json.loads(Path(payload_path).read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-1:] == ["HEAD"] and "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=next(heads))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.retry_coding_agent_local_real(
+        "T-1", "feedback", str(tmp_path), conversation_file=str(conversation_file),
+    )
+
+    assert captured_payload["resume_state"]["consulted_risk_graph"] is True
+    assert result["self_verified"] is True
+    assert result["consulted_risk_graph"] is True
+
+
 def test_retry_coding_agent_local_real_detects_commits_made_by_the_model_itself(monkeypatch, tmp_path):
     """Mismo bug que run_coding_agent_local_real, para el camino de
     reintento -- aca no hay base_branch fijo (se reusa la rama del primer
@@ -1384,6 +1879,90 @@ def test_find_open_branch_for_ticket_picks_most_recent_of_multiple_open(monkeypa
     )
 
     assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-200"
+
+
+def test_find_merged_branch_for_ticket_returns_none_when_no_branches_match(monkeypatch):
+    _fake_branch_list_and_merge_base(monkeypatch, branch_list_stdout="", merged=set())
+
+    assert orchestration._find_merged_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
+def test_find_merged_branch_for_ticket_ignores_unmerged_branch(monkeypatch):
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged=set()
+    )
+
+    assert orchestration._find_merged_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
+def test_find_merged_branch_for_ticket_returns_branch_when_merged(monkeypatch):
+    """Caso inverso a _find_open_branch_for_ticket: una rama copilot/{ticket}-*
+    que YA es ancestro de base_branch significa que un humano ya la mergeo --
+    confirma que el pipeline puede detectar esto para cerrar el ticket."""
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged={"copilot/KAN-2-100"}
+    )
+
+    assert orchestration._find_merged_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-100"
+
+
+def _fake_branch_list_merge_base_and_rev_parse(monkeypatch, branch_list_stdout: str, merged: set, base_branch: str = "main"):
+    def fake_run(cmd, **kwargs):
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout=branch_list_stdout)
+        if "merge-base" in cmd:
+            branch = cmd[-2]
+            return _fake_subprocess_result(returncode=0 if branch in merged else 1)
+        if "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=f"{base_branch}\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+
+def test_check_already_completed_true_when_jira_status_already_done(monkeypatch):
+    """Gap real (usuario): un webhook viejo/duplicado que re-dispara el
+    pipeline sobre un ticket que un humano ya cerro no deberia volver a
+    correr firewall/coding agent/tests -- esto se detecta ANTES de tocar
+    git, con el status que ya trae fetch_ticket_live()."""
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: pytest.fail("no deberia tocar git"))
+    comments, transitions = [], []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(ticket_key))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append(ticket_key))
+
+    result = orchestration._check_already_completed(
+        "T-1", {"ticket_id": "T-1", "status": orchestration.JIRA_DONE_STATUS}, "/repo",
+    )
+
+    assert result is True
+    assert comments == [] and transitions == []  # ya esta Done, no hace falta re-comentar/re-transicionar
+
+
+def test_check_already_completed_true_and_transitions_to_done_when_branch_merged(monkeypatch):
+    _fake_branch_list_merge_base_and_rev_parse(
+        monkeypatch, branch_list_stdout="  copilot/T-1-100\n", merged={"copilot/T-1-100"}, base_branch="main",
+    )
+    transitions = []
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+
+    result = orchestration._check_already_completed("T-1", {"ticket_id": "T-1", "status": "Code Review"}, "/repo")
+
+    assert result is True
+    assert transitions == [("T-1", orchestration.JIRA_DONE_STATUS)]
+    assert any("copilot/T-1-100" in text for _key, text in comments)
+
+
+def test_check_already_completed_false_when_nothing_indicates_completion(monkeypatch):
+    _fake_branch_list_merge_base_and_rev_parse(
+        monkeypatch, branch_list_stdout="  copilot/T-1-100\n", merged=set(), base_branch="main",
+    )
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: pytest.fail("no deberia transicionar"))
+
+    result = orchestration._check_already_completed("T-1", {"ticket_id": "T-1", "status": "In Progress"}, "/repo")
+
+    assert result is False
 
 
 def test_run_coding_agent_local_real_reuses_existing_open_branch(monkeypatch, tmp_path):

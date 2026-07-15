@@ -72,6 +72,10 @@ Una historia que toca un componente del que otro depende debería resolverse ant
 También señalá (sin bloquear -- esto es información, no un gate) si dos historias parecen pisarse: mismo \
 componente, cambios que suenan contradictorios, o alcance solapado.
 
+Si una historia trae info de sprint, es solo contexto informativo -- NUNCA la uses para excluir o bloquear \
+una historia del orden (una historia fuera del sprint activo puede seguir siendo parte real de esta corrida). \
+Usala solo si te ayuda a explicar coordination_notes (ej. "las historias del Sprint 12 se agrupan primero").
+
 No inventes relaciones que no puedas verificar con la tool -- si el grafo no tiene datos suficientes, \
 ordená por el criterio que tengas (ej. mantené el orden original) y decilo en coordination_notes en vez de \
 inventar una dependencia.
@@ -93,9 +97,17 @@ MCP_SERVERS = {
 }
 
 
+def _format_sprint_suffix(sprint: dict | None) -> str:
+    if not sprint or not sprint.get("name"):
+        return ""
+    state = f", {sprint['state']}" if sprint.get("state") else ""
+    return f" (sprint: {sprint['name']}{state})"
+
+
 def _build_user_prompt(epic: dict, children: list) -> str:
     children_text = "\n".join(
-        f"- {c.get('ticket_id')} ({c.get('repository_origen')}): {c.get('summary')}\n  {c.get('description')}"
+        f"- {c.get('ticket_id')} ({c.get('repository_origen')}){_format_sprint_suffix(c.get('sprint'))}: "
+        f"{c.get('summary')}\n  {c.get('description')}"
         for c in children
     )
     return f"""Épica {epic.get('key')}: {epic.get('summary')}
