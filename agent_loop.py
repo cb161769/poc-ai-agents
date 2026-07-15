@@ -591,6 +591,37 @@ def compact_old_tool_results(messages: list, read_only_tool_names: set, keep_las
                 block["content"] = _COMPACTED_TOOL_RESULT_TEMPLATE.format(tool_name=tool_name)
 
 
+# Gap real (usuario, "hay gaps en el context window"): nada en el pipeline
+# media cuanto pesa realmente la conversacion acumulada contra el limite
+# real del backend (OLLAMA_NUM_CTX para Ollama) -- total_input_tokens/
+# total_output_tokens se acumulan solo para costo, nunca se comparan contra
+# nada. Esto es una ESTIMACION honesta por caracteres (~4 caracteres/token,
+# heuristica conocida, NO un conteo exacto de tokens por backend real -- eso
+# requeriria un tokenizer distinto por modelo, desproporcionado para esto),
+# etiquetada como tal en el mensaje de warning. Nunca trunca nada -- solo
+# visibilidad donde hoy no habia ninguna.
+CONTEXT_SIZE_WARNING_CHARS = int(os.environ.get("CONTEXT_SIZE_WARNING_CHARS", str(OLLAMA_NUM_CTX * 4)))
+
+
+def _estimate_message_chars(messages: list) -> int:
+    return sum(len(str(m.get("content", ""))) for m in messages)
+
+
+def warn_if_context_large(messages: list, logger, label: str) -> None:
+    """Best-effort: loguea UN warning real (no trunca, no lanza) cuando el
+    historial acumulado de esta conversacion supera CONTEXT_SIZE_WARNING_CHARS
+    -- llamar despues de compact_old_tool_results() para medir lo que
+    efectivamente se va a reenviar en el proximo turno.
+    """
+    estimated_chars = _estimate_message_chars(messages)
+    if estimated_chars > CONTEXT_SIZE_WARNING_CHARS:
+        logger.warning(
+            f"{label}: el historial acumulado de esta conversacion es de ~{estimated_chars} caracteres "
+            f"(~{estimated_chars // 4} tokens estimados a 4 caracteres/token, umbral configurado "
+            f"{CONTEXT_SIZE_WARNING_CHARS} caracteres) -- riesgo real de truncamiento o rechazo del backend."
+        )
+
+
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: str = "agente") -> dict:
     """Best-effort: a server that's unreachable (uvx missing, Neo4j/Qdrant
     down) is skipped, not fatal — the caller just has fewer tools that run.

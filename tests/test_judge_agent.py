@@ -537,6 +537,47 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
     mock_get_issues.assert_called_once_with("AuthService")
 
 
+def test_judge_with_tools_compacts_old_tool_results(monkeypatch):
+    """Gap real (usuario, "hay gaps en el context window"): coding_agent.py
+    ya compacta resultados viejos de tools de solo lectura tras cada turno,
+    pero judge_with_tools() nunca lo hacia -- su propio loop de tools
+    (query_sonar/neo4j-cypher/qdrant-rag, todas de solo lectura) reenviaba
+    el historial completo turno tras turno. Este test confirma que ahora
+    compact_old_tool_results() se llama con el set de tools ofrecidas."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "query_sonar", "input": {"component": "AuthService"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "listo"}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    compact_calls = []
+    monkeypatch.setattr(judge_agent, "compact_old_tool_results", lambda messages, names: compact_calls.append(names))
+
+    with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
+        mock_get_issues.return_value = {"issues": []}
+        payload = {
+            "ticket": {"ticket_id": "T-1", "summary": "algo", "description": "desc", "repository_origen": "AuthService"},
+            "firewall": {"status": "APPROVED", "reason": None, "redactions_applied": 0},
+            "change_source": "local_diff", "change_description": "diff", "test_summary": "3 tests pasaron",
+        }
+        asyncio.run(judge_agent.judge_with_tools(payload))
+
+    assert compact_calls == [{"query_sonar"}]
+
+
 def test_judge_with_tools_nudges_once_on_self_contradictory_verdict_and_accepts_correction(monkeypatch):
     """Caso real (KAN-15): el 1er veredicto es FLAGGED con reasoning que
     dice "inofensivo" -- tiene que recibir el nudge de consistencia y, si

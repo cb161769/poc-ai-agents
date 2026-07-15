@@ -13,6 +13,7 @@ import pytest
 import agent_loop
 from agent_loop import (
     JSON_CORRECTION_MESSAGE,
+    _estimate_message_chars,
     _final_text_with_json_retry,
     _ollama_model_available,
     _ollama_response_to_blocks,
@@ -20,6 +21,7 @@ from agent_loop import (
     _text_as_fallback_tool_call,
     call_with_fallback,
     compact_old_tool_results,
+    warn_if_context_large,
 )
 
 
@@ -804,6 +806,34 @@ def test_compact_old_tool_results_noop_when_not_enough_turns_yet():
     compact_old_tool_results(messages, {"read_file"}, keep_last_n_turns=3)
 
     assert all("colapsado" not in c for c in _tool_result_contents(messages))
+
+
+def test_estimate_message_chars_sums_content_length():
+    messages = [{"role": "user", "content": "abcde"}, {"role": "assistant", "content": "1234567890"}]
+    assert _estimate_message_chars(messages) == 15
+
+
+def test_warn_if_context_large_logs_when_over_threshold(monkeypatch):
+    """Gap real (usuario, "hay gaps en el context window"): antes no habia
+    NINGUNA senal de que una conversacion se estuviera acercando al limite
+    real del backend -- esto agrega visibilidad (nunca trunca)."""
+    monkeypatch.setattr(agent_loop, "CONTEXT_SIZE_WARNING_CHARS", 10)
+    logger = MagicMock()
+
+    warn_if_context_large([{"role": "user", "content": "x" * 20}], logger, "juez")
+
+    logger.warning.assert_called_once()
+    assert "juez" in logger.warning.call_args[0][0]
+    assert "caracteres" in logger.warning.call_args[0][0]
+
+
+def test_warn_if_context_large_silent_when_under_threshold(monkeypatch):
+    monkeypatch.setattr(agent_loop, "CONTEXT_SIZE_WARNING_CHARS", 1000)
+    logger = MagicMock()
+
+    warn_if_context_large([{"role": "user", "content": "x" * 20}], logger, "juez")
+
+    logger.warning.assert_not_called()
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):

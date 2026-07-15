@@ -20,6 +20,7 @@ from orchestration import (
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
     _filter_active_children,
+    _query_component_risk_history,
     _resolve_pr_threads,
     _find_open_branch_for_ticket,
     _format_conflicts_section,
@@ -68,6 +69,72 @@ def test_filter_active_children_respects_custom_terminal_statuses():
 
     assert active == [{"ticket_id": "C-3", "status": "In Progress"}]
     assert {c["ticket_id"] for c in already_terminal} == {"C-1", "C-2"}
+
+
+def test_query_component_risk_history_combines_both_queries(monkeypatch):
+    """Gap real (usuario, "como Neo4j relaciona cada tema"): graph_writer.py
+    ya escribe Risk/Run/Epic/Story reales pero nadie los leia de vuelta --
+    confirma que el historial real de riesgos Y de tickets que tocaron el
+    componente llega combinado."""
+    def fake_run(cmd, **kwargs):
+        query = cmd[-1]
+        if "Risk" in query:
+            return "riesgo_documentado | veces\nscope-mismatch | 2\n"
+        return "ticket | resumen\nKAN-5 | Historia real\n"
+
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+
+    result = _query_component_risk_history("Frontend")
+
+    assert "Riesgos documentados" in result
+    assert "scope-mismatch | 2" in result
+    assert "Tickets que ya tocaron este componente" in result
+    assert "KAN-5" in result
+
+
+def test_query_component_risk_history_returns_empty_when_no_data(monkeypatch):
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "")
+
+    assert _query_component_risk_history("Frontend") == ""
+
+
+def test_query_component_risk_history_degrades_gracefully_on_failure(monkeypatch):
+    """Best-effort real: a diferencia de la query de dependencias existente
+    (retries=2, puede fallar la tarea), esta nunca debe tirar la corrida --
+    si una de las dos queries falla, la otra igual se devuelve."""
+    def fake_run(cmd, **kwargs):
+        query = cmd[-1]
+        if "Risk" in query:
+            raise RuntimeError("comando fallo (cypher-shell): conexion rechazada")
+        return "ticket | resumen\nKAN-5 | Historia real\n"
+
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+
+    result = _query_component_risk_history("Frontend")
+
+    assert "Riesgos documentados" not in result
+    assert "KAN-5" in result
+
+
+def test_query_graph_appends_risk_history_when_present(monkeypatch):
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "servicio | lenguaje\nAuthService | Java\n")
+    monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "Riesgos documentados:\nscope-mismatch | 1")
+
+    result = orchestration.query_graph.fn("Frontend")
+
+    assert "AuthService | Java" in result
+    assert "Historial real de riesgos/corridas para este componente" in result
+    assert "scope-mismatch | 1" in result
+
+
+def test_query_graph_omits_risk_history_section_when_empty(monkeypatch):
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "servicio | lenguaje\nAuthService | Java\n")
+    monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "")
+
+    result = orchestration.query_graph.fn("Frontend")
+
+    assert "AuthService | Java" in result
+    assert "Historial real de riesgos/corridas" not in result
 
 
 def test_resolve_single_repo_ok_when_all_agree():

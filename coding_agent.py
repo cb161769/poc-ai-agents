@@ -60,6 +60,7 @@ from agent_loop import (
     _select_backend,
     call_with_fallback,
     compact_old_tool_results,
+    warn_if_context_large,
 )
 from log_utils import get_logger
 
@@ -976,6 +977,7 @@ async def run_coding_agent(
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
                 messages.append({"role": "user", "content": tool_results})
                 compact_old_tool_results(messages, _READ_ONLY_TOOL_NAMES)
+                warn_if_context_large(messages, logger, "coding agent")
 
     return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
 

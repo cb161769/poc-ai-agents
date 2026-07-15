@@ -4,6 +4,8 @@ mocked -- same pattern already used in tests/test_judge_agent.py for the
 equivalent dual-backend agent loop.
 """
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -116,6 +118,47 @@ def test_plan_epic_uses_model_reorder(monkeypatch):
 
     assert result["ordered_children"] == ["JIRA-2", "JIRA-1"]
     assert result["coordination_notes"] == "JIRA-2 primero"
+
+
+def test_plan_epic_compacts_old_tool_results(monkeypatch):
+    """Gap real (usuario, "hay gaps en el context window"): el loop de
+    tools de epic_planner.py (solo neo4j-cypher, solo lectura) nunca
+    compactaba resultados viejos -- confirma que ahora se llama
+    compact_old_tool_results() con el set de tools ofrecidas."""
+    monkeypatch.setattr(epic_planner, "_select_backend", lambda: "anthropic")
+
+    fake_session = AsyncMock()
+    fake_session.list_tools.return_value = SimpleNamespace(tools=[])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {"neo4j-cypher": fake_session}
+
+    monkeypatch.setattr(epic_planner, "_connect_mcp_servers", fake_connect_mcp_servers)
+    monkeypatch.setattr(
+        epic_planner, "_normalize_tool_schema",
+        lambda name, tools: [{"name": "neo4j-cypher__query", "description": "d", "input_schema": {}}],
+    )
+    monkeypatch.setattr(epic_planner, "_call_mcp_tool", AsyncMock(return_value="resultado"))
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "neo4j-cypher__query", "input": {}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"ordered_children": ["JIRA-1", "JIRA-2"], "coordination_notes": "", "conflicts": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
+
+    compact_calls = []
+    monkeypatch.setattr(epic_planner, "compact_old_tool_results", lambda messages, names: compact_calls.append(names))
+
+    result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
+
+    assert compact_calls == [{"neo4j-cypher__query"}]
+    assert result["ordered_children"] == ["JIRA-1", "JIRA-2"]
 
 
 def test_plan_epic_falls_back_when_model_returns_invalid_json(monkeypatch):

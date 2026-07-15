@@ -67,6 +67,8 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
     _ollama_response_to_blocks,
     _select_backend,
     call_with_fallback,
+    compact_old_tool_results,
+    warn_if_context_large,
 )
 from firewall_proxy import _redact
 from log_utils import get_logger
@@ -540,6 +542,12 @@ async def judge_with_tools(payload: dict) -> dict:
             except Exception as exc:
                 logger.warning(f"juez: no se pudieron listar tools de '{name}': {exc}")
 
+        # Gap real (usuario, "hay gaps en el context window"): todas las
+        # tools que se le ofrecen al juez son de solo lectura (query_sonar,
+        # neo4j-cypher, qdrant-rag -- el juez nunca escribe nada), asi que
+        # compact_old_tool_results() puede compactar cualquiera de ellas.
+        read_only_tool_names = {t["name"] for t in tools}
+
         messages = [{"role": "user", "content": _build_user_prompt(payload)}]
 
         async with httpx.AsyncClient() as client:
@@ -667,6 +675,8 @@ async def judge_with_tools(payload: dict) -> dict:
                             {"type": "tool_result", "tool_use_id": block["id"], "content": str(output)}
                         )
                 messages.append({"role": "user", "content": tool_results})
+                compact_old_tool_results(messages, read_only_tool_names)
+                warn_if_context_large(messages, logger, "juez")
 
     raise RuntimeError("el juez agoto los turnos de herramientas sin dar un veredicto final")
 

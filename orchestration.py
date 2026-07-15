@@ -232,6 +232,44 @@ def check_log_evidence(ticket: dict):
         ).result()
 
 
+def _query_component_risk_history(component: str) -> str:
+    """Gap real (usuario, "como Neo4j relaciona cada tema"): graph_writer.py
+    ya escribe Story-[:PART_OF]->Epic, Epic|Story-[:AFFECTS]->Service,
+    Run-[:TOUCHED]->Service, Run-[:FOR_TICKET]->root, Risk-[:AFFECTS]->Service,
+    Risk-[:IDENTIFIED_IN]->Run -- evidencia real de que tickets/riesgos ya
+    tocaron cada componente -- pero nadie lo leia de vuelta: el unico read
+    path cableado al pipeline (la query de abajo) ignoraba todo eso. Esto
+    trae esa historia real de vuelta al prompt inicial de CADA corrida, sin
+    depender de que el modelo decida llamar la tool MCP por su cuenta.
+    Best-effort total: a diferencia de la query de dependencias (que tiene
+    retries=2 y puede fallar la tarea), esta nunca bloquea la corrida -- si
+    Neo4j no tiene estos datos o la query falla, devuelve "".
+    """
+    neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
+    neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
+    risks_query = (
+        f"MATCH (r:Risk)-[:AFFECTS]->(svc:Service {{name: '{component}'}}) "
+        "OPTIONAL MATCH (r)-[:IDENTIFIED_IN]->(run:Run) "
+        "RETURN r.policy_reference AS riesgo_documentado, count(run) AS veces"
+    )
+    tickets_query = (
+        f"MATCH (run:Run)-[:TOUCHED]->(svc:Service {{name: '{component}'}}) "
+        "MATCH (run)-[:FOR_TICKET]->(root) "
+        "RETURN DISTINCT root.key AS ticket, root.summary AS resumen"
+    )
+    parts = []
+    for label, query in (("Riesgos documentados", risks_query), ("Tickets que ya tocaron este componente", tickets_query)):
+        try:
+            output = _run(["cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass, "--format", "plain", query])
+        except RuntimeError as exc:
+            logger.warning(f"query_graph: no se pudo traer el historial real de riesgos/corridas para '{component}': {exc}")
+            continue
+        if output.strip():
+            parts.append(f"{label}:\n{output.strip()}")
+    return "\n\n".join(parts)
+
+
 @task(retries=2, retry_delay_seconds=10, name="query-graph")
 def query_graph(component: str) -> str:
     neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
@@ -241,7 +279,11 @@ def query_graph(component: str) -> str:
         f"MATCH (origin {{name: '{component}'}})<-[:DEPENDS_ON]-(dependent) "
         "RETURN dependent.name AS servicio, dependent.language AS lenguaje"
     )
-    return _run(["cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass, "--format", "plain", query])
+    result = _run(["cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass, "--format", "plain", query])
+    risk_history = _query_component_risk_history(component)
+    if risk_history:
+        result += f"\n\n--- Historial real de riesgos/corridas para este componente ---\n{risk_history}"
+    return result
 
 
 @task(retries=2, retry_delay_seconds=5, name="query-sonar")
