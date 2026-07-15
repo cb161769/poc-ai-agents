@@ -69,7 +69,7 @@ import epic_planner
 import graph_writer
 import jira_client
 import output_guard
-from tech_doc_agent import generate_technical_report
+from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
 from pipeline_shared import RETRYABLE_POLICY_REFERENCES
@@ -1817,7 +1817,25 @@ def _deliver(
     if _check_already_completed(ticket_id, jira_context, target_repo_dir, is_epic, child_ticket_keys):
         return {"firewall": firewall_result, "agent": None, "judge": None, "skipped": "already_completed"}
 
+    # Testing Agent liviano (evaluacion de un workflow multi-agente pedida
+    # por el usuario, aprobado en version reducida): un Test Plan real
+    # generado ANTES de implementar, a partir de evidencia real del ticket
+    # -- se postea en Jira Y se inyecta en el prompt del coding agent, para
+    # que la implementacion tenga casos concretos (especialmente negativos)
+    # a cubrir en vez de descubrirlos recien al final. Best-effort total:
+    # None (agente apagado, sin backend, rechazo del modelo) no cambia nada.
+    test_plan = generate_test_plan({
+        "ticket": ticket_id, "resumen": summary, "descripcion": jira_context.get("description", ""),
+    })
+    if test_plan:
+        _comment_all(f"🧪 Test Plan (Prefect):\n\n{test_plan}", ticket_id, is_epic, child_ticket_keys)
+
     sanitized = firewall_result["sanitized_prompt"]
+    if test_plan:
+        sanitized += (
+            f"\n\n--- Test Plan real generado antes de implementar ---\n{test_plan}\n"
+            "Implementa cubriendo estos casos, especialmente los negativos."
+        )
     _transition_all(JIRA_IN_PROGRESS_STATUS, ticket_id, is_epic, child_ticket_keys)
     falco_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     components = (jira_context.get("repository_origen") or "").split(",")
@@ -2166,7 +2184,20 @@ def _deliver_epic_sequential(
             continue
 
         transition_jira(JIRA_IN_PROGRESS_STATUS, ticket_key=child_id)
+
+        # Testing Agent liviano -- mismo criterio que _deliver(), por hijo.
+        test_plan = generate_test_plan({
+            "ticket": child_id, "resumen": child["summary"], "descripcion": child.get("description", ""),
+        })
+        if test_plan:
+            comment_jira(f"🧪 Test Plan (Prefect):\n\n{test_plan}", ticket_key=child_id)
+
         sanitized = firewall_result["sanitized_prompt"]
+        if test_plan:
+            sanitized += (
+                f"\n\n--- Test Plan real generado antes de implementar ---\n{test_plan}\n"
+                "Implementa cubriendo estos casos, especialmente los negativos."
+            )
         falco_since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         checkpoint = _run(["git", "-C", target_repo_dir, "rev-parse", "HEAD"]).strip() if branch else None

@@ -56,13 +56,82 @@ def test_generate_technical_report_returns_none_when_no_backend_available(monkey
     assert tech_doc_agent.generate_technical_report({"epica": "EPIC-1"}) is None
 
 
+def test_generate_test_plan_returns_none_when_disabled(monkeypatch):
+    monkeypatch.setattr(tech_doc_agent, "TEST_PLAN_ENABLED", False)
+
+    async def boom(*a, **k):
+        pytest.fail("no deberia llamar al backend si esta deshabilitado")
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", boom)
+
+    assert tech_doc_agent.generate_test_plan({"ticket": "T-1"}) is None
+
+
+def test_generate_test_plan_returns_text_prefixed_with_real_backend(monkeypatch):
+    """Testing Agent liviano (evaluacion del workflow multi-agente pedida por
+    el usuario): reusa la MISMA infraestructura de un solo llamado real a
+    LLM que ya usa generate_technical_report -- este test confirma que el
+    Test Plan real llega con el mismo envoltorio (backend real, sin relleno)."""
+    monkeypatch.setattr(tech_doc_agent, "TEST_PLAN_ENABLED", True)
+    captured = {}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, ollama_model=None):
+        captured["messages"] = messages
+        captured["system_prompt"] = system_prompt
+        return (
+            [{"type": "text", "text": "# Test Plan\n\n## Casos Negativos\n- entrada invalida"}],
+            "end_turn",
+            {},
+            "ollama",
+        )
+
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = tech_doc_agent.generate_test_plan({"ticket": "T-1", "resumen": "Agregar boton de login"})
+
+    assert result is not None
+    assert "backend 'ollama'" in result
+    assert "entrada invalida" in result
+    assert captured["system_prompt"] is tech_doc_agent._TEST_PLAN_SYSTEM_PROMPT
+    assert "T-1" in captured["messages"][0]["content"]
+
+
+def test_generate_test_plan_returns_none_when_backend_fails(monkeypatch):
+    monkeypatch.setattr(tech_doc_agent, "TEST_PLAN_ENABLED", True)
+
+    async def fake_call_with_fallback(*a, **k):
+        raise RuntimeError("ningun backend disponible")
+
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_call_with_fallback)
+
+    assert tech_doc_agent.generate_test_plan({"ticket": "T-1"}) is None
+
+
+def test_generate_test_plan_strips_filler_and_detects_refusal(monkeypatch):
+    """generate_test_plan reusa _strip_filler_sections/_looks_like_refusal
+    (no las duplica) -- confirma que un rechazo del modelo se trata como
+    None, no como contenido real."""
+    monkeypatch.setattr(tech_doc_agent, "TEST_PLAN_ENABLED", True)
+
+    async def fake_refusal(client, messages, tools, system_prompt, ollama_model=None):
+        return ([{"type": "text", "text": "Lo siento, pero no puedo generar ese contenido."}], "end_turn", {}, "ollama")
+
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_refusal)
+
+    assert tech_doc_agent.generate_test_plan({"ticket": "T-1"}) is None
+
+
+def test_test_plan_system_prompt_requires_at_least_one_negative_case():
+    assert "OBLIGATORIO al menos uno" in tech_doc_agent._TEST_PLAN_SYSTEM_PROMPT
+    assert "Casos Negativos NUNCA se omite" in tech_doc_agent._TEST_PLAN_SYSTEM_PROMPT
+
+
 def test_system_prompt_requires_omitting_sections_without_real_data():
     """Auditoria real (confirmado esta sesion en KAN-2/KAN-4): el prompt
     viejo pedia rellenar las 7 secciones SIEMPRE, lo que producia relleno
     generico ("no se proporciona informacion... no fue provista en los
     datos reales") en vez de omitir la seccion sin contenido real."""
-    assert "OMITILA POR COMPLETO" in tech_doc_agent._SYSTEM_PROMPT
-    assert "es mejor que uno completo con relleno" in tech_doc_agent._SYSTEM_PROMPT
+    assert "OMITILA POR COMPLETO" in tech_doc_agent._TECH_REPORT_SYSTEM_PROMPT
+    assert "es mejor que uno completo con relleno" in tech_doc_agent._TECH_REPORT_SYSTEM_PROMPT
 
 
 def test_strip_filler_sections_removes_real_boilerplate_observed_live():

@@ -1058,3 +1058,11 @@ def test_system_prompt_requires_new_test_for_new_user_facing_behavior():
         "sin sumar cobertura para lo nuevo NO cuenta como \"tests_adequate\": true"
         in ca.CODING_AGENT_SYSTEM_PROMPT
     )
+
+
+def test_system_prompt_requires_at_least_one_negative_test_case():
+    """Evaluacion del workflow multi-agente pedida por el usuario (Testing
+    Agent): el camino feliz solo no alcanza -- el test nuevo tiene que
+    incluir al menos un caso negativo/de error cuando el cambio lo amerite."""
+    assert "al menos UN caso negativo/de error" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "cubrir solo el camino feliz tampoco cuenta" in ca.CODING_AGENT_SYSTEM_PROMPT

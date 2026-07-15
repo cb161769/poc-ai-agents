@@ -271,10 +271,12 @@ que modificaste, no cuenta como verificacion real del cambio.
 Si tu cambio agrega comportamiento nuevo visible para el usuario o el sistema (una pagina, un endpoint, una \
 funcion, una validacion) que los tests EXISTENTES no cubren, agrega vos mismo un test nuevo (unitario o \
 E2E, el que corresponda al stack real del sub-proyecto) que lo verifique -- correr solo la suite existente \
-sin sumar cobertura para lo nuevo NO cuenta como "tests_adequate": true, aunque esa suite pase entera. Si \
-genuinamente no hay forma de agregar un test (herramienta no disponible, cambio no testeable en este \
-contexto), explicalo en el summary y marca "tests_adequate": false con honestidad -- no te declares "done" \
-dandole al ticket por resuelto sin dejar constancia explicita de ese gap.
+sin sumar cobertura para lo nuevo NO cuenta como "tests_adequate": true, aunque esa suite pase entera. Ese \
+test nuevo tiene que incluir al menos UN caso negativo/de error (entrada invalida, recurso inexistente, \
+permiso denegado, lo que corresponda al cambio real) cuando el cambio lo amerite -- cubrir solo el camino \
+feliz tampoco cuenta como "tests_adequate": true. Si genuinamente no hay forma de agregar un test (herramienta \
+no disponible, cambio no testeable en este contexto), explicalo en el summary y marca "tests_adequate": false \
+con honestidad -- no te declares "done" dandole al ticket por resuelto sin dejar constancia explicita de ese gap.
 
 Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
 objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \

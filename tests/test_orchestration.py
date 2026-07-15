@@ -576,6 +576,89 @@ def test_deliver_comments_real_test_output_when_tests_pass(monkeypatch):
     assert any("PASARON" in text and "7 passed in 1.2s" in text for text in comments)
 
 
+def test_deliver_injects_test_plan_into_coding_agent_prompt_and_comments_it(monkeypatch):
+    """Testing Agent liviano (evaluacion del workflow multi-agente pedida por
+    el usuario, version reducida aprobada): un Test Plan real generado ANTES
+    de implementar se postea en Jira Y se inyecta en el prompt que recibe el
+    coding agent."""
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "generate_test_plan",
+        lambda evidence: "## Casos Negativos\n- entrada invalida" if evidence["ticket"] == "T-1" else None,
+    )
+
+    captured_prompts = []
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        captured_prompts.append(sanitized)
+        return {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        }
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(text))
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt original", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert any("Test Plan" in text and "entrada invalida" in text for text in comments)
+    assert len(captured_prompts) == 1
+    assert "prompt original" in captured_prompts[0]
+    assert "entrada invalida" in captured_prompts[0]
+    assert "especialmente los negativos" in captured_prompts[0]
+
+
+def test_deliver_does_not_touch_prompt_when_test_plan_generation_returns_none(monkeypatch):
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_test_plan", lambda *a, **k: None)
+
+    captured_prompts = []
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        captured_prompts.append(sanitized)
+        return {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        }
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt original", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert captured_prompts == ["prompt original"]
+
+
 def test_deliver_includes_salida_tests_in_technical_report(monkeypatch):
     monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
     monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
@@ -1153,6 +1236,60 @@ def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_chi
     assert any("PASARON" in text and "4 passed" in text for _key, text in comments if _key == "C-1")
     ok_reports = [ev for ev in report_calls if ev.get("resultado", "").startswith("OK")]
     assert ok_reports and ok_reports[0]["salida_tests"] == "==== 4 passed ===="
+
+
+def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
+    """Testing Agent liviano en modo epica: cada hijo recibe su PROPIO Test
+    Plan real, inyectado en el prompt/feedback que se le pasa al coding
+    agent para esa historia puntual."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    comments = []
+    captured_prompts = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "generate_test_plan",
+        lambda evidence: f"## Casos Negativos\n- caso negativo de {evidence['ticket']}",
+    )
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        captured_prompts.append(("first", sanitized))
+        return {
+            "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
+            "backend": "anthropic", "conversation_file": "/tmp/conv1.json", "self_review": {},
+        }
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        captured_prompts.append(("retry", feedback_text))
+        return {"applied": True, "backend": "anthropic", "self_review": {}, "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc epica"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert captured_prompts[0] == ("first", "prompt saneado\n\n--- Test Plan real generado antes de implementar ---\n## Casos Negativos\n- caso negativo de C-1\nImplementa cubriendo estos casos, especialmente los negativos.")
+    assert "caso negativo de C-2" in captured_prompts[1][1]
+    assert any("Test Plan" in text and "caso negativo de C-1" in text for key, text in comments if key == "C-1")
+    assert any("Test Plan" in text and "caso negativo de C-2" in text for key, text in comments if key == "C-2")
 
 
 def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monkeypatch):

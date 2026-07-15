@@ -25,11 +25,15 @@ logger = logging.getLogger("tech_doc_agent")
 # si el usuario no lo quiere (ej. corridas de humo repetidas sin necesidad
 # de un comprobante por cada una).
 TECH_DOC_ENABLED = os.environ.get("TECH_DOC_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+# Mismo criterio, para el Test Plan real generado ANTES de que el coding
+# agent implemente (ver generate_test_plan) -- apagable independientemente
+# del comprobante tecnico de despues.
+TEST_PLAN_ENABLED = os.environ.get("TEST_PLAN_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 # Mismo criterio que CODING_AGENT_OLLAMA_MODEL/JUDGE_OLLAMA_MODEL: override
 # opcional por agente, cae al OLLAMA_MODEL generico si no se setea.
 TECH_DOC_OLLAMA_MODEL = os.environ.get("TECH_DOC_OLLAMA_MODEL") or OLLAMA_MODEL
 
-_SYSTEM_PROMPT = (
+_TECH_REPORT_SYSTEM_PROMPT = (
     "Actua como un Ingeniero de Software Principal y Arquitecto de Soluciones Senior. "
     "Vas a generar un Comprobante de Desarrollo Tecnico detallado, riguroso y listo para "
     "auditoria sobre una corrida real de un pipeline de agentes de IA que usa un backend "
@@ -52,6 +56,31 @@ _SYSTEM_PROMPT = (
     "cada afirmacion tiene que estar respaldada por un dato concreto de la evidencia real -- "
     "si falta un dato puntual DENTRO de una seccion que si tiene otro contenido real, "
     "omiti esa frase puntual en vez de rellenarla."
+)
+
+# Testing Agent liviano: en vez de un agente nuevo con tools/subprocess
+# propio, reusa la MISMA infraestructura de un solo llamado real a LLM ya
+# construida arriba -- genera un Test Plan real ANTES de que el coding
+# agent implemente, a partir de la evidencia real del ticket (nunca
+# inventando stack/infra que no se le dio). Mismo criterio de "omiti la
+# seccion sin datos reales" que _TECH_REPORT_SYSTEM_PROMPT.
+_TEST_PLAN_SYSTEM_PROMPT = (
+    "Actua como un Ingeniero de QA Senior. Vas a generar un Test Plan real para un ticket real "
+    "de Jira, ANTES de que se implemente -- para que el equipo (humano o un coding agent de IA) "
+    "sepa que casos tiene que cubrir. Usa EXCLUSIVAMENTE la evidencia real que se te da a "
+    "continuacion (resumen, descripcion, criterios de aceptacion si los tiene) -- no inventes "
+    "stack tecnico, infraestructura, ni entornos que no esten en los datos provistos; si el "
+    "ticket no da pie a un tipo de caso, no lo inventes. Responde en español, en Markdown, con "
+    "esta estructura de secciones (en este orden si aplican): 1. Casos Funcionales. 2. Casos "
+    "Negativos (OBLIGATORIO al menos uno -- si el ticket no menciona un caso negativo explicito, "
+    "proponé igual el caso negativo mas obvio del dominio del ticket, ej. entrada invalida, "
+    "recurso inexistente, permiso denegado -- nunca dejes esta seccion vacia). 3. Casos Borde. "
+    "4. Candidatos a Automatizar.\n\n"
+    "Mismo criterio que cualquier comprobante real: si para una seccion NO hay ningun dato real "
+    "relacionado en la evidencia (aplica solo a Casos Funcionales/Borde/Candidatos a Automatizar, "
+    "Casos Negativos NUNCA se omite), OMITILA POR COMPLETO -- no escribas su titulo ni una frase "
+    "tipo 'no disponible'. Un test plan mas corto con solo secciones reales es mejor que uno "
+    "completo con relleno."
 )
 
 
@@ -136,41 +165,59 @@ def _looks_like_refusal(text: str) -> bool:
     return bool(_REFUSAL_PATTERN.match(text.strip()))
 
 
-async def _generate_async(evidence: dict) -> str | None:
+async def _generate_async(evidence: dict, system_prompt: str, label: str) -> str | None:
     async with httpx.AsyncClient() as client:
         try:
             blocks, _stop_reason, _usage, backend_used = await call_with_fallback(
                 client,
                 messages=[{"role": "user", "content": _format_evidence(evidence)}],
                 tools=[],
-                system_prompt=_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 ollama_model=TECH_DOC_OLLAMA_MODEL,
             )
         except Exception as exc:
-            logger.warning(f"tech_doc_agent: no se pudo generar el comprobante tecnico: {exc}")
+            logger.warning(f"tech_doc_agent: no se pudo generar el {label}: {exc}")
             return None
 
     text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
     if not text:
         return None
     if _looks_like_refusal(text):
-        logger.warning(f"tech_doc_agent: el modelo se nego a generar el comprobante (falso positivo de seguridad): {text[:200]!r}")
+        logger.warning(f"tech_doc_agent: el modelo se nego a generar el {label} (falso positivo de seguridad): {text[:200]!r}")
         return None
     text = _strip_filler_sections(text)
-    return f"_(Comprobante tecnico generado por el backend '{backend_used}', modelo real -- no redactado a mano)_\n\n{text}"
+    return f"_(Generado por el backend '{backend_used}', modelo real -- no redactado a mano)_\n\n{text}"
+
+
+def _generate(evidence: dict, system_prompt: str, label: str) -> str | None:
+    """Sincrono para llamarse directo desde una @task de Prefect (que ya
+    corre dentro de su propio flujo sync). Devuelve None (nunca levanta) si
+    la generacion falla por cualquier motivo -- es una mejora de
+    documentacion, no una parte critica de la corrida.
+    """
+    try:
+        return asyncio.run(_generate_async(evidence, system_prompt, label))
+    except Exception as exc:
+        logger.warning(f"tech_doc_agent: fallo inesperado generando el {label}: {exc}")
+        return None
 
 
 def generate_technical_report(evidence: dict) -> str | None:
-    """Sincrono para llamarse directo desde una @task de Prefect (que ya
-    corre dentro de su propio flujo sync). Devuelve None (nunca levanta) si
-    TECH_DOC_ENABLED esta apagado, no hay backend disponible, o la
-    generacion falla por cualquier motivo -- es una mejora de
-    documentacion, no una parte critica de la corrida.
-    """
+    """Comprobante de desarrollo tecnico -- generado DESPUES de una corrida
+    real, a partir de su evidencia real. None si TECH_DOC_ENABLED esta
+    apagado o la generacion falla."""
     if not TECH_DOC_ENABLED:
         return None
-    try:
-        return asyncio.run(_generate_async(evidence))
-    except Exception as exc:
-        logger.warning(f"tech_doc_agent: fallo inesperado generando el comprobante: {exc}")
+    return _generate(evidence, _TECH_REPORT_SYSTEM_PROMPT, "comprobante tecnico")
+
+
+def generate_test_plan(evidence: dict) -> str | None:
+    """Testing Agent liviano: Test Plan real generado ANTES de que el
+    coding agent implemente, a partir de la evidencia real del ticket
+    (resumen/descripcion/criterios) -- se postea en Jira Y se inyecta en el
+    prompt del coding agent (ver orchestration.py). None si
+    TEST_PLAN_ENABLED esta apagado o la generacion falla -- nunca bloquea
+    la corrida."""
+    if not TEST_PLAN_ENABLED:
         return None
+    return _generate(evidence, _TEST_PLAN_SYSTEM_PROMPT, "test plan")
