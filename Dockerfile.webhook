@@ -1,0 +1,28 @@
+# Servicio real y liviano que escucha el service hook de Azure DevOps y
+# re-dispara orchestration.py -- ver pr_webhook.py para el diseño completo.
+#
+# Necesita el CLI de docker (no un daemon propio) para lanzar el mismo
+# "docker run" Docker-outside-of-Docker que se usa manualmente en el resto
+# de este proyecto: habla con el daemon REAL del host via el socket
+# montado en runtime (-v /var/run/docker.sock:/var/run/docker.sock), igual
+# que Dockerfile.testrunner -- docker-cli, NO docker.io (ese solo trae el
+# daemon via Depends, el binario /usr/bin/docker real es un paquete
+# separado que --no-install-recommends se salteaba).
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl docker-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY pr_webhook.py secrets_provider.py log_utils.py ./
+
+RUN mkdir -p /app/logs
+
+EXPOSE 8090
+
+CMD ["uvicorn", "pr_webhook:app", "--host", "0.0.0.0", "--port", "8090"]

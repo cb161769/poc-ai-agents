@@ -630,7 +630,7 @@
     </div>
     <div class="item">
       <div class="h">Qué hace de nuevo Copilot</div>
-      <div class="v">Con un repositorio real conectado, el trabajo se le asigna al Copilot coding agent, que lo resuelve de forma autónoma en la nube y abre un pull request — no una sugerencia puntual dentro del editor.</div>
+      <div class="v">Con un repositorio real conectado, el trabajo se le asigna al Copilot coding agent, que lo resuelve de forma autónoma en la nube y abre un pull request real — no una sugerencia puntual dentro del editor. Y no termina ahí: si alguien deja un comentario de revisión en esa PR, el propio flujo se lo pasa como feedback y sigue trabajando la misma rama, sin que nadie tenga que volver a arrancar nada a mano.</div>
     </div>
     <div class="item">
       <div class="h">Cómo se controla el riesgo de entrada</div>
@@ -821,6 +821,14 @@
           <div class="flow-role">antes de confiar</div>
           <div class="flow-title">Se valida y se audita</div>
           <div class="flow-desc">Corren los tests reales del componente en un entorno descartable, y un segundo revisor independiente audita la decisión completa. Si algo falla, se bloquea ahí — recién entonces queda comentado en el ticket.</div>
+        </div>
+      </div>
+      <div class="flow-connector"></div>
+      <div class="flow-node">
+        <div class="flow-card" style="--node-color:#1f7a54">
+          <div class="flow-role">cierre del ciclo</div>
+          <div class="flow-title">Revisión humana en la PR</div>
+          <div class="flow-desc">La pull request queda abierta de verdad, no como una sugerencia suelta. Si alguien deja un comentario de revisión ahí, un webhook se lo pasa a Copilot como feedback sobre la misma rama y marca el comentario como resuelto cuando lo atiende — sin que nadie vuelva a disparar nada a mano.</div>
         </div>
       </div>
     </div>

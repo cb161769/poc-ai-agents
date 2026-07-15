@@ -275,6 +275,32 @@ services:
     networks:
       - poc-net
 
+  pr-webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
+    container_name: poc-pr-webhook
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    env_file:
+      - .env
+    environment:
+      # Paths reales del HOST (no de este contenedor) -- Docker-outside-of-
+      # Docker: el daemon que recibe "docker run" via el socket montado es
+      # el del HOST, asi que estos mounts tienen que ser paths que el host
+      # pueda resolver, no paths internos de este contenedor. Ajustar a tu
+      # entorno real antes de conectar el service hook (ver pr_webhook.py).
+      WEBHOOK_REPO_ROOT: "${WEBHOOK_REPO_ROOT:-}"
+      WEBHOOK_ENV_FILE: "${WEBHOOK_ENV_FILE:-}"
+      WEBHOOK_TARGET_REPO_DIR: "${WEBHOOK_TARGET_REPO_DIR:-}"
+    command: ["uvicorn", "pr_webhook:app", "--host", "0.0.0.0", "--port", "8090"]
+    networks:
+      - poc-net
+
 networks:
   poc-net:
     driver: bridge

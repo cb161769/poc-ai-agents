@@ -1449,6 +1449,43 @@ def _evaluate_new_diff_after_retry(
     )
 
 
+INADEQUATE_TESTS_FEEDBACK = (
+    "Tu propia autocritica (self_review.tests_adequate) al terminar el intento anterior "
+    "fue 'false' -- vos mismo marcaste que lo que corriste no cubre genuinamente este "
+    "cambio. Antes de terminar de nuevo, agregá un test real (unitario o E2E, el que "
+    "corresponda al stack real del sub-proyecto que tocaste) que cubra el comportamiento "
+    "nuevo que introdujiste -- correr solo la suite existente sin sumar cobertura no "
+    "alcanza, aunque esa suite pase entera."
+)
+
+
+def _retry_for_inadequate_tests(ticket_id: str, target_repo_dir: str, agent_result: dict) -> dict:
+    """Confirmado real (KAN-15, KAN-5): el coding agent se autoevalua con
+    honestidad (self_review.tests_adequate=False) pero termina igual con
+    status "done" sin agregar ningun test nuevo -- y el juez, en corridas
+    reales, repetidas veces lo paso por alto ("tests_adequate era false
+    pero la funcionalidad igual sirve", visto en vivo en KAN-5). En vez de
+    confiar solo en que el juez lo note, se le da al coding agent un turno
+    mas, real, ANTES de correr tests/juez -- mismo mecanismo de
+    retry_coding_agent_local_real ya usado para el feedback de PR/juez. Si
+    el reintento no aplica nada nuevo, se sigue con el agent_result
+    original (nunca bloquea la corrida solo por esto).
+    """
+    retried = retry_coding_agent_local_real(
+        ticket_id, INADEQUATE_TESTS_FEEDBACK, target_repo_dir, conversation_file=agent_result.get("conversation_file")
+    )
+    if not retried.get("applied"):
+        return agent_result
+    # retry_coding_agent_local_real() no devuelve "branch"/"base_branch"
+    # (reusa la rama que el primer intento ya dejo checked out, nunca crea
+    # una nueva) -- hay que preservarlos del agent_result original o el
+    # resto de _deliver/_deliver_epic_sequential pierde la referencia a la
+    # rama real donde esta el commit nuevo.
+    merged = dict(agent_result)
+    merged.update(retried)
+    return merged
+
+
 def _retry_local_diff(
     ticket_id: str,
     sanitized: str,
@@ -1669,6 +1706,15 @@ def _deliver(
         backend = agent_result.get("backend")
 
         if agent_result["applied"]:
+            if (agent_result.get("self_review") or {}).get("tests_adequate") is False:
+                _comment_all(
+                    "🧪 El coding agent se autoevaluo con tests_adequate=false -- dandole un turno mas "
+                    "para agregar un test real antes de correr el testing agent.",
+                    ticket_id, is_epic, child_ticket_keys,
+                )
+                agent_result = _retry_for_inadequate_tests(ticket_id, target_repo_dir, agent_result)
+                backend = agent_result.get("backend") or backend
+
             resumed_note = ""
             if agent_result.get("resumed_branch"):
                 resumed_note = " (retoma una rama existente de una corrida anterior de este ticket, no empieza de cero)"
@@ -1976,6 +2022,15 @@ def _deliver_epic_sequential(
             _post_child_technical_report(epic_key, child_id, backend, "no-op -- el agente no aplico ningun cambio")
             completed.append({"ticket_id": child_id, "outcome": "no-op"})
             continue
+
+        if (agent_result.get("self_review") or {}).get("tests_adequate") is False:
+            comment_jira(
+                f"🧪 El coding agent se autoevaluo con tests_adequate=false en {child_id} -- dandole un turno "
+                "mas para agregar un test real antes de correr el testing agent.",
+                ticket_key=child_id,
+            )
+            agent_result = _retry_for_inadequate_tests(epic_key, target_repo_dir, agent_result)
+            backend = agent_result.get("backend") or backend
 
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])

@@ -331,8 +331,8 @@
     <p class="lede">Esta PoC no prueba que un LLM puede escribir código — eso ya está probado. Prueba <strong>qué hace falta</strong> para que lo haga con supervisión real, evidencia real y poder de veto real: contra Jira, Neo4j, SonarQube, GitHub y dos backends de modelo reales. Cero mocks en la lógica de negocio propia.</p>
 
     <div class="stat-row">
-      <div class="stat"><div class="num">9</div><div class="lbl">Servicios reales integrados</div></div>
-      <div class="stat"><div class="num">239</div><div class="lbl">Tests pasando</div></div>
+      <div class="stat"><div class="num">10</div><div class="lbl">Servicios reales integrados</div></div>
+      <div class="stat"><div class="num">419</div><div class="lbl">Tests pasando</div></div>
       <div class="stat"><div class="num">3</div><div class="lbl">Caminos de coding agent</div></div>
       <div class="stat"><div class="num">2</div><div class="lbl">Puntos de bloqueo humano real</div></div>
     </div>
@@ -412,7 +412,14 @@
         <div class="chain-num">07</div>
         <div class="chain-body">
           <div class="chain-title">Veredicto ejecutado</div>
-          <div class="chain-desc"><b>OK</b> → push real + PR + ticket a revisión. <b>FLAGGED</b> → bloqueo, comentario, rama marcada — nunca se mergea sola. Toda la corrida queda escrita como evidencia en el grafo de conocimiento.</div>
+          <div class="chain-desc"><b>OK</b> → push real + PR real (abierta vía la REST API de Azure DevOps, no "pusheá a mano") + ticket a revisión. <b>FLAGGED</b> → bloqueo, comentario, rama marcada — nunca se mergea sola. Toda la corrida queda escrita como evidencia en el grafo de conocimiento.</div>
+        </div>
+      </div>
+      <div class="chain-stage">
+        <div class="chain-num">08</div>
+        <div class="chain-body">
+          <div class="chain-title">Ciclo cerrado con revisión humana real</div>
+          <div class="chain-desc">La PR abierta no es el final: un webhook entrante escucha los comentarios de revisión reales que un humano deja ahí, se los pasa al coding agent como feedback en la MISMA rama, y marca el thread como resuelto cuando aplica la corrección — sin que nadie tenga que volver a lanzar nada a mano.</div>
         </div>
       </div>
     </div>
@@ -452,6 +459,9 @@
       <div class="proof-row"><span class="desc">Mismatch de nombre de vector entre el indexador propio y el MCP de Qdrant</span><span class="fixed">Resuelto</span></div>
       <div class="proof-row"><span class="desc">SonarQube mal configurado (base de datos embebida rota) — nunca llegaba a arrancar</span><span class="fixed">Resuelto</span></div>
       <div class="proof-row"><span class="desc"><code>.env</code> con valores sin comillas que rompían el arranque de bash silenciosamente</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">El propio modelo local podía comitear por su cuenta vía shell — el chequeo original solo miraba el working tree y borraba la rama con el commit real adentro, creyendo que "no aplicó nada"</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">CRLF introducido por Windows renormalizaba archivos ya trackeados y rompía el chequeo de árbol limpio en cada corrida real dentro de un contenedor Linux</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">El cuerpo de la PR real volcaba el pedido original completo de la épica (miles de caracteres) en vez de describir el cambio real de esa rama</span><span class="fixed">Resuelto</span></div>
     </div>
   </section>
 
