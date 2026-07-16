@@ -5,10 +5,11 @@ equivalent dual-backend agent loop.
 """
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import agent_loop
 import epic_planner
 from epic_planner import _build_user_prompt, _extract_json, _fallback_result, _format_sprint_suffix, _validate_result, plan_epic
 
@@ -173,7 +174,75 @@ def test_plan_epic_falls_back_when_model_returns_invalid_json(monkeypatch):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt):
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(epic_planner, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
+
+    assert result["ordered_children"] == ["JIRA-1", "JIRA-2"]
+
+
+def _mock_ollama_tags(monkeypatch, model_names):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": n} for n in model_names]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+
+def test_plan_epic_switches_ollama_model_when_json_invalid_persists(monkeypatch):
+    """Con 2 candidatos configurados y backend ollama: un JSON invalido que
+    persiste tras el reintento de correccion prueba con el segundo modelo
+    de la lista antes de caer al orden mecanico.
+    """
+    monkeypatch.setattr(epic_planner, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(epic_planner, "EPIC_PLANNER_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(epic_planner, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"ordered_children": ["JIRA-2", "JIRA-1"], "coordination_notes": "con el segundo modelo", "conflicts": []}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(epic_planner, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
+
+    assert result["ordered_children"] == ["JIRA-2", "JIRA-1"]
+    assert result["coordination_notes"] == "con el segundo modelo"
+
+
+def test_plan_epic_still_falls_back_when_only_one_ollama_candidate(monkeypatch):
+    """Con un solo candidato, el comportamiento tiene que seguir siendo
+    identico: sin otro modelo al que cambiar, cae al orden mecanico como
+    siempre.
+    """
+    monkeypatch.setattr(epic_planner, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(epic_planner, "EPIC_PLANNER_OLLAMA_MODELS", ["modelo-a"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(epic_planner, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
 
     monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)

@@ -56,10 +56,12 @@ from agent_loop import (
     _estimate_cost_usd,
     _final_text_with_json_retry,
     _normalize_tool_schema,
-    _ollama_model_available,
     _select_backend,
     call_with_fallback,
     compact_old_tool_results,
+    init_ollama_model_state,
+    maybe_switch_ollama_model,
+    parse_ollama_model_candidates,
     warn_if_context_large,
 )
 from log_utils import get_logger
@@ -73,11 +75,13 @@ RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
 
 MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "15"))
 
-# Modelo Ollama propio para este agente -- escribir codigo/usar tools
+# Modelo(s) Ollama propios para este agente -- escribir codigo/usar tools
 # correctamente es mas exigente que solo evaluar texto (judge_agent.py), asi
 # que puede valer la pena un modelo mas fuerte aca (ej. qwen2.5-coder:7b) sin
-# afectar al juez. Cae al generico OLLAMA_MODEL si no se setea.
-CODING_AGENT_OLLAMA_MODEL = os.environ.get("CODING_AGENT_OLLAMA_MODEL", OLLAMA_MODEL)
+# afectar al juez. Coma-separado = lista de candidatos por prioridad (ver
+# parse_ollama_model_candidates); un solo valor (o sin setear, cae al
+# generico OLLAMA_MODEL) se comporta igual que antes de esto.
+CODING_AGENT_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("CODING_AGENT_OLLAMA_MODEL", ""), OLLAMA_MODEL)
 
 # Limites defensivos de las tools locales: un archivo/salida/listado gigante
 # no debe reventar el contexto del modelo ni colgar el loop. _MAX_READ_BYTES
@@ -858,11 +862,15 @@ async def run_coding_agent(
     logger.info(f"coding agent: usando backend '{backend}'")
     if backend == "none":
         return {"status": "blocked", "summary": "ni ANTHROPIC_API_KEY ni Ollama disponibles", "files_changed": [], "_meta": {}}
-    if backend == "ollama" and not _ollama_model_available(CODING_AGENT_OLLAMA_MODEL):
-        logger.warning(
-            f"coding agent: el modelo '{CODING_AGENT_OLLAMA_MODEL}' no aparece en 'ollama list' -- "
-            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
-        )
+    # El probe real (GET /api/tags) solo tiene sentido si el backend elegido
+    # es Ollama -- con Anthropic como backend inicial, ollama_model_state
+    # igual se arma (call_with_fallback puede caer a Ollama EN VIVO durante
+    # el loop si Anthropic falla a mitad de corrida) pero sin gastar una
+    # llamada de red de arranque que no aporta nada en el caso comun.
+    if backend == "ollama":
+        ollama_model_state = init_ollama_model_state(CODING_AGENT_OLLAMA_MODELS, logger, "coding agent")
+    else:
+        ollama_model_state = {"active": CODING_AGENT_OLLAMA_MODELS[0], "tried": set(), "switch_used": False}
 
     start_time = time.monotonic()
     total_input_tokens = 0
@@ -927,7 +935,7 @@ async def run_coding_agent(
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
                     client, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
-                    ollama_model=CODING_AGENT_OLLAMA_MODEL, force_json=True,
+                    ollama_model=ollama_model_state["active"], force_json=True,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
@@ -935,6 +943,16 @@ async def run_coding_agent(
 
                 if stop_reason != "tool_use":
                     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
+
+                    if (
+                        tool_call_nudge_given
+                        and _TOOL_CALL_REFUSAL_PATTERN.search(final_text)
+                        and maybe_switch_ollama_model(
+                            ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                            "coding agent", "se nego a llamar la tool incluso tras el nudge",
+                        )
+                    ):
+                        continue
 
                     if not tool_call_nudge_given and _TOOL_CALL_REFUSAL_PATTERN.search(final_text):
                         # El modelo anuncio una negativa a llamar la tool en
@@ -969,7 +987,7 @@ async def run_coding_agent(
                         # Un solo reintento acotado antes de degradar a blocked.
                         retry_text, retry_usage = await _final_text_with_json_retry(
                             client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
-                            ollama_model=CODING_AGENT_OLLAMA_MODEL,
+                            ollama_model=ollama_model_state["active"],
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)
@@ -978,6 +996,11 @@ async def run_coding_agent(
                             if result.get("status") not in ("done", "blocked"):
                                 raise json.JSONDecodeError("falta 'status' valido en el JSON", retry_text, 0)
                         except json.JSONDecodeError:
+                            if maybe_switch_ollama_model(
+                                ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                                "coding agent", "JSON invalido incluso tras el reintento de correccion",
+                            ):
+                                continue
                             return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
 
                     if result.get("status") == "done" and not has_run_verification and not verification_nudge_given:

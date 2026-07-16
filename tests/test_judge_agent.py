@@ -3,10 +3,11 @@ model's reply, the Anthropic<->Ollama message-shape adapters, and the cost
 estimator. No network, no MCP servers, no model calls involved.
 """
 import asyncio
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent_loop
 import judge_agent
 from judge_agent import (
     JUDGE_CONSISTENCY_NUDGE_MESSAGE,
@@ -833,3 +834,133 @@ def test_judge_with_tools_raises_when_retry_also_lacks_valid_verdict(monkeypatch
 
     with pytest.raises(RuntimeError, match="verdict"):
         asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+
+def _mock_ollama_tags(monkeypatch, model_names):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": n} for n in model_names]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+
+def test_judge_with_tools_switches_ollama_model_when_retry_also_lacks_valid_verdict(monkeypatch):
+    """Con 2 candidatos configurados y backend ollama: si el reintento de
+    JSON tampoco trae un 'verdict' valido, antes de levantar RuntimeError
+    prueba con el segundo modelo de la lista.
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(judge_agent, "JUDGE_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"verdict": "OK", "reasoning": "listo con el segundo modelo"}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        content = [{"type": "text", "text": '{"status": "ok"}'}]  # sin "verdict"
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert result["verdict"] == "OK"
+    assert result["reasoning"] == "listo con el segundo modelo"
+
+
+def test_judge_with_tools_raises_when_only_one_ollama_candidate_and_retry_lacks_verdict(monkeypatch):
+    """Con un solo candidato (el caso de hoy), el comportamiento tiene que
+    seguir siendo identico: sin otro modelo al que cambiar, sigue
+    levantando RuntimeError como siempre.
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(judge_agent, "JUDGE_OLLAMA_MODELS", ["modelo-a"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"status": "ok"}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    with pytest.raises(RuntimeError, match="verdict"):
+        asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+
+def test_judge_with_tools_switches_ollama_model_when_verdict_still_contradictory_after_nudge(monkeypatch):
+    """Con 2 candidatos y backend ollama: si el veredicto SIGUE
+    auto-contradictorio incluso despues del nudge de consistencia (el
+    empujon ya se gasto), antes de aceptarlo igual prueba con el segundo
+    modelo de la lista.
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(judge_agent, "JUDGE_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    contradictory_text = (
+        '{"verdict": "FLAGGED", "firewall_assessment": "ok", '
+        '"change_assessment": "OK", "reasoning": "el cambio es inofensivo desde una perspectiva de seguridad."}'
+    )
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"verdict": "OK", "reasoning": "corregido con el segundo modelo"}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert result["verdict"] == "OK"
+    assert result["reasoning"] == "corregido con el segundo modelo"
+
+
+def test_judge_with_tools_still_accepts_verdict_when_only_one_ollama_candidate(monkeypatch):
+    """Con un solo candidato, el veredicto que sigue contradictorio tras el
+    nudge se sigue aceptando igual que antes (sin otro modelo, no hay
+    cambio posible).
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(judge_agent, "JUDGE_OLLAMA_MODELS", ["modelo-a"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    contradictory_text = (
+        '{"verdict": "FLAGGED", "firewall_assessment": "ok", '
+        '"change_assessment": "OK", "reasoning": "el cambio es inofensivo desde una perspectiva de seguridad."}'
+    )
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert result["verdict"] == "FLAGGED"

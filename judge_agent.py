@@ -63,11 +63,13 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
     _final_text_with_json_retry,
     _messages_to_ollama,
     _normalize_tool_schema,
-    _ollama_model_available,
     _ollama_response_to_blocks,
     _select_backend,
     call_with_fallback,
     compact_old_tool_results,
+    init_ollama_model_state,
+    maybe_switch_ollama_model,
+    parse_ollama_model_candidates,
     warn_if_context_large,
 )
 from firewall_proxy import _redact
@@ -84,11 +86,13 @@ JUDGE_POLICY_PATH = Path(__file__).resolve().parent / "evals" / "JUDGE_POLICY.md
 
 MAX_TOOL_TURNS = 6
 
-# Modelo Ollama propio para el juez -- solo evalua texto+tools, no escribe
+# Modelo(s) Ollama propios para el juez -- solo evalua texto+tools, no escribe
 # codigo, asi que puede quedar en un modelo mas chico/rapido que el del
-# coding agent sin perder calidad de juicio. Cae al generico OLLAMA_MODEL
-# si no se setea.
-JUDGE_OLLAMA_MODEL = os.environ.get("JUDGE_OLLAMA_MODEL", OLLAMA_MODEL)
+# coding agent sin perder calidad de juicio. Coma-separado = lista de
+# candidatos por prioridad (ver parse_ollama_model_candidates); un solo
+# valor (o sin setear, cae al generico OLLAMA_MODEL) se comporta igual que
+# antes de esto.
+JUDGE_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("JUDGE_OLLAMA_MODEL", ""), OLLAMA_MODEL)
 
 # Criterios validos para el campo policy_reference de un veredicto FLAGGED --
 # ver evals/JUDGE_POLICY.md para la descripcion completa de cada uno. Vive
@@ -508,11 +512,12 @@ tests es suficiente para el cambio real, no asumas que "paso" significa \
 async def judge_with_tools(payload: dict) -> dict:
     backend = _select_backend()
     logger.info(f"juez: usando backend '{backend}'")
-    if backend == "ollama" and not _ollama_model_available(JUDGE_OLLAMA_MODEL):
-        logger.warning(
-            f"juez: el modelo '{JUDGE_OLLAMA_MODEL}' no aparece en 'ollama list' -- "
-            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
-        )
+    # Mismo criterio que coding_agent.py: el probe real solo tiene sentido
+    # si el backend elegido es Ollama.
+    if backend == "ollama":
+        ollama_model_state = init_ollama_model_state(JUDGE_OLLAMA_MODELS, logger, "juez")
+    else:
+        ollama_model_state = {"active": JUDGE_OLLAMA_MODELS[0], "tried": set(), "switch_used": False}
 
     start_time = time.monotonic()
     total_input_tokens = 0
@@ -553,7 +558,7 @@ async def judge_with_tools(payload: dict) -> dict:
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=JUDGE_OLLAMA_MODEL, force_json=True,
+                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=ollama_model_state["active"], force_json=True,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
@@ -580,12 +585,17 @@ async def judge_with_tools(payload: dict) -> dict:
                         # main() lo maneja como error, sin loop infinito.
                         retry_text, retry_usage = await _final_text_with_json_retry(
                             client, backend, messages, tools, JUDGE_SYSTEM_PROMPT,
-                            ollama_model=JUDGE_OLLAMA_MODEL,
+                            ollama_model=ollama_model_state["active"],
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)
                         retry_verdict = _extract_json(retry_text)
                         if retry_verdict.get("verdict") not in ("OK", "FLAGGED"):
+                            if maybe_switch_ollama_model(
+                                ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                                "juez", "JSON sin 'verdict' valido incluso tras el reintento de correccion",
+                            ):
+                                continue
                             raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
                         retry_verdict = _normalize_policy_reference(retry_verdict)
                         # Bug real confirmado esta sesion (investigacion KAN-5,
@@ -612,7 +622,7 @@ async def judge_with_tools(payload: dict) -> dict:
                             messages.append({"role": "user", "content": nudge_message})
                             nudge_content, _nudge_stop, nudge_usage = await _call_model_turn(
                                 client, backend, messages, [], JUDGE_SYSTEM_PROMPT,
-                                ollama_model=JUDGE_OLLAMA_MODEL, force_json=True,
+                                ollama_model=ollama_model_state["active"], force_json=True,
                             )
                             messages.append({"role": "assistant", "content": nudge_content})
                             total_input_tokens += nudge_usage.get("input_tokens", 0)
@@ -622,12 +632,22 @@ async def judge_with_tools(payload: dict) -> dict:
                                 corrected_verdict = _extract_json(nudge_text)
                                 if corrected_verdict.get("verdict") in ("OK", "FLAGGED"):
                                     retry_verdict = _normalize_policy_reference(corrected_verdict)
+                                elif maybe_switch_ollama_model(
+                                    ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                                    "juez", "la correccion post-reintento tampoco trajo un 'verdict' valido",
+                                ):
+                                    continue
                                 else:
                                     logger.warning(
                                         f"juez: la correccion post-reintento tampoco trajo un 'verdict' valido -- "
                                         f"se acepta el veredicto anterior igual: {nudge_text[:500]!r}"
                                     )
                             except json.JSONDecodeError:
+                                if maybe_switch_ollama_model(
+                                    ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                                    "juez", "la correccion post-reintento no fue JSON valido",
+                                ):
+                                    continue
                                 logger.warning(
                                     f"juez: la correccion post-reintento no fue JSON valido -- se acepta el "
                                     f"veredicto anterior igual: {nudge_text[:500]!r}"
@@ -654,6 +674,20 @@ async def judge_with_tools(payload: dict) -> dict:
                         consistency_nudge_given = True
                         messages.append({"role": "user", "content": JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE})
                         continue
+
+                    if consistency_nudge_given and (
+                        _verdict_is_self_contradictory(verdict) or _reasoning_ignores_real_diff_files(payload, verdict)
+                    ):
+                        # El empujon de arriba ya se gasto y el veredicto
+                        # SIGUE alucinado -- antes de aceptarlo igual, un
+                        # ultimo intento: probar con otro modelo candidato
+                        # (presupuesto de un solo cambio por corrida, ver
+                        # maybe_switch_ollama_model).
+                        if maybe_switch_ollama_model(
+                            ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                            "juez", "veredicto sigue auto-contradictorio/alucinado incluso tras el nudge",
+                        ):
+                            continue
 
                     return _finalize(verdict)
 

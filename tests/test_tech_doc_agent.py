@@ -4,8 +4,11 @@ estos tests solo verifican el envoltorio: que se arme el prompt con la
 evidencia real, que el texto devuelto se prefije con el backend real que
 respondio, y que cualquier fallo se trague en silencio (best-effort).
 """
+from unittest.mock import MagicMock
+
 import pytest
 
+import agent_loop
 import tech_doc_agent
 from tech_doc_agent import _looks_like_refusal, _strip_filler_sections
 
@@ -43,6 +46,34 @@ def test_generate_technical_report_returns_text_prefixed_with_real_backend(monke
     assert "Contenido real generado por el modelo." in result
     assert captured["tools"] == []
     assert "EPIC-1" in captured["messages"][0]["content"]
+
+
+def test_generate_technical_report_resolves_first_pulled_candidate(monkeypatch):
+    """TECH_DOC_OLLAMA_MODEL=modelo-a,modelo-b -- con modelo-a no descargado
+    y modelo-b si, el segundo candidato es el que se le pasa a call_with_fallback.
+    """
+    monkeypatch.setattr(tech_doc_agent, "TECH_DOC_ENABLED", True)
+    monkeypatch.setattr(tech_doc_agent, "TECH_DOC_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "modelo-b:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    captured = {}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, ollama_model=None):
+        captured["ollama_model"] = ollama_model
+        return (
+            [{"type": "text", "text": "# Comprobante\n\nContenido real."}],
+            "end_turn",
+            {},
+            "ollama",
+        )
+
+    monkeypatch.setattr(tech_doc_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = tech_doc_agent.generate_technical_report({"epica": "EPIC-1", "backend_usado": "ollama"})
+
+    assert result is not None
+    assert captured["ollama_model"] == "modelo-b"
 
 
 def test_generate_technical_report_returns_none_when_no_backend_available(monkeypatch):

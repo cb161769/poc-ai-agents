@@ -39,10 +39,12 @@ from agent_loop import (
     _connect_mcp_servers,
     _final_text_with_json_retry,
     _normalize_tool_schema,
-    _ollama_model_available,
     _select_backend,
     call_with_fallback,
     compact_old_tool_results,
+    init_ollama_model_state,
+    maybe_switch_ollama_model,
+    parse_ollama_model_candidates,
     warn_if_context_large,
 )
 from log_utils import get_logger
@@ -52,6 +54,12 @@ load_dotenv()
 logger = get_logger(__name__)
 
 MAX_TOOL_TURNS = 4
+
+# Modelo(s) Ollama propios para el planificador -- mismo patron que
+# CODING_AGENT_OLLAMA_MODEL/JUDGE_OLLAMA_MODEL: override opcional
+# coma-separado (lista de candidatos por prioridad), cae al generico
+# OLLAMA_MODEL si no se setea.
+EPIC_PLANNER_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("EPIC_PLANNER_OLLAMA_MODEL", ""), OLLAMA_MODEL)
 
 
 def _extract_json(text: str) -> dict:
@@ -159,11 +167,12 @@ async def plan_epic(epic: dict, children: list) -> dict:
         return _fallback_result(children)
 
     logger.info(f"epic planner: usando backend '{backend}'")
-    if backend == "ollama" and not _ollama_model_available(OLLAMA_MODEL):
-        logger.warning(
-            f"epic planner: el modelo '{OLLAMA_MODEL}' no aparece en 'ollama list' -- "
-            "probablemente falta 'ollama pull', cae al orden mecanico si falla mas adelante."
-        )
+    # Mismo criterio que coding_agent.py/judge_agent.py: el probe real solo
+    # tiene sentido si el backend elegido es Ollama.
+    if backend == "ollama":
+        ollama_model_state = init_ollama_model_state(EPIC_PLANNER_OLLAMA_MODELS, logger, "epic planner")
+    else:
+        ollama_model_state = {"active": EPIC_PLANNER_OLLAMA_MODELS[0], "tried": set(), "switch_used": False}
 
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="epic planner")
@@ -186,7 +195,8 @@ async def plan_epic(epic: dict, children: list) -> dict:
         async with httpx.AsyncClient() as client:
             for _ in range(MAX_TOOL_TURNS):
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT, force_json=True,
+                    client, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT,
+                    ollama_model=ollama_model_state["active"], force_json=True,
                 )
                 messages.append({"role": "assistant", "content": content})
 
@@ -197,10 +207,16 @@ async def plan_epic(epic: dict, children: list) -> dict:
                     except json.JSONDecodeError:
                         try:
                             retry_text, _usage = await _final_text_with_json_retry(
-                                client, backend, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT
+                                client, backend, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT,
+                                ollama_model=ollama_model_state["active"],
                             )
                             result = _extract_json(retry_text)
                         except json.JSONDecodeError:
+                            if maybe_switch_ollama_model(
+                                ollama_model_state, backend, EPIC_PLANNER_OLLAMA_MODELS, logger,
+                                "epic planner", "JSON invalido incluso tras el reintento de correccion",
+                            ):
+                                continue
                             logger.warning("epic planner: el modelo no devolvio JSON valido, cae al orden mecanico")
                             return _fallback_result(children)
                     return _validate_result(result, children)

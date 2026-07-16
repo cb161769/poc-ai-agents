@@ -107,6 +107,31 @@ def _backend_available(backend: str) -> bool:
     return is_within_budget(backend)
 
 
+def parse_ollama_model_candidates(raw_value: str, default: str) -> list:
+    """CODING_AGENT_OLLAMA_MODEL=qwen2.5-coder:7b,llama3.1,mistral -- coma-
+    separado, orden = prioridad. Sin coma (o sin setear) = comportamiento
+    identico a hoy (una lista de un solo elemento). default es el fallback
+    si raw_value viene vacio.
+    """
+    candidates = [m.strip() for m in (raw_value or "").split(",") if m.strip()]
+    if not candidates:
+        candidates = [default]
+    seen = set()
+    return [m for m in candidates if not (m in seen or seen.add(m))]
+
+
+def _pulled_ollama_model_names():
+    """None = servidor inalcanzable (distinto de "sin modelos descargados").
+    Unico punto que llama GET /api/tags para chequeos de modelo -- evita N
+    requests HTTP para N candidatos.
+    """
+    try:
+        resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
+        return {m.get("name") for m in resp.json().get("models", [])}
+    except httpx.HTTPError:
+        return None
+
+
 def _ollama_model_available(model: str) -> bool:
     """Best-effort: _backend_available("ollama") ya confirma que el
     servidor responde -- esto ademas confirma que el modelo PEDIDO esta
@@ -115,12 +140,79 @@ def _ollama_model_available(model: str) -> bool:
     JUDGE_OLLAMA_MODEL por primera vez) recien fallaba a mitad de una
     corrida real, sin ningun aviso previo.
     """
-    try:
-        resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
-        names = {m.get("name") for m in resp.json().get("models", [])}
-        return model in names or any(n.startswith(f"{model}:") for n in names)
-    except httpx.HTTPError:
+    names = _pulled_ollama_model_names()
+    if names is None:
         return False
+    return model in names or any(n.startswith(f"{model}:") for n in names)
+
+
+def resolve_ollama_model(candidates: list, exclude: set = None):
+    """Primer candidato (en orden de prioridad) que este realmente 'ollama
+    pull'-eado y no este en exclude (modelos ya probados/descartados en
+    esta corrida). None si el servidor no responde o ningun candidato
+    restante esta descargado -- el caller decide como degradar (mismo
+    criterio que _ollama_model_available ya usaba: solo un warning, no un
+    bloqueo duro, porque el pedido puede fallar mas adelante o el nombre
+    puede resultar correcto igual si el listado de /api/tags fallo por
+    otra razon).
+    """
+    names = _pulled_ollama_model_names()
+    if names is None:
+        return None
+    exclude = exclude or set()
+    for model in candidates:
+        if model in exclude:
+            continue
+        if model in names or any(n.startswith(f"{model}:") for n in names):
+            return model
+    return None
+
+
+def maybe_switch_ollama_model(model_state: dict, backend: str, candidates: list, log, agent_label: str, reason: str) -> bool:
+    """Se llama en el punto en que un agente esta por RENDIRSE ante una
+    alucinacion (JSON invalido tras su reintento acotado, negativa a tool
+    que persiste tras el nudge, veredicto auto-contradictorio que persiste
+    tras el nudge). Devuelve True si cambio de modelo (el caller debe
+    reintentar el turno con model_state["active"]), False si no hay otro
+    candidato disponible o ya se uso el cambio de modelo en esta corrida
+    (el caller se rinde como hacia antes de este cambio). Presupuesto: UN
+    cambio de modelo por corrida por agente -- mismo criterio de "un
+    empujon acotado, nunca loop infinito" que ya rige los nudges de
+    re-prompting existentes en cada agente.
+    """
+    if backend != "ollama" or model_state["switch_used"]:
+        return False
+    model_state["tried"].add(model_state["active"])
+    next_model = resolve_ollama_model(candidates, exclude=model_state["tried"])
+    if next_model is None:
+        return False
+    log.warning(
+        f"{agent_label}: el modelo '{model_state['active']}' alucino ({reason}) -- "
+        f"cambiando a '{next_model}' (candidatos: {candidates})"
+    )
+    model_state["active"] = next_model
+    model_state["switch_used"] = True
+    return True
+
+
+def init_ollama_model_state(candidates: list, log, agent_label: str) -> dict:
+    """Resuelve el modelo activo inicial de la lista de candidatos (el
+    primero realmente descargado) y arma el dict de estado que
+    maybe_switch_ollama_model() espera. Si ningun candidato aparece en
+    'ollama list' (servidor caido, o ninguno pulled todavia), cae al
+    primero de la lista igual -- mismo comportamiento best-effort que ya
+    tenia _ollama_model_available: se deja que la corrida real falle mas
+    adelante con un error concreto, en vez de bloquear aca sobre un
+    chequeo que puede tener falsos negativos.
+    """
+    active = resolve_ollama_model(candidates)
+    if active is None:
+        active = candidates[0]
+        log.warning(
+            f"{agent_label}: ninguno de los modelos candidatos {candidates} aparece en 'ollama list' -- "
+            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
+        )
+    return {"active": active, "tried": set(), "switch_used": False}
 
 
 def _select_backend() -> str:

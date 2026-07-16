@@ -21,6 +21,10 @@ from agent_loop import (
     _text_as_fallback_tool_call,
     call_with_fallback,
     compact_old_tool_results,
+    init_ollama_model_state,
+    maybe_switch_ollama_model,
+    parse_ollama_model_candidates,
+    resolve_ollama_model,
     warn_if_context_large,
 )
 
@@ -693,6 +697,133 @@ def test_ollama_model_available_false_when_server_unreachable(monkeypatch):
     monkeypatch.setattr(agent_loop.httpx, "get", fake_get)
 
     assert _ollama_model_available("llama3.1") is False
+
+
+def test_parse_ollama_model_candidates_splits_on_comma_in_priority_order():
+    assert parse_ollama_model_candidates("qwen2.5-coder:7b, llama3.1 ,mistral", "llama3.1") == [
+        "qwen2.5-coder:7b", "llama3.1", "mistral",
+    ]
+
+
+def test_parse_ollama_model_candidates_single_value_matches_todays_behavior():
+    assert parse_ollama_model_candidates("llama3.1", "llama3.1") == ["llama3.1"]
+
+
+def test_parse_ollama_model_candidates_empty_falls_back_to_default():
+    assert parse_ollama_model_candidates("", "llama3.1") == ["llama3.1"]
+    assert parse_ollama_model_candidates(None, "llama3.1") == ["llama3.1"]
+
+
+def test_parse_ollama_model_candidates_dedupes_preserving_first_occurrence():
+    assert parse_ollama_model_candidates("llama3.1,mistral,llama3.1", "llama3.1") == ["llama3.1", "mistral"]
+
+
+def test_resolve_ollama_model_returns_first_pulled_candidate(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "mistral:latest"}, {"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert resolve_ollama_model(["qwen2.5-coder:7b", "mistral", "llama3.1"]) == "mistral"
+
+
+def test_resolve_ollama_model_respects_exclude(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "mistral:latest"}, {"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert resolve_ollama_model(["mistral", "llama3.1"], exclude={"mistral"}) == "llama3.1"
+
+
+def test_resolve_ollama_model_none_when_nothing_pulled(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+    assert resolve_ollama_model(["qwen2.5-coder:7b", "mistral"]) is None
+
+
+def test_resolve_ollama_model_none_when_server_unreachable(monkeypatch):
+    def fake_get(*a, **k):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(agent_loop.httpx, "get", fake_get)
+
+    assert resolve_ollama_model(["llama3.1"]) is None
+
+
+def test_init_ollama_model_state_resolves_first_pulled_candidate(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    log = MagicMock()
+
+    state = init_ollama_model_state(["qwen2.5-coder:7b", "llama3.1"], log, "coding agent")
+
+    assert state == {"active": "llama3.1", "tried": set(), "switch_used": False}
+    log.warning.assert_not_called()
+
+
+def test_init_ollama_model_state_falls_back_to_first_candidate_with_warning(monkeypatch):
+    def fake_get(*a, **k):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(agent_loop.httpx, "get", fake_get)
+    log = MagicMock()
+
+    state = init_ollama_model_state(["qwen2.5-coder:7b", "llama3.1"], log, "coding agent")
+
+    assert state["active"] == "qwen2.5-coder:7b"
+    log.warning.assert_called_once()
+
+
+def test_maybe_switch_ollama_model_switches_once_to_next_pulled_candidate(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "mistral:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    log = MagicMock()
+    state = {"active": "llama3.1", "tried": set(), "switch_used": False}
+
+    switched = maybe_switch_ollama_model(state, "ollama", ["llama3.1", "mistral"], log, "coding agent", "JSON invalido")
+
+    assert switched is True
+    assert state["active"] == "mistral"
+    assert state["switch_used"] is True
+    log.warning.assert_called_once()
+
+
+def test_maybe_switch_ollama_model_only_switches_once_per_run(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "mistral:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    log = MagicMock()
+    state = {"active": "mistral", "tried": {"llama3.1"}, "switch_used": True}
+
+    switched = maybe_switch_ollama_model(state, "ollama", ["llama3.1", "mistral"], log, "coding agent", "JSON invalido de nuevo")
+
+    assert switched is False
+    assert state["active"] == "mistral"
+
+
+def test_maybe_switch_ollama_model_false_when_no_more_candidates(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    log = MagicMock()
+    state = {"active": "llama3.1", "tried": set(), "switch_used": False}
+
+    switched = maybe_switch_ollama_model(state, "ollama", ["llama3.1"], log, "coding agent", "JSON invalido")
+
+    assert switched is False
+    assert state["switch_used"] is False
+
+
+def test_maybe_switch_ollama_model_false_when_backend_is_not_ollama():
+    log = MagicMock()
+    state = {"active": "llama3.1", "tried": set(), "switch_used": False}
+
+    switched = maybe_switch_ollama_model(state, "anthropic", ["llama3.1", "mistral"], log, "coding agent", "JSON invalido")
+
+    assert switched is False
 
 
 def test_call_with_fallback_falls_back_to_next_backend_on_failure(monkeypatch):

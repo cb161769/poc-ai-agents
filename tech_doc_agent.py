@@ -16,7 +16,7 @@ import re
 
 import httpx
 
-from agent_loop import OLLAMA_MODEL, call_with_fallback
+from agent_loop import OLLAMA_MODEL, call_with_fallback, parse_ollama_model_candidates, resolve_ollama_model
 
 logger = logging.getLogger("tech_doc_agent")
 
@@ -30,8 +30,13 @@ TECH_DOC_ENABLED = os.environ.get("TECH_DOC_ENABLED", "true").strip().lower() no
 # del comprobante tecnico de despues.
 TEST_PLAN_ENABLED = os.environ.get("TEST_PLAN_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 # Mismo criterio que CODING_AGENT_OLLAMA_MODEL/JUDGE_OLLAMA_MODEL: override
-# opcional por agente, cae al OLLAMA_MODEL generico si no se setea.
-TECH_DOC_OLLAMA_MODEL = os.environ.get("TECH_DOC_OLLAMA_MODEL") or OLLAMA_MODEL
+# opcional coma-separado (lista de candidatos por prioridad), cae al
+# OLLAMA_MODEL generico si no se setea. Este agente es single-shot (sin
+# loop de tool-calling ni nudges que reusar para un cambio de modelo ante
+# alucinacion), asi que solo se beneficia del fallback por conectividad:
+# se resuelve el primer candidato realmente 'pull'-eado UNA vez por
+# llamada, no hay reintento-con-otro-modelo si el elegido alucina.
+TECH_DOC_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("TECH_DOC_OLLAMA_MODEL", ""), OLLAMA_MODEL)
 
 _TECH_REPORT_SYSTEM_PROMPT = (
     "Actua como un Ingeniero de Software Principal y Arquitecto de Soluciones Senior. "
@@ -173,7 +178,7 @@ async def _generate_async(evidence: dict, system_prompt: str, label: str) -> str
                 messages=[{"role": "user", "content": _format_evidence(evidence)}],
                 tools=[],
                 system_prompt=system_prompt,
-                ollama_model=TECH_DOC_OLLAMA_MODEL,
+                ollama_model=resolve_ollama_model(TECH_DOC_OLLAMA_MODELS) or TECH_DOC_OLLAMA_MODELS[0],
             )
         except Exception as exc:
             logger.warning(f"tech_doc_agent: no se pudo generar el {label}: {exc}")

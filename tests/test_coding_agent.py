@@ -11,10 +11,11 @@ import asyncio
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent_loop
 import coding_agent as ca
 
 
@@ -616,6 +617,108 @@ def test_run_coding_agent_only_nudges_tool_call_refusal_once(monkeypatch, tmp_pa
     # investigar -> se niega (nudge 1) -> se niega otra vez -> retry generico -> blocked
     assert call_count["n"] == 3
     assert result["status"] == "blocked"
+
+
+def _mock_ollama_tags(monkeypatch, model_names):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": n} for n in model_names]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+
+
+def test_run_coding_agent_switches_ollama_model_when_json_invalid_persists(monkeypatch, tmp_path):
+    """Con 2 candidatos configurados (CODING_AGENT_OLLAMA_MODEL=modelo-a,modelo-b)
+    y AMBOS 'pull'-eados, un JSON invalido que persiste incluso tras el
+    reintento de correccion ahora prueba con el segundo modelo de la lista
+    antes de degradar a blocked -- confirmado que el segundo intento con el
+    modelo nuevo puede recuperar la corrida en vez de perderla.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el segundo modelo", "files_changed": []}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    assert result["summary"] == "listo con el segundo modelo"
+
+
+def test_run_coding_agent_still_blocks_when_json_invalid_and_only_one_ollama_candidate(monkeypatch, tmp_path):
+    """Con un solo candidato configurado (el caso de hoy, sin listas), el
+    comportamiento tiene que ser IDENTICO al de antes de este cambio: sin
+    otro modelo al que cambiar, se degrada a blocked como siempre.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+
+
+def test_run_coding_agent_switches_ollama_model_when_tool_refusal_persists_after_nudge(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    (tmp_path / "existing.txt").write_text("ya existe")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    call_count = {"n": 0}
+    refusal_text = "No puedo crear ese archivo sin confirmación humana."
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{
+                "type": "text",
+                "text": (
+                    '{"status": "done", "summary": "listo tras cambiar de modelo", "files_changed": [], '
+                    '"self_review": {"scope_matches_ticket": true, "no_secrets_introduced": true, "tests_adequate": true}}'
+                ),
+            }]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        # modelo-a se niega SIEMPRE, incluso tras el nudge -- fuerza el cambio de modelo.
+        content = [{"type": "text", "text": refusal_text}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    assert result["summary"] == "listo tras cambiar de modelo"
 
 
 def test_run_coding_agent_resume_skips_reinvestigation(monkeypatch, tmp_path):

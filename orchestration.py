@@ -69,6 +69,7 @@ import epic_planner
 import graph_writer
 import jira_client
 import output_guard
+from coding_agent import _STACK_MARKERS
 from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
@@ -164,6 +165,42 @@ def check_dirty_tree(target_repo_dir: str):
             "de correr esto — el pipeline va a crear una rama nueva y no queremos mezclar tu trabajo en "
             "progreso con lo que haga Copilot."
         )
+
+
+# Override opcional para repos que no usan "main"/"master" como trunk.
+TRUNK_BRANCH = os.environ.get("TRUNK_BRANCH", "")
+
+
+@task(retries=0, name="ensure-trunk-branch")
+def ensure_on_trunk_branch(target_repo_dir: str) -> str:
+    """Bug real confirmado en vivo (epica KAN-4, PR #240/#241 apuntando entre
+    si en vez de a main): run_coding_agent_local_real()/run_coding_agent_local()
+    calculan base_branch como "lo que sea que este en HEAD ahora mismo" (git
+    rev-parse --abbrev-ref HEAD) -- si Docker-outside-of-Docker reusa el
+    mismo clon persistente entre corridas y una corrida anterior dejo el
+    working tree parado en una rama copilot/... vieja (no en main),
+    TODO lo nuevo se ramificaba desde esa rama vieja en vez del trunk real.
+    Esto establece el trunk real UNA sola vez al arrancar la corrida
+    (llamado justo despues de check_dirty_tree, que ya garantiza working
+    tree limpio -- este checkout nunca pierde nada) para que cada
+    rev-parse HEAD posterior en toda la corrida sea confiable por
+    construccion, sin tener que tocar cada call site.
+    """
+    candidates = [TRUNK_BRANCH] if TRUNK_BRANCH else ["main", "master"]
+    for candidate in candidates:
+        result = subprocess.run(
+            ["git", "-C", target_repo_dir, "checkout", candidate], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            # Best-effort: traer lo ultimo del remoto -- nunca bloquea si
+            # falla (sin remoto, offline, etc.), solo deja el trunk local
+            # como esta.
+            subprocess.run(["git", "-C", target_repo_dir, "pull", "--ff-only"], capture_output=True, text=True)
+            return candidate
+    raise PipelineBlocked(
+        f"No se pudo dejar {target_repo_dir} parado en una rama trunk conocida ({', '.join(candidates)}). "
+        "Setea TRUNK_BRANCH en .env si tu repo usa otro nombre."
+    )
 
 
 @task(retries=1, retry_delay_seconds=5, name="discover-known-components")
@@ -942,6 +979,56 @@ def _local_coding_agent_backend_available() -> bool:
         return False
 
 
+# Directorios reales de dependencias/build que un marcador de proyecto
+# (pom.xml, go.mod, package.json, etc.) puede aparecer DENTRO de, sin ser un
+# proyecto real duplicado (ej. un modulo vendoreado) -- se excluyen ademas
+# de .git/node_modules para no generar falsos positivos.
+_SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__"}
+
+
+def _is_project_root(dir_path: Path) -> bool:
+    """Pure: mismos marcadores reales que coding_agent.py._STACK_MARKERS usa
+    para detectar el stack de un sub-proyecto (Maven/Go/Ruby/Rust/Python/
+    Node), mas .csproj/.sln para .NET -- asi la deteccion de scaffolding
+    duplicado no queda atada a un solo lenguaje.
+    """
+    if any((dir_path / marker).exists() for marker, _stack, _cmd in _STACK_MARKERS):
+        return True
+    return bool(list(dir_path.glob("*.csproj"))) or bool(list(dir_path.glob("*.sln")))
+
+
+def _has_duplicate_project_scaffolding(target_repo_dir: str) -> str | None:
+    """Bug real confirmado en vivo (PR #240/#241, epica KAN-4): dos raices de
+    proyecto anidadas una dentro de la otra -- el mismo patron exacto que
+    "ionic start my-app" genero dentro de frontend/ (frontend/ y
+    frontend/my-app/, ambas con su propio package.json). No esta atado a
+    Node/TS: usa los mismos marcadores reales de _STACK_MARKERS
+    (pom.xml, go.mod, Gemfile, Cargo.toml, Pipfile, requirements.txt,
+    package.json, .csproj/.sln) para cualquier lenguaje que el pipeline
+    este tocando. Los tests reales pueden pasar igual con esto presente
+    (una estructura duplicada no necesariamente rompe nada), asi que esta
+    es una señal de salud SEPARADA de run_tests() para el gate de resumir
+    una rama existente. Best-effort: cualquier error de I/O devuelve None
+    (no bloquea la corrida por esto).
+    """
+    try:
+        root = Path(target_repo_dir).resolve()
+        for parent in root.rglob("*"):
+            if not parent.is_dir() or any(part in _SCAFFOLD_SCAN_SKIP_DIRS for part in parent.parts):
+                continue
+            if not _is_project_root(parent):
+                continue
+            nested_roots = [
+                child for child in parent.iterdir()
+                if child.is_dir() and child.name not in _SCAFFOLD_SCAN_SKIP_DIRS and _is_project_root(child)
+            ]
+            if nested_roots:
+                return f"{parent.relative_to(root)} y {nested_roots[0].relative_to(root)} son ambas raices de proyecto"
+    except OSError:
+        return None
+    return None
+
+
 @task(retries=0, name="coding-agent-local-real")
 def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
     """Camino B1: the real local coding agent (coding_agent.py) -- reasons
@@ -978,6 +1065,10 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             health_check = run_tests(target_repo_dir)
             if not health_check["passed"]:
                 abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+            else:
+                structural_issue = _has_duplicate_project_scaffolding(target_repo_dir)
+                if structural_issue:
+                    abandon_reason = f"estructura duplicada detectada: {structural_issue}"
 
         if abandon_reason:
             run_logger.warning(
@@ -2503,7 +2594,8 @@ def run_pipeline():
 
     target_repo_dir = detect_target_repo()
     check_dirty_tree(target_repo_dir)
-    logger.info(f"Repo objetivo detectado: {target_repo_dir}")
+    trunk_branch = ensure_on_trunk_branch(target_repo_dir)
+    logger.info(f"Repo objetivo detectado: {target_repo_dir} (trunk: {trunk_branch})")
 
     known_components = discover_known_components()
 
@@ -2560,7 +2652,8 @@ def run_epic_pipeline(epic_key: str):
 
     target_repo_dir = detect_target_repo()
     check_dirty_tree(target_repo_dir)
-    logger.info(f"Repo objetivo detectado: {target_repo_dir}")
+    trunk_branch = ensure_on_trunk_branch(target_repo_dir)
+    logger.info(f"Repo objetivo detectado: {target_repo_dir} (trunk: {trunk_branch})")
 
     known_components = discover_known_components()
 

@@ -20,6 +20,7 @@ from orchestration import (
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
     _filter_active_children,
+    _has_duplicate_project_scaffolding,
     _query_component_risk_history,
     _resolve_pr_threads,
     _find_open_branch_for_ticket,
@@ -29,7 +30,168 @@ from orchestration import (
     _retry_after_no_changes,
     _retry_local_diff,
     _transition_all,
+    ensure_on_trunk_branch,
 )
+
+
+def test_ensure_on_trunk_branch_checks_out_main_and_pulls(monkeypatch):
+    """Bug real confirmado en vivo (PR #240/#241, epica KAN-4): base_branch
+    se calculaba como "lo que sea que este en HEAD ahora mismo" -- si el
+    working tree quedaba parado en una rama copilot/... vieja de una
+    corrida anterior, todo lo nuevo se ramificaba desde ahi. Esto confirma
+    que arranca dejando el repo parado en main de verdad."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-2:] == ["checkout", "main"]:
+            return _fake_subprocess_result(returncode=0)
+        return _fake_subprocess_result(returncode=0)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = ensure_on_trunk_branch.fn("/repo")
+
+    assert result == "main"
+    assert any(cmd[-2:] == ["checkout", "main"] for cmd in calls)
+    assert any("pull" in cmd for cmd in calls)
+
+
+def test_ensure_on_trunk_branch_falls_back_to_master(monkeypatch):
+    def fake_run(cmd, **kwargs):
+        if cmd[-2:] == ["checkout", "main"]:
+            return _fake_subprocess_result(returncode=1)
+        if cmd[-2:] == ["checkout", "master"]:
+            return _fake_subprocess_result(returncode=0)
+        return _fake_subprocess_result(returncode=0)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert ensure_on_trunk_branch.fn("/repo") == "master"
+
+
+def test_ensure_on_trunk_branch_raises_when_no_known_trunk(monkeypatch):
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: _fake_subprocess_result(returncode=1))
+
+    with pytest.raises(PipelineBlocked):
+        ensure_on_trunk_branch.fn("/repo")
+
+
+def test_ensure_on_trunk_branch_respects_env_override(monkeypatch):
+    monkeypatch.setattr(orchestration, "TRUNK_BRANCH", "trunk")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _fake_subprocess_result(returncode=0)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert ensure_on_trunk_branch.fn("/repo") == "trunk"
+    assert any(cmd[-2:] == ["checkout", "trunk"] for cmd in calls)
+    assert not any(cmd[-2:] == ["checkout", "main"] for cmd in calls)
+
+
+def test_ensure_on_trunk_branch_pull_failure_is_best_effort(monkeypatch):
+    """El pull es best-effort -- si falla (sin remoto, offline), no debe
+    tirar la corrida, solo deja el trunk local como esta."""
+    def fake_run(cmd, **kwargs):
+        if "pull" in cmd:
+            return _fake_subprocess_result(returncode=1, stderr="no remote")
+        return _fake_subprocess_result(returncode=0)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert ensure_on_trunk_branch.fn("/repo") == "main"  # no lanza
+
+
+def test_has_duplicate_project_scaffolding_detects_nested_project_roots(tmp_path):
+    """Bug real confirmado en vivo (PR #240/#241, epica KAN-4): "ionic start
+    my-app" corrio dentro de frontend/ (que YA tenia su propio package.json
+    + src/), creando una segunda raiz de proyecto anidada adentro."""
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "package.json").write_text("{}")
+
+    nested = frontend / "my-app"
+    (nested / "src").mkdir(parents=True)
+    (nested / "package.json").write_text("{}")
+
+    result = _has_duplicate_project_scaffolding(str(tmp_path))
+
+    assert result is not None
+    assert "frontend" in result and "my-app" in result
+
+
+def test_has_duplicate_project_scaffolding_no_false_positive_for_sibling_subprojects(tmp_path):
+    """Un monorepo real (sub-proyectos HERMANOS, ninguno anidado dentro del
+    otro) no debe dispararlo -- ese es un patron legitimo, no el bug."""
+    for name in ("frontend", "backend"):
+        sub = tmp_path / name
+        (sub / "src").mkdir(parents=True)
+        (sub / "package.json").write_text("{}")
+
+    assert _has_duplicate_project_scaffolding(str(tmp_path)) is None
+
+
+def test_has_duplicate_project_scaffolding_none_when_clean(tmp_path):
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "package.json").write_text("{}")
+
+    assert _has_duplicate_project_scaffolding(str(tmp_path)) is None
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["pom.xml", "go.mod", "Gemfile", "Cargo.toml", "Pipfile", "requirements.txt", "package.json"],
+)
+def test_has_duplicate_project_scaffolding_detects_any_stack_marker(tmp_path, marker):
+    """Gap real (usuario, "debe de aplicar a cualquier lenguaje de
+    programacion"): el chequeo original solo miraba package.json+src/ --
+    ahora usa los mismos marcadores reales que coding_agent.py._STACK_MARKERS
+    (Maven, Go, Ruby, Rust, Python, Node), no solo Node/TS."""
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / marker).write_text("")
+
+    nested = service / "nested-app"
+    nested.mkdir()
+    (nested / marker).write_text("")
+
+    result = _has_duplicate_project_scaffolding(str(tmp_path))
+
+    assert result is not None
+    assert "service" in result and "nested-app" in result
+
+
+def test_has_duplicate_project_scaffolding_detects_dotnet_marker(tmp_path):
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / "Service.csproj").write_text("")
+
+    nested = service / "nested-app"
+    nested.mkdir()
+    (nested / "NestedApp.csproj").write_text("")
+
+    result = _has_duplicate_project_scaffolding(str(tmp_path))
+
+    assert result is not None
+
+
+def test_has_duplicate_project_scaffolding_ignores_vendored_markers(tmp_path):
+    """Un marcador dentro de un directorio de dependencias reales (vendor/,
+    target/, etc.) no es un proyecto duplicado -- es una dependencia
+    normal, no debe dispararlo."""
+    service = tmp_path / "service"
+    service.mkdir()
+    (service / "go.mod").write_text("")
+
+    vendored = service / "vendor" / "some-dep"
+    vendored.mkdir(parents=True)
+    (vendored / "go.mod").write_text("")
+
+    assert _has_duplicate_project_scaffolding(str(tmp_path)) is None
 
 
 def test_filter_active_children_excludes_terminal_status():
@@ -2237,6 +2399,50 @@ def test_run_coding_agent_local_real_abandons_branch_when_tests_already_fail(mon
 
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo real"})
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["resumed_branch"] is False
+    assert result["branch"] != "copilot/T-1-100"
+    assert any("-b" in cmd for cmd in git_calls if "checkout" in cmd)
+
+
+def test_run_coding_agent_local_real_abandons_branch_when_structure_duplicated(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (PR #240/#241, epica KAN-4): los tests
+    reales PASABAN en la rama vieja aunque tuviera frontend/my-app/
+    duplicado -- el chequeo de tests solo no alcanzaba. Confirma que la
+    señal estructural abandona la rama igual, aunque los tests pasen."""
+    git_calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout=" M archivo.txt\n")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "todo bien (pero la estructura esta duplicada)"})
+
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "package.json").write_text("{}")
+    nested = frontend / "my-app"
+    (nested / "src").mkdir(parents=True)
+    (nested / "package.json").write_text("{}")
 
     result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
 
