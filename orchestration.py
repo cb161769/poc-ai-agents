@@ -959,14 +959,38 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     if existing_branch:
         pr_rejected = _check_pr_rejected_for_branch(target_repo_dir, existing_branch)
         run_logger = get_run_logger()
-        run_logger.info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
-        if pr_rejected:
-            run_logger.warning(
-                f"{ticket_id}: la rama retomada '{existing_branch}' tiene una PR previa RECHAZADA/cerrada sin "
-                "mergear -- se reusa igual, pero revisar si el codigo previo sigue siendo valido."
-            )
         branch = existing_branch
         subprocess.run(["git", "-C", target_repo_dir, "checkout", branch], check=True)
+
+        # Bug real confirmado en vivo (epica KAN-4): antes esto solo
+        # LOGUEABA una PR rechazada y reusaba la rama igual -- una corrida
+        # nueva terminaba aplicando un cambio sobre codigo YA roto (el mismo
+        # PR real que termino con dos arboles src/ desconectados). Ahora se
+        # chequea salud real ANTES de reusar: PR rechazada, O los tests
+        # reales YA fallan en la rama tal cual esta (sin ningun cambio
+        # nuevo) -- cualquiera de las dos abandona la rama y arranca de
+        # cero desde base_branch, en vez de acumular trabajo sobre algo que
+        # ya se sabe que esta roto.
+        abandon_reason = None
+        if pr_rejected:
+            abandon_reason = "la PR previa de esta rama fue rechazada/cerrada sin mergear"
+        else:
+            health_check = run_tests(target_repo_dir)
+            if not health_check["passed"]:
+                abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+
+        if abandon_reason:
+            run_logger.warning(
+                f"{ticket_id}: la rama retomada '{existing_branch}' parece rota ({abandon_reason}) -- "
+                f"se abandona y arranca de cero desde '{base_branch}' en vez de reusarla."
+            )
+            subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
+            existing_branch = None
+            pr_rejected = False
+            branch = f"copilot/{ticket_id}-{int(time.time())}"
+            subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
+        else:
+            run_logger.info(f"{ticket_id}: retomando rama existente '{existing_branch}' en vez de crear una nueva.")
     else:
         branch = f"copilot/{ticket_id}-{int(time.time())}"
         subprocess.run(["git", "-C", target_repo_dir, "checkout", "-b", branch], check=True)
@@ -1113,6 +1137,12 @@ def retry_coding_agent_local_real(
             # False aunque coding_agent.py SI la acepta como seed
             # (resume_state.get("consulted_risk_graph")).
             "consulted_risk_graph": conversation_state.get("consulted_risk_graph", False),
+            # Bug real confirmado en vivo (PR real, epica KAN-4): sin esto,
+            # cada reintento perdia el registro de que directorios ya se
+            # listaron -- el gate anti-duplicacion de scaffolding
+            # (coding_agent.py) volvia a exigir list_directory de cero en
+            # cada turno nuevo, aunque el turno anterior ya lo hubiera hecho.
+            "listed_dirs": conversation_state.get("listed_dirs", []),
         }
         Path(conversation_file).unlink(missing_ok=True)
     else:

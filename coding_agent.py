@@ -176,6 +176,23 @@ TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION = (
 # pytest, dotnet test).
 _VERIFICATION_COMMAND_PATTERN = re.compile(r"\b(test|rspec|lint|build|compile)\b", re.IGNORECASE)
 
+# Bug real confirmado en vivo (PR real de esta sesion, epica KAN-4): el
+# coding agent corrio "ionic start my-app" dentro de frontend/ SIN revisar
+# antes si ya habia un src/ real ahi -- resultado: dos arboles src/
+# desconectados (frontend/src/ real + frontend/my-app/src/ nuevo) en el
+# mismo PR. Estos comandos generan estructura de proyecto NUEVA -- antes de
+# dejarlos correr, se exige que el agente haya listado (list_directory) el
+# directorio donde va a scaffoldear, para que tenga evidencia real de lo
+# que ya existe ahi en vez de asumir que esta vacio.
+_SCAFFOLD_COMMAND_PATTERN = re.compile(
+    r"\b(ionic start|ng new|create-react-app|npm create|npx create-|yarn create|vue create|create-next-app)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_listed_dir(path: str) -> str:
+    return (path or ".").strip().rstrip("/") or "."
+
 _SELF_REVIEW_FIELDS = ("scope_matches_ticket", "no_secrets_introduced", "tests_adequate")
 
 
@@ -261,6 +278,13 @@ mencionalo en el summary como fuera de alcance si te parece relevante, no lo imp
 No inventes arquitectura, capas, ni archivos de configuracion/estructura que no viste con tus propias \
 herramientas (list_directory/read_file/grep_search) -- si necesitas asumir algo sobre como esta organizado \
 el proyecto para poder avanzar, verificalo primero, no lo improvises.
+
+Bug real confirmado en vivo (un PR real de este pipeline): un comando como "ionic start"/"ng new"/ \
+"create-react-app" corrio dentro de un sub-proyecto que YA tenia un src/ real (con componentes/servicios \
+reales) sin revisarlo antes -- el resultado fueron DOS arboles src/ desconectados en el mismo PR. Antes de \
+scaffoldear un proyecto/estructura nueva, o de crear un archivo cuyo nombre ya existe con otra extension en \
+el mismo directorio (ej. Header.tsx cuando ya existe Header.ts), list_directory ESE directorio puntual \
+primero -- si ya hay estructura real ahi, extendela/edita lo existente, no dupliques creando algo paralelo.
 
 Antes de declararte "done", corré algo que verifique tu cambio de verdad con run_shell_command (los tests \
 del proyecto si existen, o al menos una compilacion/lint) -- terminar sin haber corrido nada es aceptable \
@@ -432,6 +456,32 @@ def _confirm(prompt_text: str) -> bool:
     return answer == "s"
 
 
+_COMMON_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
+
+
+def _sibling_duplicate_warning(full_path: Path) -> str:
+    """Bug real confirmado en vivo (PR real de esta sesion, epica KAN-4): el
+    coding agent creo Header.ts Y Header.tsx (mismo componente, dos
+    extensiones) en el mismo directorio -- nunca reviso si ya existia una
+    version con otra extension antes de escribir una nueva. Best-effort: no
+    bloquea (podria haber falsos positivos legitimos), solo avisa fuerte en
+    el resultado de la tool para que el modelo pueda autocorregirse.
+    """
+    if full_path.suffix not in _COMMON_CODE_EXTENSIONS:
+        return ""
+    for ext in _COMMON_CODE_EXTENSIONS:
+        if ext == full_path.suffix:
+            continue
+        sibling = full_path.with_name(full_path.stem + ext)
+        if sibling.exists():
+            return (
+                f"\n\nADVERTENCIA: ya existe '{sibling.name}' en este mismo directorio -- "
+                "¿es este archivo un duplicado del mismo componente con otra extension? Si es asi, "
+                "edita el archivo existente en vez de crear uno nuevo, y borra el que sobra."
+            )
+    return ""
+
+
 def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     try:
         full_path = _safe_path(target_repo_dir, path)
@@ -440,6 +490,7 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     if _is_inside_git_dir(full_path, target_repo_dir):
         return f"error: no se puede escribir dentro de .git/ ({path})"
 
+    is_new_file = not full_path.exists()
     if full_path.exists() and full_path.is_file():
         try:
             old_content = full_path.read_text(encoding="utf-8", errors="replace")
@@ -468,7 +519,8 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
 
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
-    return f"escrito ok: {path}"
+    warning = _sibling_duplicate_warning(full_path) if is_new_file else ""
+    return f"escrito ok: {path}{warning}"
 
 
 def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string: str) -> str:
@@ -820,6 +872,7 @@ async def run_coding_agent(
     has_run_verification = bool(resume_state.get("has_run_verification"))
     initial_plan = resume_state.get("initial_plan")
     consulted_risk_graph = bool(resume_state.get("consulted_risk_graph"))
+    listed_dirs = set(resume_state.get("listed_dirs") or [])
     verification_nudge_given = False
     self_review_nudge_given = False
     tool_call_nudge_given = False
@@ -844,6 +897,7 @@ async def run_coding_agent(
             "has_run_verification": has_run_verification,
             "initial_plan": initial_plan,
             "consulted_risk_graph": consulted_risk_graph,
+            "listed_dirs": sorted(listed_dirs),
         }
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="coding_agent_conversation_", delete=False, encoding="utf-8"
@@ -962,10 +1016,24 @@ async def run_coding_agent(
                                 "Todavia no investigaste el repo. Usa read_file, list_directory, o "
                                 "grep_search antes de escribir o ejecutar algo."
                             )
+                        elif (
+                            name == "run_shell_command"
+                            and _SCAFFOLD_COMMAND_PATTERN.search(str(tool_input.get("command", "")))
+                            and _normalize_listed_dir(tool_input.get("cwd", "")) not in listed_dirs
+                        ):
+                            scaffold_dir = tool_input.get("cwd") or "."
+                            output = (
+                                f"Este comando crea estructura de proyecto NUEVA (scaffolding) en '{scaffold_dir}' -- "
+                                f"antes de correrlo, usa list_directory con path=\"{scaffold_dir}\" para confirmar si "
+                                "ya existe estructura real ahi (ej. un src/ existente) que deberias extender en vez "
+                                "de duplicar."
+                            )
                         elif name in LOCAL_TOOLS:
                             output = LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input)
                             if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
                                 has_investigated = True
+                            if name == "list_directory":
+                                listed_dirs.add(_normalize_listed_dir(tool_input.get("path", ".")))
                             if name == "run_shell_command" and _VERIFICATION_COMMAND_PATTERN.search(str(tool_input.get("command", ""))):
                                 has_run_verification = True
                         else:

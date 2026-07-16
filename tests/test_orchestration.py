@@ -2196,6 +2196,7 @@ def test_run_coding_agent_local_real_reuses_existing_open_branch(monkeypatch, tm
         return _fake_subprocess_result()
 
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
 
     result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
 
@@ -2204,6 +2205,84 @@ def test_run_coding_agent_local_real_reuses_existing_open_branch(monkeypatch, tm
     # Se hizo "checkout copilot/T-1-100", NUNCA "checkout -b" con una rama nueva
     assert not any("-b" in cmd for cmd in git_calls if cmd[:3] == ["git", "-C", str(tmp_path)] and "checkout" in cmd)
     assert any(cmd[-1] == "copilot/T-1-100" and "checkout" in cmd and "-b" not in cmd for cmd in git_calls)
+
+
+def test_run_coding_agent_local_real_abandons_branch_when_tests_already_fail(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (epica KAN-4, la misma PR con dos arboles
+    src/ desconectados): antes se reusaba una rama rota sin chequear nada,
+    y el coding agent aplicaba un cambio nuevo sobre codigo ya roto. Ahora,
+    si los tests reales YA fallan en la rama tal cual esta (antes de
+    aplicar nada nuevo), se abandona y arranca de cero desde base_branch."""
+    git_calls = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)  # todavia abierta
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout=" M archivo.txt\n")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo real"})
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["resumed_branch"] is False
+    assert result["branch"] != "copilot/T-1-100"
+    assert any("-b" in cmd for cmd in git_calls if "checkout" in cmd)
+
+
+def test_run_coding_agent_local_real_abandons_branch_when_pr_rejected(monkeypatch, tmp_path):
+    """PR rechazada es motivo suficiente por si sola -- no hace falta ni
+    correr los tests de salud para decidir abandonar."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout=" M archivo.txt\n")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "_check_pr_rejected_for_branch", lambda *a, **k: True)
+
+    tests_called = {"n": 0}
+
+    def fail_if_tests_called(*a, **k):
+        tests_called["n"] += 1
+        return {"passed": True, "output": "no deberia llegar aca"}
+
+    monkeypatch.setattr(orchestration, "run_tests", fail_if_tests_called)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["resumed_branch"] is False
+    assert result["resumed_pr_rejected"] is False
+    assert tests_called["n"] == 0
 
 
 def test_run_coding_agent_local_real_does_not_delete_reused_branch_when_nothing_applied(monkeypatch, tmp_path):
@@ -2233,6 +2312,7 @@ def test_run_coding_agent_local_real_does_not_delete_reused_branch_when_nothing_
         return _fake_subprocess_result()
 
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
 
     result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
 

@@ -108,6 +108,43 @@ def test_tool_write_file_skips_when_rejected(tmp_path, monkeypatch):
     assert not (tmp_path / "rejected.txt").exists()
 
 
+def test_tool_write_file_warns_on_sibling_with_different_extension(tmp_path, monkeypatch):
+    """Bug real confirmado en vivo (PR real, epica KAN-4): el coding agent
+    creo Header.ts Y Header.tsx (mismo componente, dos extensiones) en el
+    mismo directorio -- confirma que ahora se avisa fuerte en el resultado
+    de la tool cuando eso pasa."""
+    (tmp_path / "Header.ts").write_text("export const Header = () => {};")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "Header.tsx", "export const Header = () => <div/>;")
+
+    assert "escrito ok" in result
+    assert "ADVERTENCIA" in result
+    assert "Header.ts" in result
+
+
+def test_tool_write_file_no_warning_when_no_sibling_exists(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "Header.tsx", "export const Header = () => <div/>;")
+
+    assert "escrito ok" in result
+    assert "ADVERTENCIA" not in result
+
+
+def test_tool_write_file_no_warning_when_overwriting_existing_file(tmp_path, monkeypatch):
+    """El aviso es solo para archivos NUEVOS -- sobreescribir el mismo
+    archivo (edicion legitima) no debe dispararlo."""
+    (tmp_path / "Header.ts").write_text("viejo")
+    (tmp_path / "Header.tsx").write_text("viejo tsx")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "Header.tsx", "nuevo contenido")
+
+    assert "escrito ok" in result
+    assert "ADVERTENCIA" not in result
+
+
 def test_tool_write_file_blocks_path_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda: "s")
 
@@ -270,6 +307,91 @@ def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(m
 
     assert result["status"] == "done"
     assert result["self_verified"] is False
+
+
+def test_run_coding_agent_blocks_scaffold_command_without_listing_target_dir(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (PR real, epica KAN-4): "ionic start
+    my-app" corrio dentro de frontend/ sin revisar antes si ya habia un
+    src/ real ahi -- resultado: dos arboles src/ desconectados en el mismo
+    PR. Confirma que el gate rechaza el comando de scaffolding (nunca lo
+    ejecuta de verdad) hasta que el agente liste el directorio destino."""
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "existing.txt").write_text("ya existe")
+    (tmp_path / "frontend").mkdir()
+
+    captured_tool_results = []
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if isinstance(messages[-1].get("content"), list):
+            captured_tool_results.append(messages[-1]["content"])
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [{
+                "type": "tool_use", "id": "call_2", "name": "run_shell_command",
+                "input": {"command": "ionic start my-app blank --type=angular", "cwd": "frontend"},
+            }]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    def fail_if_called(*a, **k):
+        pytest.fail("el comando de scaffolding NUNCA deberia ejecutarse de verdad sin list_directory antes")
+
+    monkeypatch.setattr(ca.subprocess, "run", fail_if_called)
+
+    asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    scaffold_result = captured_tool_results[-1][0]["content"]
+    assert "crea estructura de proyecto NUEVA" in scaffold_result
+    assert "exit_code=" not in scaffold_result
+
+
+def test_run_coding_agent_allows_scaffold_command_after_listing_target_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    (tmp_path / "frontend").mkdir()
+
+    captured_tool_results = []
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if isinstance(messages[-1].get("content"), list):
+            captured_tool_results.append(messages[-1]["content"])
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "list_directory", "input": {"path": "frontend"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [{
+                "type": "tool_use", "id": "call_2", "name": "run_shell_command",
+                "input": {"command": "ionic start my-app blank --type=angular", "cwd": "frontend"},
+            }]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    monkeypatch.setattr(ca.subprocess, "run", lambda *a, **k: FakeCompleted())
+
+    asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    scaffold_result = captured_tool_results[-1][0]["content"]
+    assert "exit_code=0" in scaffold_result
 
 
 def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypatch, tmp_path):
