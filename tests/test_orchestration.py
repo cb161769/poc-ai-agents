@@ -21,6 +21,7 @@ from orchestration import (
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
     _filter_active_children,
+    _git_add_all_excluding_vendor,
     _has_duplicate_project_scaffolding,
     _query_component_risk_history,
     _resolve_pr_threads,
@@ -33,6 +34,59 @@ from orchestration import (
     _transition_all,
     ensure_on_trunk_branch,
 )
+
+
+def _init_real_git_repo(repo_dir):
+    import subprocess as sp
+    sp.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "baseline"], cwd=repo_dir, check=True)
+
+
+def test_git_add_all_excluding_vendor_stages_real_files(tmp_path):
+    _init_real_git_repo(tmp_path)
+    (tmp_path / "app.py").write_text("print('hi')")
+
+    _git_add_all_excluding_vendor(str(tmp_path))
+
+    import subprocess as sp
+    staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
+    assert "app.py" in staged
+
+
+def test_git_add_all_excluding_vendor_skips_node_modules(tmp_path):
+    """Bug real confirmado en vivo (operacion de esta sesion, epica KAN-4):
+    un 'npm install' real corrido por el testing agent generaba
+    node_modules/ completo -- sin esto, 'git add -A' lo meteria ENTERO en
+    el commit, y output_guard bloqueaba la epica entera por un falso
+    positivo (matcheo 'rm -rf' dentro de un script de build de un paquete
+    vendoreado de terceros, no nada escrito por el agente).
+    """
+    _init_real_git_repo(tmp_path)
+    (tmp_path / "app.py").write_text("print('hi')")
+    vendor_dir = tmp_path / "node_modules" / "some-package"
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / "package.json").write_text('{"scripts": {"build": "rm -rf dist"}}')
+
+    _git_add_all_excluding_vendor(str(tmp_path))
+
+    import subprocess as sp
+    staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
+    assert "app.py" in staged
+    assert "node_modules" not in staged
+
+
+@pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__"])
+def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, vendor_dir):
+    _init_real_git_repo(tmp_path)
+    nested = tmp_path / vendor_dir / "some-file.txt"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("vendored content")
+
+    _git_add_all_excluding_vendor(str(tmp_path))
+
+    import subprocess as sp
+    staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
+    assert staged.strip() == ""
 
 
 def test_ensure_on_trunk_branch_checks_out_main_and_pulls(monkeypatch):

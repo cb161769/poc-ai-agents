@@ -971,7 +971,7 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
     ).stdout
 
     if suggest.returncode == 0 and status.strip():
-        subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
+        _git_add_all_excluding_vendor(target_repo_dir)
         try:
             subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Copilot suggestion for {ticket_id}"], check=True)
             return {
@@ -1016,6 +1016,29 @@ def _local_coding_agent_backend_available() -> bool:
 # proyecto real duplicado (ej. un modulo vendoreado) -- se excluyen ademas
 # de .git/node_modules para no generar falsos positivos.
 _SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__"}
+
+
+def _git_add_all_excluding_vendor(target_repo_dir: str) -> None:
+    """git add -A, pero excluyendo directorios de dependencias/build reales
+    (misma lista que _SCAFFOLD_SCAN_SKIP_DIRS). Bug real confirmado en vivo
+    (operacion de esta sesion, epica KAN-4): un 'npm install' real corrido
+    por el testing agent generaba node_modules/ completo (2417 archivos,
+    1.26M lineas de codigo de terceros) -- sin esto, 'git add -A' lo metia
+    ENTERO en el commit, y output_guard bloqueaba la epica entera por un
+    falso positivo (matcheo 'rm -rf' dentro de un script de build de un
+    paquete vendoreado, no nada escrito por el agente). Defensivo: no
+    depende de que el repo objetivo tenga su propio .gitignore bien
+    configurado -- confirmado real que no siempre lo tiene.
+    """
+    # Forma larga ":(exclude)" en vez de ":!" -- confirmado real probando
+    # esto: la forma corta falla con "Unimplemented pathspec magic '_'" en
+    # nombres que empiezan con guion bajo (ej. "__pycache__") en algunas
+    # versiones de git.
+    pathspec_excludes = [f":(exclude){d}" for d in sorted(_SCAFFOLD_SCAN_SKIP_DIRS) if d != ".git"]
+    subprocess.run(
+        ["git", "-C", target_repo_dir, "add", "-A", "--", ".", *pathspec_excludes],
+        check=True,
+    )
 
 
 def _is_project_root(dir_path: Path) -> bool:
@@ -1194,7 +1217,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     has_own_commits = commits_ahead.isdigit() and int(commits_ahead) > 0
 
     if status.strip():
-        subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
+        _git_add_all_excluding_vendor(target_repo_dir)
         try:
             subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
             has_own_commits = True
@@ -1338,7 +1361,7 @@ def retry_coding_agent_local_real(
         }
 
     if status.strip():
-        subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
+        _git_add_all_excluding_vendor(target_repo_dir)
         try:
             subprocess.run(
                 ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
