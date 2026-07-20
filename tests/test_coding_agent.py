@@ -256,6 +256,152 @@ def test_tool_run_shell_command_rejects_cwd_that_is_not_a_directory(tmp_path, mo
     assert "no es un directorio" in result
 
 
+def test_resolve_stack_image_if_needed_none_when_binary_available_locally(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4/KAN-6): el coding agent
+    corria sus propios comandos de verificacion (npm install/npm test)
+    DIRECTO en testrunner (Python-only, sin Node) -- 'npm: not found'
+    SIEMPRE, indistinguible de un fallo real del codigo generado. Si el
+    binario YA esta disponible localmente (este caso), no hay que
+    containerizar -- corre nativo, sin overhead de contenedor."""
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+
+    assert ca._resolve_stack_image_if_needed("npm test", tmp_path) is None
+
+
+def test_resolve_stack_image_if_needed_none_when_no_stack_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    assert ca._resolve_stack_image_if_needed("npm test", tmp_path) is None
+
+
+def test_resolve_stack_image_if_needed_none_when_docker_unavailable(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: None)
+
+    assert ca._resolve_stack_image_if_needed("npm test", tmp_path) is None
+
+
+def test_resolve_stack_image_if_needed_returns_image_when_marker_present_and_binary_missing(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    image = ca._resolve_stack_image_if_needed("npm install && npm test", tmp_path)
+
+    assert image == "mcr.microsoft.com/playwright:v1.44.1-jammy"
+
+
+@pytest.mark.parametrize("marker_file,binary,expected_image", [
+    ("pom.xml", "mvn", "maven:3.9-eclipse-temurin-17"),
+    ("go.mod", "go", "golang:1.22"),
+    ("Gemfile", "bundle", "ruby:3.3"),
+    ("Cargo.toml", "cargo", "rust:1.78"),
+    ("Pipfile", "pipenv", "python:3.10-slim"),
+])
+def test_resolve_stack_image_if_needed_covers_every_known_stack(tmp_path, monkeypatch, marker_file, binary, expected_image):
+    (tmp_path / marker_file).write_text("")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    assert ca._resolve_stack_image_if_needed(binary, tmp_path) == expected_image
+
+
+def test_resolve_stack_image_if_needed_dotnet_uses_glob_marker(tmp_path, monkeypatch):
+    """.NET no tiene un nombre de archivo fijo (*.csproj/*.sln) -- a
+    diferencia del resto de los stacks, que chequean un marcador con nombre
+    exacto."""
+    (tmp_path / "MyProject.csproj").write_text("")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    assert ca._resolve_stack_image_if_needed("dotnet test", tmp_path) == "mcr.microsoft.com/dotnet/sdk:8.0"
+
+
+def test_run_command_in_stack_container_builds_correct_docker_invocation(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="tests pasaron", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    result = ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.44.1-jammy", "npm test", str(tmp_path), tmp_path)
+
+    assert captured["cmd"] == [
+        "docker", "run", "--rm", "-v", f"{tmp_path}:/work", "-w", "/work",
+        "mcr.microsoft.com/playwright:v1.44.1-jammy", "sh", "-c", "npm test",
+    ]
+    assert "exit_code=0" in result
+    assert "tests pasaron" in result
+
+
+def test_run_command_in_stack_container_uses_host_target_repo_dir_for_subdir(tmp_path, monkeypatch):
+    """Docker-outside-of-Docker (mismo patron que orchestration.py::run_tests()):
+    cuando work_dir es una SUBCARPETA del repo objetivo (monorepo real, ej.
+    frontend/), el path que el daemon del HOST puede montar tiene que ser
+    HOST_TARGET_REPO_DIR + esa misma subcarpeta -- no target_repo_dir (que
+    solo existe DENTRO de este contenedor)."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.setenv("HOST_TARGET_REPO_DIR", "/host/real/path")
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.44.1-jammy", "npm test", str(tmp_path), frontend)
+
+    assert "-v" in captured["cmd"]
+    v_index = captured["cmd"].index("-v")
+    assert captured["cmd"][v_index + 1] == "/host/real/path/frontend:/work"
+
+
+def test_tool_run_shell_command_delegates_to_stack_container_when_binary_missing(tmp_path, monkeypatch):
+    """End-to-end: el binario (npm) no esta disponible localmente, pero SI
+    hay un package.json real -- run_shell_command tiene que delegar a la
+    imagen correcta en vez de fallar con 'npm: not found'."""
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+
+    result = ca.tool_run_shell_command(str(tmp_path), "npm test")
+
+    assert captured["cmd"][0] == "docker"
+    assert "exit_code=0" in result
+
+
+def test_tool_run_shell_command_runs_natively_when_binary_available(tmp_path, monkeypatch):
+    """El caso comun (binario ya disponible, ej. git/python3 en testrunner):
+    cero cambio de comportamiento -- corre nativo, docker nunca se invoca."""
+    monkeypatch.setattr("builtins.input", lambda: "s")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/git" if name == "git" else None)
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+
+    result = ca.tool_run_shell_command(str(tmp_path), "git status")
+
+    assert captured["command"] == "git status"  # no ["docker", "run", ...]
+    assert "exit_code=0" in result
+
+
 def test_build_user_prompt_does_not_precargar_root_listing(tmp_path):
     """El listado de la raiz del repo ya no viaja precargado en el prompt
     inicial -- el modelo lo pide el mismo con list_directory si le hace

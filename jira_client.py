@@ -585,6 +585,19 @@ def _markdown_to_adf(text: str) -> dict:
     return {"type": "doc", "version": 1, "content": content}
 
 
+# Jira Cloud rechaza (400) comentarios cuyo cuerpo ADF excede un tamano
+# real -- gap identificado en auditoria ("gaps en los flujos de jira"): un
+# reporte tecnico/razonamiento del juez generado por un LLM sin ningun tope
+# de longitud (a diferencia de los extractos de output de test, que ya se
+# recortan con [-1500:]/[:2000] en orchestration.py) podia superarlo, y ese
+# 400 se atrapaba como cualquier otro fallo de Jira (transition_jira/
+# comment_jira: best-effort, solo un WARNING) -- el comentario se perdia
+# entero en silencio en vez de llegar recortado. Limite conservador (bien
+# por debajo del limite real de Jira) para dejar margen al overhead del
+# markup ADF generado a partir del texto plano.
+_COMMENT_MAX_CHARS = 30000
+
+
 def post_audit_comment(ticket_key: str, text: str) -> dict:
     """Posts a Markdown-formatted audit comment on the real Jira ticket
     (converted to real Atlassian Document Format -- ver _markdown_to_adf),
@@ -599,6 +612,9 @@ def post_audit_comment(ticket_key: str, text: str) -> dict:
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json", "Content-Type": "application/json"}
 
+    if len(text) > _COMMENT_MAX_CHARS:
+        text = text[:_COMMENT_MAX_CHARS] + "\n\n... (comentario truncado -- excedia el tamano maximo real de un comentario de Jira)"
+
     body_adf = _markdown_to_adf(text)
 
     resp = httpx.post(
@@ -609,6 +625,10 @@ def post_audit_comment(ticket_key: str, text: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+_COMMENT_ALREADY_POSTED_MAX_RESULTS = 100
+_COMMENT_ALREADY_POSTED_MAX_PAGES = 5
 
 
 def comment_already_posted(ticket_key: str, marker: str) -> bool:
@@ -622,28 +642,125 @@ def comment_already_posted(ticket_key: str, marker: str) -> bool:
     Best-effort: si esta consulta falla (red, credenciales), devuelve False
     -- mejor un duplicado ocasional que perder el comentario real por
     completo.
+
+    Gap real identificado en auditoria posterior ("gaps en los flujos de
+    jira"): la primera version solo miraba maxResults=50 (una sola pagina) --
+    en un ticket que paso por varias corridas del pipeline (cada una postea
+    varios comentarios: test plan, estado del agente, salida de tests,
+    veredicto del juez, link al PR, comprobante tecnico), un marcador de una
+    corrida anterior se corria mas alla de esa ventana y la deteccion de
+    duplicados fallaba en silencio. Pagina (ordenado -created, el marcador
+    mas reciente aparece primero) hasta encontrarlo o agotar un limite
+    acotado -- sigue siendo best-effort, no un scan sin fin.
     """
-    jira_url = os.environ["JIRA_URL"].rstrip("/")
-    email = require_secret("JIRA_EMAIL")
-    token = require_secret("JIRA_API_TOKEN")
+    return _any_recent_comment_matches(ticket_key, lambda comment: marker in json.dumps(comment.get("body", {})))
+
+
+def _any_recent_comment_matches(ticket_key: str, predicate) -> bool:
+    """Paginacion compartida real entre comment_already_posted (marcador
+    exacto de idempotencia) y test_plan_already_posted (prefijo de texto) --
+    misma logica de scan acotado, distinto criterio de match. Best-effort de
+    verdad (no solo contra fallos de red): a diferencia de
+    comment_already_posted (que solo se llama cuando ya hay un marcador real
+    de idempotencia, ver _comment_idempotency_marker), test_plan_already_posted
+    se llama incondicionalmente cada vez que hay un test plan generado -- si
+    JIRA_URL/JIRA_EMAIL/JIRA_API_TOKEN faltaran (ej. una corrida de test),
+    KeyError tiene que degradar a False igual que un fallo de red, no
+    tirar abajo el caller.
+    """
+    try:
+        jira_url = os.environ["JIRA_URL"].rstrip("/")
+        email = require_secret("JIRA_EMAIL")
+        token = require_secret("JIRA_API_TOKEN")
+    except KeyError:
+        return False
     auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
 
+    start_at = 0
+    for _page in range(_COMMENT_ALREADY_POSTED_MAX_PAGES):
+        try:
+            resp = httpx.get(
+                f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
+                headers=headers,
+                params={"maxResults": _COMMENT_ALREADY_POSTED_MAX_RESULTS, "startAt": start_at, "orderBy": "-created"},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError:
+            return False
+
+        body = resp.json()
+        comments = body.get("comments", [])
+        for comment in comments:
+            if predicate(comment):
+                return True
+
+        start_at += len(comments)
+        total = body.get("total", start_at)
+        if not comments or start_at >= total:
+            break
+
+    return False
+
+
+def test_plan_already_posted(ticket_key: str) -> bool:
+    """Gap real identificado en auditoria ("gaps en los flujos de jira",
+    KAN-6 real): un ticket que nunca progresa mas alla del coding agent
+    (bloqueado por output_guard/tests/juez en cada corrida, dias seguidos)
+    regenera y reposta un Test Plan practicamente identico en CADA corrida
+    nueva -- confirmado real: KAN-6 tuvo el MISMO Test Plan posteado 5 veces
+    en dias distintos, enterrando la señal real (por que se bloqueo) entre
+    ruido repetido. A diferencia de comment_already_posted (marcador exacto
+    por flow_run_id, para evitar duplicados dentro de la MISMA corrida), esto
+    chequea si YA existe cualquier comentario de Test Plan para este ticket,
+    sin importar de que corrida -- el test plan se sigue regenerando e
+    inyectando en el prompt del coding agent en cada corrida (evidencia
+    fresca del ticket), solo se evita volver a POSTEARLO si ya esta visible.
+    Best-effort: igual que comment_already_posted, un fallo de red/credenciales
+    devuelve False (mejor un duplicado ocasional que perder visibilidad).
+    """
+    # ASCII-only ("Test Plan (Prefect):" sin el emoji que lo precede) a
+    # proposito: json.dumps() por default escapa no-ASCII a \uXXXX, asi que
+    # buscar el emoji literal en el JSON serializado nunca matchearia.
+    return _any_recent_comment_matches(
+        ticket_key, lambda comment: "Test Plan (Prefect):" in json.dumps(comment.get("body", {}))
+    )
+
+
+_PIPELINE_BLOCKED_LABEL = "pipeline-blocked"
+
+
+def set_pipeline_blocked_label(ticket_key: str, blocked: bool) -> None:
+    """Gap real identificado en auditoria ("gaps en los flujos de jira", KAN-6
+    real): este proyecto de Jira (team-managed/simplified) solo tiene 4
+    estados (Por hacer/En curso/En revision/Finalizado) -- no existe un
+    estado "Blocked" real en el workflow. JIRA_BLOCKED_STATUS y
+    JIRA_REVIEW_STATUS terminan configurados con el MISMO string ("En
+    revision"), asi que un ticket bloqueado por el firewall/output_guard/
+    tests/juez queda visualmente IDENTICO a uno con un PR real listo para
+    revisar -- confirmado real: KAN-6 estuvo dias en "En revision" sin
+    ningun PR, porque cada corrida lo bloqueaba, y la unica forma de
+    notarlo era leyendo cada comentario uno por uno.
+
+    Best-effort (igual que comment_already_posted/post_audit_comment): un
+    fallo aca (red, credenciales, el label ya estaba/no estaba) nunca debe
+    bloquear la corrida real -- esto es una señal visual extra, no una
+    parte critica del pipeline.
+    """
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    action = "add" if blocked else "remove"
     try:
-        resp = httpx.get(
-            f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
+        resp = httpx.put(
+            f"{jira_url}/rest/api/3/issue/{ticket_key}",
             headers=headers,
-            params={"maxResults": 50, "orderBy": "-created"},
+            json={"update": {"labels": [{action: _PIPELINE_BLOCKED_LABEL}]}},
             timeout=15.0,
         )
         resp.raise_for_status()
     except httpx.HTTPError:
-        return False
-
-    for comment in resp.json().get("comments", []):
-        if marker in json.dumps(comment.get("body", {})):
-            return True
-    return False
+        pass  # best-effort, mismo criterio que comment_already_posted: nunca bloquea la corrida real
 
 
 def transition_ticket(ticket_key: str, target_status_name: str) -> dict:

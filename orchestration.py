@@ -39,6 +39,7 @@ run_poc_loop.sh is kept as-is for anyone who prefers a plain bash run
 without standing up Prefect — both drive the exact same scripts underneath.
 """
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -75,23 +76,53 @@ from coding_agent import _STACK_MARKERS
 from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
-from pipeline_shared import RETRYABLE_POLICY_REFERENCES, TicketState, outcome_to_state
+from pipeline_shared import (
+    RETRYABLE_POLICY_REFERENCES,
+    TicketState,
+    acquire_ticket_lock,
+    outcome_to_state,
+    release_ticket_lock,
+)
 
 logger = get_logger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
-JIRA_IN_PROGRESS_STATUS = os.environ.get("JIRA_IN_PROGRESS_STATUS", "In Progress")
-JIRA_BLOCKED_STATUS = os.environ.get("JIRA_BLOCKED_STATUS", "Blocked")
+
+
+def _env_status(name: str, default: str) -> str:
+    """os.environ.get() para nombres de estados de Jira, pero pelando un
+    par de comillas simples/dobles que envuelvan el valor entero. Bug real
+    confirmado en vivo (multiples corridas de esta sesion, epica KAN-4):
+    docker run --env-file / docker-compose env_file: NO interpretan
+    comillas como lo haria un shell -- ".env" tenia
+    'JIRA_REVIEW_STATUS="En revision"' (comillas puestas por habito de
+    bash), asi que el valor real de la env var terminaba siendo el string
+    literal '"En revision"' CON las comillas adentro. transition_ticket()
+    entonces buscaba una transicion llamada '"En revision"' y fallaba
+    SIEMPRE, aunque 'En revision' (sin comillas) estuviera listado como
+    transicion disponible -- confirmado via el mensaje de error real:
+    "no hay una transicion llamada '\"En revision\"' ... Disponibles:
+    [... 'En revision' ...]". Cada corrida de la epica de esta sesion tuvo
+    este bug silencioso (solo un WARNING en el log, nunca bloqueaba nada).
+    """
+    value = os.environ.get(name, default)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+JIRA_IN_PROGRESS_STATUS = _env_status("JIRA_IN_PROGRESS_STATUS", "In Progress")
+JIRA_BLOCKED_STATUS = _env_status("JIRA_BLOCKED_STATUS", "Blocked")
 # Corrida exitosa (juez OK) -- antes no habia NINGUNA transicion de exito, un
 # ticket que pasaba todo el pipeline se quedaba atascado en JIRA_IN_PROGRESS_STATUS.
-JIRA_REVIEW_STATUS = os.environ.get("JIRA_REVIEW_STATUS", "Code Review")
+JIRA_REVIEW_STATUS = _env_status("JIRA_REVIEW_STATUS", "Code Review")
 # Confirmado real (usuario, "encuentra gaps en jira de cara al development
 # cycle"): el pipeline nunca transicionaba nada a Done -- llegaba como mucho
 # a JIRA_REVIEW_STATUS y de ahi en mas dependia de que un humano se acuerde
 # de cerrar el ticket a mano cuando mergea la PR. Ver _find_merged_branch_for_ticket/
 # _check_already_completed.
-JIRA_DONE_STATUS = os.environ.get("JIRA_DONE_STATUS", "Done")
+JIRA_DONE_STATUS = _env_status("JIRA_DONE_STATUS", "Done")
 # Gap real (usuario, "gaps en el scrum agent"): fetch_epic_with_children() no
 # filtra por status -- trae TODOS los hijos de la epica, incluidos los ya
 # terminales. Se le pasaban tal cual al scrum agent (epic_planner.py), que
@@ -133,6 +164,34 @@ class PipelineBlocked(Exception):
     attachments unresolved) — surfaces as a failed run in the Prefect UI,
     which is the observability win over a bash `exit 1` nobody's watching.
     """
+
+
+@contextlib.contextmanager
+def _held_ticket_lock(ticket_id: str):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira"): sin
+    esto, dos corridas sobre el MISMO ticket (un humano re-corriendo
+    run_poc_loop.sh a mano mientras un flow de Prefect disparado por webhook
+    todavia esta corriendo, o dos corridas agendadas solapadas) podian
+    comentar/transicionar Jira en paralelo, intercalado -- y transition_ticket
+    (jira_client.py) hace un GET de transiciones disponibles y despues un
+    POST por separado, no atomico, asi que una transicion concurrente entre
+    esos dos pasos puede dejar al POST apuntando a un id de transicion
+    stale. Se levanta PipelineBlocked (no una excepcion generica) para que
+    esto se vea en la UI de Prefect como lo que es -- un stop esperado, no
+    un crash -- exactamente igual que un rechazo del firewall.
+    """
+    if not acquire_ticket_lock(ticket_id):
+        raise PipelineBlocked(
+            f"{ticket_id}: ya hay otra corrida de este pipeline trabajando este ticket ahora mismo "
+            "(lock de archivo activo) -- evita comentarios/transiciones de Jira intercalados entre dos "
+            "corridas concurrentes. Si esto persiste y no hay ninguna corrida real en curso, es un lock "
+            "huerfano de un proceso que crasheo -- se libera solo despues de un tiempo (ver "
+            "pipeline_shared.DEFAULT_LOCK_STALE_SECONDS)."
+        )
+    try:
+        yield
+    finally:
+        release_ticket_lock(ticket_id)
 
 
 def _run(cmd: list, input_text: str | None = None, check: bool = True, env: dict | None = None) -> str:
@@ -386,21 +445,76 @@ def evaluate_firewall(prompt: str, jira_context: dict, sonar_errors: list) -> di
     return resp.json()
 
 
-@task(retries=2, retry_delay_seconds=5, name="transition-jira")
-def transition_jira(status: str, ticket_key: str | None = None):
+_jira_auth_failed_this_run = False
+
+
+def _is_jira_auth_failure(exc: Exception) -> bool:
+    """401/403 real de Jira -- a diferencia de un nombre de transicion
+    invalido o una red caida transitoria, esto significa que el token
+    (JIRA_API_TOKEN) es invalido/expiro, y TODAS las escrituras a Jira del
+    resto de esta corrida van a fallar exactamente igual. Mismo criterio que
+    _is_hard_auth_failure en agent_loop.py (circuit breaker de Anthropic)."""
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403)
+
+
+def _warn_jira_write_failed(action: str, key: str, status_or_text: str, exc: Exception) -> None:
+    """Gap real identificado en auditoria ("gaps en los flujos de jira"):
+    @task(retries=2) en transition_jira/comment_jira era codigo muerto -- las
+    excepciones se atrapaban ANTES de que Prefect pudiera reintentar, asi que
+    los 2 reintentos configurados nunca se disparaban (confirmado leyendo el
+    codigo: Prefect solo reintenta si la tarea *raisea*). Las escrituras a
+    Jira son intencionalmente NO reintentadas via retry_utils.retry_call
+    (ver su docstring: reintentar un POST cuyo request SI llego a Jira
+    arriesgaria una transicion/comentario duplicado -- salvo comment_jira,
+    que ya tiene idempotencia real via _comment_idempotency_marker). Lo que
+    SI era un gap real de observabilidad: un token vencido a mitad de una
+    epica larga (KAN-4, confirmado real esta sesion) hacia que CADA escritura
+    posterior fallara en silencio, indistinguible en los logs de un typo de
+    nombre de transicion puntual. Esto lo hace ruidoso una sola vez (ERROR),
+    y despues vuelve a WARNING para no inundar el log de una epica de 12
+    historias con la misma causa raiz repetida.
+    """
+    global _jira_auth_failed_this_run
+    if _is_jira_auth_failure(exc):
+        if not _jira_auth_failed_this_run:
+            _jira_auth_failed_this_run = True
+            get_run_logger().error(
+                f"JIRA_API_TOKEN invalido/expirado -- {action} de '{key}' a '{status_or_text}' fallo con "
+                f"{exc}. TODAS las escrituras a Jira del resto de esta corrida van a fallar de la misma "
+                "forma (se loguean solo como WARNING de aca en mas para no inundar el log)."
+            )
+        else:
+            get_run_logger().warning(f"No se pudo {action} '{key}' a '{status_or_text}' (token de Jira ya confirmado invalido): {exc}")
+    else:
+        get_run_logger().warning(f"No se pudo {action} '{key}' a '{status_or_text}': {exc}")
+
+
+@task(name="transition-jira")
+def transition_jira(status: str, ticket_key: str | None = None, blocked: bool = False):
+    """blocked: senal EXPLICITA de intencion, no inferida del valor de
+    'status' -- gap real identificado en auditoria ("gaps en los flujos de
+    jira", KAN-6 real): este proyecto de Jira solo tiene 4 estados, asi que
+    JIRA_BLOCKED_STATUS y JIRA_REVIEW_STATUS terminan configurados con el
+    MISMO string ("En revision"). Si se infiriera 'blocked' comparando
+    status == JIRA_BLOCKED_STATUS, un ticket con un veredicto OK real
+    (transicionado a JIRA_REVIEW_STATUS, que en este proyecto ES ese mismo
+    string) se marcaria incorrectamente como bloqueado -- exactamente el
+    problema que esto existe para resolver. Cada caller declara la
+    intencion real de la transicion, no el string resultante.
+    """
     key = ticket_key or os.environ["JIRA_TICKET_KEY"]
     try:
         jira_client.transition_ticket(key, status)
+        jira_client.set_pipeline_blocked_label(key, blocked)
     except Exception as exc:
-        # Best-effort (igual que antes, con check=False) pero YA NO en
-        # silencio -- antes un fallo real de Jira (nombre de transicion
+        # Best-effort a proposito (igual que antes, con check=False) pero YA
+        # NO en silencio -- antes un fallo real de Jira (nombre de transicion
         # invalido, red caida) desaparecia sin dejar rastro. Gap real de
         # observabilidad (Prefect): esto usaba el logger de log_utils
         # (stderr crudo del contenedor), invisible en la UI de Prefect --
-        # aunque la tarea agota sus 2 reintentos y "completa" igual (best-
-        # effort a proposito), get_run_logger() deja el fallo real visible
-        # en los logs de ESA tarea puntual en vez de perderse en stderr.
-        get_run_logger().warning(f"No se pudo transicionar el ticket {key} a '{status}': {exc}")
+        # get_run_logger() deja el fallo real visible en los logs de ESA
+        # tarea puntual en vez de perderse en stderr.
+        _warn_jira_write_failed("transicionar", key, status, exc)
 
 
 def _comment_idempotency_marker(text: str) -> str:
@@ -421,17 +535,26 @@ def _comment_idempotency_marker(text: str) -> str:
     return f"[ref: {flow_run_id}:{text_hash}]"
 
 
-@task(retries=2, retry_delay_seconds=5, name="comment-jira")
+@task(name="comment-jira")
 def comment_jira(text: str, ticket_key: str | None = None):
     key = ticket_key or os.environ["JIRA_TICKET_KEY"]
     marker = _comment_idempotency_marker(text)
+    # jira_client.post_audit_comment() ya trunca por tamano como red de
+    # seguridad general (cualquier caller), pero si el corte cayera aca
+    # (dentro de comment_jira) se llevaria puesto el marcador de idempotencia
+    # -- que se concatena DESPUES, al final del texto -- rompiendo la
+    # deteccion de duplicados justo en los comentarios largos (reportes
+    # tecnicos) que mas la necesitan. Se trunca el cuerpo ACA, antes de
+    # agregar el marcador, para garantizar que el marcador sobrevive entero.
+    if marker and len(text) > jira_client._COMMENT_MAX_CHARS - len(marker) - 4:
+        text = text[: jira_client._COMMENT_MAX_CHARS - len(marker) - 4] + "\n\n..."
     try:
         if marker and jira_client.comment_already_posted(key, marker):
             get_run_logger().info(f"Comentario ya posteado antes en {key} (marcador {marker}) -- no se duplica.")
             return
         jira_client.post_audit_comment(key, f"{text}\n\n{marker}" if marker else text)
     except Exception as exc:
-        get_run_logger().warning(f"No se pudo comentar en el ticket {key}: {exc}")
+        _warn_jira_write_failed("comentar en", key, text[:80], exc)
 
 
 def _post_child_technical_report(epic_key: str, child_id: str, backend: str | None, resultado: str, extra: dict | None = None) -> None:
@@ -471,12 +594,12 @@ def _comment_all(text: str, ticket_id: str, is_epic: bool, child_ticket_keys: li
             comment_jira(text, ticket_key=child_key)
 
 
-def _transition_all(status: str, ticket_id: str, is_epic: bool, child_ticket_keys: list | None) -> None:
+def _transition_all(status: str, ticket_id: str, is_epic: bool, child_ticket_keys: list | None, blocked: bool = False) -> None:
     """Mismo criterio que _comment_all, para transiciones de estado."""
-    transition_jira(status, ticket_key=ticket_id)
+    transition_jira(status, ticket_key=ticket_id, blocked=blocked)
     if is_epic:
         for child_key in (child_ticket_keys or []):
-            transition_jira(status, ticket_key=child_key)
+            transition_jira(status, ticket_key=child_key, blocked=blocked)
 
 
 @task(retries=0, name="push-and-open-pr")
@@ -903,6 +1026,46 @@ def _find_merged_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_br
     return merged_branches[0]
 
 
+def _branch_has_recorded_judge_ok(ticket_id: str, branch: str) -> bool | None:
+    """Gap real identificado en auditoria (audit de esta sesion, "gaps en
+    los flujos de jira"): _check_already_completed confiaba EXCLUSIVAMENTE
+    en que una rama 'copilot/{ticket_id}-*' fuera ancestro de base_branch
+    para marcar Done -- sin verificar que esa rama vino de una corrida real
+    de ESTE pipeline con veredicto OK del juez (vs. ej. una rama que un
+    humano creo a mano con un nombre que por casualidad matchea el patron,
+    y que mergeo por una razon no relacionada). graph_writer.py ya deja
+    Run{{branch}}-[:FOR_TICKET]->root{{key}} y Run-[:HAS_DECISION]->
+    Decision{{stage:'judge', status}} -- esto corrobora contra esa
+    evidencia real en vez de confiar solo en el nombre de la rama.
+    Devuelve True/False si pudo consultar, None si el grafo no esta
+    disponible (best-effort, mismo criterio que _query_component_risk_history
+    -- nunca bloquea la corrida).
+    """
+    neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
+    neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
+    query = (
+        f"MATCH (run:Run {{branch: '{branch}'}})-[:FOR_TICKET]->(root {{key: '{ticket_id}'}}) "
+        "MATCH (run)-[:HAS_DECISION]->(dec:Decision {stage: 'judge'}) "
+        "WHERE dec.status = 'OK' "
+        "RETURN count(run) AS found"
+    )
+    try:
+        output = _run(["cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass, "--format", "plain", query])
+    except RuntimeError as exc:
+        logger.warning(f"{ticket_id}: no se pudo corroborar en el grafo el veredicto OK de la rama '{branch}': {exc}")
+        return None
+
+    lines = [line.strip().strip('"') for line in output.strip().splitlines() if line.strip()]
+    if not lines:
+        return False
+    try:
+        return int(lines[-1]) > 0
+    except ValueError:
+        logger.warning(f"{ticket_id}: respuesta inesperada del grafo al corroborar la rama '{branch}': {output!r}")
+        return None
+
+
 def _check_already_completed(
     ticket_id: str, jira_context: dict, target_repo_dir: str,
     is_epic: bool = False, child_ticket_keys: list | None = None,
@@ -928,12 +1091,23 @@ def _check_already_completed(
     if not merged_branch:
         return False
 
+    corroborated = _branch_has_recorded_judge_ok(ticket_id, merged_branch)
+    if corroborated is True:
+        caveat = ""
+    elif corroborated is False:
+        caveat = (
+            " ⚠️ OJO: no se encontro en el grafo un veredicto OK del juez registrado para esta rama exacta -- "
+            "verificar a mano que este merge corresponde a una corrida real de este pipeline."
+        )
+    else:
+        caveat = " (no se pudo corroborar contra el grafo de conocimiento -- Neo4j no disponible en esta corrida)"
+
     _comment_all(
         f"✅ Se detecto que la rama '{merged_branch}' de este ticket ya esta mergeada en "
-        f"'{base_branch}' -- se marca como completado sin volver a correr el pipeline.",
+        f"'{base_branch}' -- se marca como completado sin volver a correr el pipeline.{caveat}",
         ticket_id, is_epic, child_ticket_keys,
     )
-    _transition_all(JIRA_DONE_STATUS, ticket_id, is_epic, child_ticket_keys)
+    _transition_all(JIRA_DONE_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=False)
     return True
 
 
@@ -1033,8 +1207,14 @@ def _git_add_all_excluding_vendor(target_repo_dir: str) -> None:
     # Forma larga ":(exclude)" en vez de ":!" -- confirmado real probando
     # esto: la forma corta falla con "Unimplemented pathspec magic '_'" en
     # nombres que empiezan con guion bajo (ej. "__pycache__") en algunas
-    # versiones de git.
-    pathspec_excludes = [f":(exclude){d}" for d in sorted(_SCAFFOLD_SCAN_SKIP_DIRS) if d != ".git"]
+    # versiones de git. Ademas requiere el patron "**/<dir>/**" con magic
+    # "glob" -- un pathspec sin comodines (ej. ":(exclude)node_modules")
+    # solo excluye el directorio en la RAIZ del repo, no anidado (ej.
+    # "frontend/node_modules/"). Bug real confirmado en vivo (epica KAN-4,
+    # esta sesion): el fix original con ":(exclude)node_modules" seguia
+    # commiteando "frontend/node_modules/..." completo porque node_modules
+    # vivia dentro de "frontend/", no en la raiz.
+    pathspec_excludes = [f":(exclude,glob)**/{d}/**" for d in sorted(_SCAFFOLD_SCAN_SKIP_DIRS) if d != ".git"]
     subprocess.run(
         ["git", "-C", target_repo_dir, "add", "-A", "--", ".", *pathspec_excludes],
         check=True,
@@ -1084,6 +1264,43 @@ def _has_duplicate_project_scaffolding(target_repo_dir: str) -> str | None:
     return None
 
 
+def _branch_diff_has_vendor_pollution(target_repo_dir: str, branch: str, base_branch: str) -> str | None:
+    """Gap real identificado en auditoria ("gaps en los flujos de jira", KAN-6
+    real): _git_add_all_excluding_vendor (mas arriba) evita que una corrida
+    NUEVA meta node_modules/target/etc en un commit NUEVO, pero no hace nada
+    por una rama que YA estaba sucia de una corrida ANTERIOR a que ese fix
+    existiera -- _find_open_branch_for_ticket la sigue encontrando "abierta"
+    y la resume, asi que el diff contra base_branch arrastra esa
+    contaminacion vieja para siempre, sin importar que tan limpia sea la
+    corrida de HOY. Confirmado real: KAN-6 quedo bloqueado por
+    output_guard (falso positivo 'rm -rf' dentro de un script de build
+    vendoreado) en CADA corrida durante dias, incluso despues de aplicar el
+    fix de exclusion, porque la rama que se seguia resumiendo ya tenia
+    frontend/node_modules/@esbuild/... y auth-service/target/*.class
+    commiteados de antes. Mismo criterio que _has_duplicate_project_scaffolding
+    (senal de salud SEPARADA para el gate de resumir una rama existente):
+    si el diff YA tiene vendor adentro, la rama no se puede limpiar
+    incrementalmente (el commit contaminado sigue en su historia) -- hay
+    que abandonarla y arrancar de cero, igual que con una PR rechazada.
+    """
+    diff_files = subprocess.run(
+        ["git", "-C", target_repo_dir, "diff", "--name-only", f"{base_branch}..{branch}"],
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    vendor_dirs_found = {
+        part
+        for f in diff_files
+        for part in Path(f).parts
+        if part in _SCAFFOLD_SCAN_SKIP_DIRS and part != ".git"
+    }
+    if vendor_dirs_found:
+        return (
+            f"el diff contra '{base_branch}' ya tiene archivos dentro de {', '.join(sorted(vendor_dirs_found))} "
+            "commiteados (probablemente de una corrida anterior al fix de exclusion de vendor)"
+        )
+    return None
+
+
 @task(retries=0, name="coding-agent-local-real")
 def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
     """Camino B1: the real local coding agent (coding_agent.py) -- reasons
@@ -1117,13 +1334,22 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         if pr_rejected:
             abandon_reason = "la PR previa de esta rama fue rechazada/cerrada sin mergear"
         else:
-            health_check = run_tests(target_repo_dir)
-            if not health_check["passed"]:
-                abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+            # Chequeo barato (un solo git diff, sin correr tests reales) ANTES
+            # de run_tests() -- si la rama ya arrastra vendor commiteado de
+            # una corrida anterior al fix de exclusion, no tiene sentido
+            # gastar tiempo corriendo tests sobre algo que se va a abandonar
+            # de todas formas.
+            vendor_pollution = _branch_diff_has_vendor_pollution(target_repo_dir, existing_branch, base_branch)
+            if vendor_pollution:
+                abandon_reason = vendor_pollution
             else:
-                structural_issue = _has_duplicate_project_scaffolding(target_repo_dir)
-                if structural_issue:
-                    abandon_reason = f"estructura duplicada detectada: {structural_issue}"
+                health_check = run_tests(target_repo_dir)
+                if not health_check["passed"]:
+                    abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+                else:
+                    structural_issue = _has_duplicate_project_scaffolding(target_repo_dir)
+                    if structural_issue:
+                        abandon_reason = f"estructura duplicada detectada: {structural_issue}"
 
         if abandon_reason:
             run_logger.warning(
@@ -1785,7 +2011,7 @@ def _evaluate_new_diff_after_retry(
             ticket_id, is_epic, child_ticket_keys,
         )
         post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id} ({label}): {reason}")
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
         check_falco_correlation(falco_since, ticket_id)
         record_run_in_graph(
             _build_graph_payload(
@@ -1802,7 +2028,7 @@ def _evaluate_new_diff_after_retry(
     if not test_result["passed"]:
         _comment_all(f"🧪 Testing agent (Prefect): los tests reales FALLARON en el {label} de '{branch}'.", ticket_id, is_epic, child_ticket_keys)
         post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id} ({label}): los tests reales fallaron en '{branch}'.")
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
         check_falco_correlation(falco_since, ticket_id)
         record_run_in_graph(
             _build_graph_payload(
@@ -2019,7 +2245,7 @@ def _handle_rejected(
     # Antes esto no transicionaba nada -- un ticket rechazado se quedaba
     # donde estaba, sin senal visible en Jira de que el pipeline ya lo
     # proceso y lo freno.
-    _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+    _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
 
     record_run_in_graph(
         _build_graph_payload(
@@ -2071,7 +2297,14 @@ def _deliver(
     test_plan = generate_test_plan({
         "ticket": ticket_id, "resumen": summary, "descripcion": jira_context.get("description", ""),
     })
-    if test_plan:
+    # Gap real identificado en auditoria ("gaps en los flujos de jira",
+    # KAN-6 real): un ticket que nunca progresa (bloqueado dias seguidos)
+    # reposteaba practicamente el mismo Test Plan en cada corrida nueva,
+    # enterrando la señal real (por que se bloqueo) entre ruido repetido.
+    # El test plan SIGUE regenerandose e inyectandose en el prompt del
+    # coding agent cada vez (evidencia fresca) -- solo se evita volver a
+    # POSTEARLO si ya hay uno visible para este ticket.
+    if test_plan and not jira_client.test_plan_already_posted(ticket_id):
         _comment_all(f"🧪 Test Plan (Prefect):\n\n{test_plan}", ticket_id, is_epic, child_ticket_keys)
 
     sanitized = firewall_result["sanitized_prompt"]
@@ -2149,7 +2382,7 @@ def _deliver(
                     ticket_id, is_epic, child_ticket_keys,
                 )
                 post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {ticket_id}: {reason}")
-                _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+                _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
                 check_falco_correlation(falco_since, ticket_id)
                 record_run_in_graph(
                     _build_graph_payload(
@@ -2166,7 +2399,7 @@ def _deliver(
             if not test_result["passed"]:
                 _comment_all(f"🧪 Testing agent (Prefect): los tests reales FALLARON en '{agent_result['branch']}'.", ticket_id, is_epic, child_ticket_keys)
                 post_alert_webhook(f"🧪 Testing agent BLOCKED en {ticket_id}: los tests reales fallaron en '{agent_result['branch']}'.")
-                _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+                _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
                 check_falco_correlation(falco_since, ticket_id)
                 record_run_in_graph(
                     _build_graph_payload(
@@ -2261,11 +2494,11 @@ def _deliver(
             "🧑‍⚖️ Agente juez (Prefect): no pudo evaluar esta corrida -- continua sin veredicto.",
             ticket_id, is_epic, child_ticket_keys,
         )
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
     elif judge_verdict["verdict"] == "FLAGGED":
         _comment_all(f"🧑‍⚖️ Agente juez (Prefect): FLAGGED. {judge_verdict['reasoning']}", ticket_id, is_epic, child_ticket_keys)
         post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {ticket_id}: {judge_verdict['reasoning']}")
-        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys)
+        _transition_all(JIRA_BLOCKED_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=True)
     else:
         _comment_all(f"🧑‍⚖️ Agente juez (Prefect): OK. {judge_verdict['reasoning']}", ticket_id, is_epic, child_ticket_keys)
 
@@ -2291,7 +2524,29 @@ def _deliver(
                     f"({pr_result['reason']}).",
                     ticket_id, is_epic, child_ticket_keys,
                 )
-        _transition_all(JIRA_REVIEW_STATUS, ticket_id, is_epic, child_ticket_keys)
+            _transition_all(JIRA_REVIEW_STATUS, ticket_id, is_epic, child_ticket_keys, blocked=False)
+        else:
+            # Bug real confirmado en vivo (audit de esta sesion): "branch"
+            # es None en DOS casos reales -- (a) GITHUB_REPO seteado
+            # (Camino A, coding agent en la nube: el juez solo evaluo el
+            # prompt crudo en modo "issue_only", sin ningun diff real,
+            # porque el PR de Copilot todavia no existe en el momento de
+            # esta corrida), o (b) Camino B local pero el agente no aplico
+            # ningun cambio. En ambos casos transicionar a JIRA_REVIEW_STATUS
+            # mentia: implicaba que hay codigo listo para revisar cuando no
+            # lo hay. Se queda en JIRA_IN_PROGRESS_STATUS (ya seteado al
+            # arrancar esta funcion). Para (a), este pipeline no tiene
+            # (todavia) un webhook que vuelva a chequear y transicionar
+            # cuando Copilot termine -- requiere revision humana del PR real.
+            if backend == "cloud":
+                reason = "el PR real de Copilot todavia no existe en esta corrida (Camino A, coding agent en la nube)"
+            else:
+                reason = "el coding agent no aplico ningun cambio real en esta corrida"
+            _comment_all(
+                f"ℹ️ Veredicto OK, pero sin codigo real listo para revisar ({reason}) -- el ticket se queda en "
+                f"'{JIRA_IN_PROGRESS_STATUS}' en vez de pasar a '{JIRA_REVIEW_STATUS}'.",
+                ticket_id, is_epic, child_ticket_keys,
+            )
 
     technical_report_evidence = {
         "ticket": ticket_id,
@@ -2429,11 +2684,12 @@ def _deliver_epic_sequential(
 
         transition_jira(JIRA_IN_PROGRESS_STATUS, ticket_key=child_id)
 
-        # Testing Agent liviano -- mismo criterio que _deliver(), por hijo.
+        # Testing Agent liviano -- mismo criterio que _deliver(), por hijo,
+        # incluida la deduplicacion cross-corrida (ver comentario en _deliver).
         test_plan = generate_test_plan({
             "ticket": child_id, "resumen": child["summary"], "descripcion": child.get("description", ""),
         })
-        if test_plan:
+        if test_plan and not jira_client.test_plan_already_posted(child_id):
             comment_jira(f"🧪 Test Plan (Prefect):\n\n{test_plan}", ticket_key=child_id)
 
         sanitized = firewall_result["sanitized_prompt"]
@@ -2508,7 +2764,7 @@ def _deliver_epic_sequential(
                 ticket_key=child_id,
             )
             post_alert_webhook(f"🛡️ Guardia de salida BLOCKED en {child_id} (modo epica secuencial): {reason}")
-            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
+            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             check_falco_correlation(falco_since, child_id)
             _post_child_technical_report(epic_key, child_id, backend, f"bloqueada por la guardia de salida ({reason})")
             blocked_at = child_id
@@ -2522,7 +2778,7 @@ def _deliver_epic_sequential(
                 ticket_key=child_id,
             )
             post_alert_webhook(f"🧪 Testing agent BLOCKED en {child_id} (modo epica secuencial): tests reales fallaron.")
-            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
+            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             check_falco_correlation(falco_since, child_id)
             _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- los tests reales fallaron", {"salida_tests": test_result["output"][:2000]})
             blocked_at = child_id
@@ -2578,7 +2834,7 @@ def _deliver_epic_sequential(
             # indistinguible de un hijo que sigue en curso de verdad. "sin
             # veredicto" es evidencia insuficiente para dar el cambio por
             # bueno, se trata como bloqueado (necesita revision humana).
-            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
+            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             _post_child_technical_report(epic_key, child_id, backend, "sin veredicto del juez", {"rama_git": branch})
             completed.append({"ticket_id": child_id, "outcome": "no-verdict"})
         elif judge_verdict["verdict"] == "FLAGGED":
@@ -2588,13 +2844,13 @@ def _deliver_epic_sequential(
                 ticket_key=child_id,
             )
             post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {child_id} (modo epica secuencial): {judge_verdict['reasoning']}")
-            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id)
+            transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- el juez marco FLAGGED", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})
             blocked_at = child_id
             break
         else:
             comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
-            transition_jira(JIRA_REVIEW_STATUS, ticket_key=child_id)
+            transition_jira(JIRA_REVIEW_STATUS, ticket_key=child_id, blocked=False)
             _post_child_technical_report(
                 epic_key, child_id, backend, "OK -- listo para revision humana",
                 {
@@ -2689,13 +2945,13 @@ def _deliver_epic_sequential(
     # de camino), la epica en si ya esta terminada.
     all_already_completed = bool(completed) and all(c["outcome"] == "already-completed" for c in completed)
     if blocked_at:
-        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key)
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key, blocked=True)
     elif has_reviewable_work:
-        transition_jira(JIRA_REVIEW_STATUS, ticket_key=epic_key)
+        transition_jira(JIRA_REVIEW_STATUS, ticket_key=epic_key, blocked=False)
     elif all_already_completed:
-        transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key)
+        transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key, blocked=False)
     else:
-        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key)
+        transition_jira(JIRA_BLOCKED_STATUS, ticket_key=epic_key, blocked=True)
 
     if conversation_file:
         Path(conversation_file).unlink(missing_ok=True)
@@ -2730,40 +2986,41 @@ def run_pipeline():
     component = ticket["repository_origen"]
     logger.info(f"Ticket {ticket['ticket_id']} — componente {component}")
 
-    check_attachments_gate(ticket)
-    check_log_evidence(ticket)
+    with _held_ticket_lock(ticket["ticket_id"]):
+        check_attachments_gate(ticket)
+        check_log_evidence(ticket)
 
-    graph_result = query_graph(component)
-    sonar_result = query_sonar(component)
-    sonar_issues_text = "\n".join(
-        f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in sonar_result["issues"]
-    )
-    figma_result = query_figma(ticket.get("figma_link"))
+        graph_result = query_graph(component)
+        sonar_result = query_sonar(component)
+        sonar_issues_text = "\n".join(
+            f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in sonar_result["issues"]
+        )
+        figma_result = query_figma(ticket.get("figma_link"))
 
-    prompt = (
-        f"{ticket['summary']}\n{ticket['description']}\n"
-        f"--- Adjuntos (descritos por Rovo) ---\n{ticket.get('attachment_context', '')}\n"
-        f"--- Grafo de impacto ---\n{graph_result}\n"
-        f"--- Hallazgos Sonar (reales) ---\n{sonar_issues_text}"
-    )
-    if figma_result and figma_result.get("found"):
-        prompt += f"\n--- Specs reales de Figma ---\n{json.dumps(figma_result['summary'], ensure_ascii=False, indent=2)}"
-    jira_context = {
-        "ticket_id": ticket["ticket_id"],
-        "summary": ticket["summary"],
-        "description": ticket["description"],
-        "repository_origen": component,
-        "status": ticket.get("status"),
-        "sprint": ticket.get("sprint"),
-    }
+        prompt = (
+            f"{ticket['summary']}\n{ticket['description']}\n"
+            f"--- Adjuntos (descritos por Rovo) ---\n{ticket.get('attachment_context', '')}\n"
+            f"--- Grafo de impacto ---\n{graph_result}\n"
+            f"--- Hallazgos Sonar (reales) ---\n{sonar_issues_text}"
+        )
+        if figma_result and figma_result.get("found"):
+            prompt += f"\n--- Specs reales de Figma ---\n{json.dumps(figma_result['summary'], ensure_ascii=False, indent=2)}"
+        jira_context = {
+            "ticket_id": ticket["ticket_id"],
+            "summary": ticket["summary"],
+            "description": ticket["description"],
+            "repository_origen": component,
+            "status": ticket.get("status"),
+            "sprint": ticket.get("sprint"),
+        }
 
-    firewall_result = evaluate_firewall(prompt, jira_context, [i["message"] for i in sonar_result["issues"]])
+        firewall_result = evaluate_firewall(prompt, jira_context, [i["message"] for i in sonar_result["issues"]])
 
-    if firewall_result["status"] == "REJECTED":
-        logger.warning(f"Rechazado por el firewall: {firewall_result['reason']}")
-        _handle_rejected(ticket["ticket_id"], jira_context, firewall_result)
+        if firewall_result["status"] == "REJECTED":
+            logger.warning(f"Rechazado por el firewall: {firewall_result['reason']}")
+            _handle_rejected(ticket["ticket_id"], jira_context, firewall_result)
 
-    return _deliver(ticket["ticket_id"], ticket["summary"], firewall_result, jira_context, target_repo_dir)
+        return _deliver(ticket["ticket_id"], ticket["summary"], firewall_result, jira_context, target_repo_dir)
 
 
 @flow(name="poc-ai-agents-epic-pipeline", log_prints=True)
@@ -2776,146 +3033,147 @@ def run_epic_pipeline(epic_key: str):
     """
     logger = get_run_logger()
 
-    target_repo_dir = detect_target_repo()
-    check_dirty_tree(target_repo_dir)
-    trunk_branch = ensure_on_trunk_branch(target_repo_dir)
-    logger.info(f"Repo objetivo detectado: {target_repo_dir} (trunk: {trunk_branch})")
+    with _held_ticket_lock(epic_key):
+        target_repo_dir = detect_target_repo()
+        check_dirty_tree(target_repo_dir)
+        trunk_branch = ensure_on_trunk_branch(target_repo_dir)
+        logger.info(f"Repo objetivo detectado: {target_repo_dir} (trunk: {trunk_branch})")
 
-    known_components = discover_known_components()
+        known_components = discover_known_components()
 
-    epic_data = fetch_epic(epic_key, known_components)
-    epic = epic_data["epic"]
-    children = epic_data["children"]
-    logger.info(f"Epica {epic_key} — {len(children)} hijos")
+        epic_data = fetch_epic(epic_key, known_components)
+        epic = epic_data["epic"]
+        children = epic_data["children"]
+        logger.info(f"Epica {epic_key} — {len(children)} hijos")
 
-    if not children:
-        raise PipelineBlocked(
-            f"La epica {epic_key} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). "
-            "Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent'. "
-            "Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md "
-            "(Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
+        if not children:
+            raise PipelineBlocked(
+                f"La epica {epic_key} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). "
+                "Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent'. "
+                "Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md "
+                "(Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
+            )
+
+        # Gap real (usuario, "gaps en el scrum agent"): antes se le pasaban TODOS
+        # los hijos (incluidos los ya terminales) al scrum agent (epic_planner.py)
+        # -- gastaba un turno real de LLM + grafo razonando sobre historias
+        # cerradas, y una sola de ellas podia degradar el ordenamiento real (ver
+        # _filter_active_children).
+        children, already_terminal = _filter_active_children(children, JIRA_EPIC_TERMINAL_STATUSES)
+        if already_terminal:
+            excluded_text = ", ".join(f"{c['ticket_id']} ({c.get('status')})" for c in already_terminal)
+            comment_jira(
+                f"✅ Modo epica (Prefect): {len(already_terminal)} historia(s) ya estaban en un status terminal, "
+                f"se excluyen de esta corrida: {excluded_text}.",
+                ticket_key=epic_key,
+            )
+        if not children:
+            comment_jira(
+                f"✅ Modo epica (Prefect): las {len(already_terminal)} historias hijas de {epic_key} ya estan "
+                "completadas -- nada que procesar en esta corrida.",
+                ticket_key=epic_key,
+            )
+            transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key, blocked=False)
+            return {"completed": [], "blocked_at": None, "branch": None, "pr": None}
+
+        unresolved = [c["ticket_id"] for c in children if not c.get("repository_origen")]
+        if unresolved:
+            reason = (
+                f"Estos hijos de {epic_key} no tienen un componente resuelto (Components/labels no matchean "
+                f"ningun nodo conocido del grafo): {', '.join(unresolved)}."
+            )
+            comment_jira(f"🚫 Modo epica (Prefect): no se pudo procesar {epic_key} — {reason}", ticket_key=epic_key)
+            raise PipelineBlocked(reason)
+
+        distinct_components = sorted({c["repository_origen"] for c in children})
+
+        try:
+            repo_url = check_epic_single_repo_task(distinct_components)
+        except PipelineBlocked as exc:
+            comment_jira(f"🚫 Modo epica (Prefect): no se pudo procesar {epic_key} — {exc}", ticket_key=epic_key)
+            raise
+        logger.info(f"Todos los componentes de {epic_key} confirmados en el mismo repo: {repo_url}")
+
+        origin_url = subprocess.run(
+            ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
+        ).stdout.strip()
+        if origin_url and origin_url != repo_url:
+            logger.warning(
+                f"El remote 'origin' de {target_repo_dir} ({origin_url}) no coincide exactamente con repo_url "
+                f"del grafo ({repo_url}) — puede ser solo ssh vs https, pero confirma que estas parado en el repo correcto."
+            )
+
+        graph_parts, sonar_parts, sonar_errors = [], [], []
+        for component in distinct_components:
+            graph_parts.append(f"--- {component} ---\n{query_graph(component)}")
+            sonar_result = query_sonar(component)
+            sonar_parts.append(
+                f"--- {component} ---\n"
+                + "\n".join(f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in sonar_result["issues"])
+            )
+            sonar_errors.extend(i["message"] for i in sonar_result["issues"])
+
+        plan_result = plan_epic_task(epic, children)
+        children_by_id = {c["ticket_id"]: c for c in children}
+        ordered_children = [children_by_id[cid] for cid in plan_result["ordered_children"] if cid in children_by_id]
+        if len(ordered_children) != len(children):
+            logger.warning("plan-epic devolvio un orden incompleto -- se usa el orden original")
+            ordered_children = children
+        coordination_notes = plan_result.get("coordination_notes") or ""
+        conflicts = plan_result.get("conflicts") or []
+        if conflicts:
+            logger.warning(f"plan-epic detecto {len(conflicts)} conflicto(s) potencial(es) entre historias hijas: {conflicts}")
+
+        # Camino B1 real (backend local disponible, sin GITHUB_REPO): procesa
+        # cada hijo en su propio turno real en vez de un prompt combinado -- ver
+        # _deliver_epic_sequential. El camino cloud y el fallback de un solo
+        # tiro (sin backend real) no tienen concepto de "continuar la misma
+        # conversacion" turno a turno, asi que siguen con el prompt combinado
+        # de mas abajo.
+        if not GITHUB_REPO and _local_coding_agent_backend_available():
+            return _deliver_epic_sequential(
+                epic_key, epic, ordered_children, target_repo_dir,
+                graph_parts, sonar_parts, sonar_errors, coordination_notes, conflicts,
+            )
+
+        children_text = "\n".join(
+            f"- {c['ticket_id']} ({c['repository_origen']}): {c['summary']}\n  {c['description']}" for c in ordered_children
         )
-
-    # Gap real (usuario, "gaps en el scrum agent"): antes se le pasaban TODOS
-    # los hijos (incluidos los ya terminales) al scrum agent (epic_planner.py)
-    # -- gastaba un turno real de LLM + grafo razonando sobre historias
-    # cerradas, y una sola de ellas podia degradar el ordenamiento real (ver
-    # _filter_active_children).
-    children, already_terminal = _filter_active_children(children, JIRA_EPIC_TERMINAL_STATUSES)
-    if already_terminal:
-        excluded_text = ", ".join(f"{c['ticket_id']} ({c.get('status')})" for c in already_terminal)
-        comment_jira(
-            f"✅ Modo epica (Prefect): {len(already_terminal)} historia(s) ya estaban en un status terminal, "
-            f"se excluyen de esta corrida: {excluded_text}.",
-            ticket_key=epic_key,
+        coordination_section = f"\n--- Notas de coordinacion del planificador ---\n{coordination_notes}" if coordination_notes else ""
+        conflicts_section = _format_conflicts_section(conflicts)
+        prompt = (
+            f"ESTO ES UNA EPICA con {len(children)} historias hijas. Resolvelas todas juntas, "
+            "coordinando los cambios entre los componentes que toca cada una.\n\n"
+            f"Epica {epic_key}: {epic['summary']}\n{epic['description']}\n\n"
+            f"--- Historias hijas (orden sugerido por el planificador de epicas) ---\n{children_text}\n"
+            f"{coordination_section}"
+            f"{conflicts_section}"
+            f"--- Grafo de impacto (por componente) ---\n{chr(10).join(graph_parts)}\n"
+            f"--- Hallazgos Sonar (reales, por componente) ---\n{chr(10).join(sonar_parts)}"
         )
-    if not children:
-        comment_jira(
-            f"✅ Modo epica (Prefect): las {len(already_terminal)} historias hijas de {epic_key} ya estan "
-            "completadas -- nada que procesar en esta corrida.",
-            ticket_key=epic_key,
+        jira_context = {
+            "ticket_id": epic_key,
+            "summary": epic["summary"],
+            "description": epic["description"],
+            "repository_origen": ",".join(distinct_components),
+            "status": epic.get("status"),
+            "sprint": epic.get("sprint"),
+        }
+
+        firewall_result = evaluate_firewall(prompt, jira_context, sonar_errors)
+        child_ticket_keys = [c["ticket_id"] for c in children]
+
+        if firewall_result["status"] == "REJECTED":
+            logger.warning(f"Rechazado por el firewall: {firewall_result['reason']}")
+            _handle_rejected(epic_key, jira_context, firewall_result, is_epic=True, child_ticket_keys=child_ticket_keys)
+
+        # _deliver ya espeja cada comentario/transicion real (firewall, coding
+        # agent, tests, juez, PR) hacia cada hijo a medida que ocurre -- ya no
+        # hace falta un comentario generico aparte al final.
+        return _deliver(
+            epic_key, epic["summary"], firewall_result, jira_context, target_repo_dir,
+            is_epic=True, child_ticket_keys=child_ticket_keys, conflicts=plan_result.get("conflicts"),
         )
-        transition_jira(JIRA_DONE_STATUS, ticket_key=epic_key)
-        return {"completed": [], "blocked_at": None, "branch": None, "pr": None}
-
-    unresolved = [c["ticket_id"] for c in children if not c.get("repository_origen")]
-    if unresolved:
-        reason = (
-            f"Estos hijos de {epic_key} no tienen un componente resuelto (Components/labels no matchean "
-            f"ningun nodo conocido del grafo): {', '.join(unresolved)}."
-        )
-        comment_jira(f"🚫 Modo epica (Prefect): no se pudo procesar {epic_key} — {reason}", ticket_key=epic_key)
-        raise PipelineBlocked(reason)
-
-    distinct_components = sorted({c["repository_origen"] for c in children})
-
-    try:
-        repo_url = check_epic_single_repo_task(distinct_components)
-    except PipelineBlocked as exc:
-        comment_jira(f"🚫 Modo epica (Prefect): no se pudo procesar {epic_key} — {exc}", ticket_key=epic_key)
-        raise
-    logger.info(f"Todos los componentes de {epic_key} confirmados en el mismo repo: {repo_url}")
-
-    origin_url = subprocess.run(
-        ["git", "-C", target_repo_dir, "remote", "get-url", "origin"], capture_output=True, text=True
-    ).stdout.strip()
-    if origin_url and origin_url != repo_url:
-        logger.warning(
-            f"El remote 'origin' de {target_repo_dir} ({origin_url}) no coincide exactamente con repo_url "
-            f"del grafo ({repo_url}) — puede ser solo ssh vs https, pero confirma que estas parado en el repo correcto."
-        )
-
-    graph_parts, sonar_parts, sonar_errors = [], [], []
-    for component in distinct_components:
-        graph_parts.append(f"--- {component} ---\n{query_graph(component)}")
-        sonar_result = query_sonar(component)
-        sonar_parts.append(
-            f"--- {component} ---\n"
-            + "\n".join(f"- [{i['severity']}] {i['rule']}: {i['message']} (linea {i['line']})" for i in sonar_result["issues"])
-        )
-        sonar_errors.extend(i["message"] for i in sonar_result["issues"])
-
-    plan_result = plan_epic_task(epic, children)
-    children_by_id = {c["ticket_id"]: c for c in children}
-    ordered_children = [children_by_id[cid] for cid in plan_result["ordered_children"] if cid in children_by_id]
-    if len(ordered_children) != len(children):
-        logger.warning("plan-epic devolvio un orden incompleto -- se usa el orden original")
-        ordered_children = children
-    coordination_notes = plan_result.get("coordination_notes") or ""
-    conflicts = plan_result.get("conflicts") or []
-    if conflicts:
-        logger.warning(f"plan-epic detecto {len(conflicts)} conflicto(s) potencial(es) entre historias hijas: {conflicts}")
-
-    # Camino B1 real (backend local disponible, sin GITHUB_REPO): procesa
-    # cada hijo en su propio turno real en vez de un prompt combinado -- ver
-    # _deliver_epic_sequential. El camino cloud y el fallback de un solo
-    # tiro (sin backend real) no tienen concepto de "continuar la misma
-    # conversacion" turno a turno, asi que siguen con el prompt combinado
-    # de mas abajo.
-    if not GITHUB_REPO and _local_coding_agent_backend_available():
-        return _deliver_epic_sequential(
-            epic_key, epic, ordered_children, target_repo_dir,
-            graph_parts, sonar_parts, sonar_errors, coordination_notes, conflicts,
-        )
-
-    children_text = "\n".join(
-        f"- {c['ticket_id']} ({c['repository_origen']}): {c['summary']}\n  {c['description']}" for c in ordered_children
-    )
-    coordination_section = f"\n--- Notas de coordinacion del planificador ---\n{coordination_notes}" if coordination_notes else ""
-    conflicts_section = _format_conflicts_section(conflicts)
-    prompt = (
-        f"ESTO ES UNA EPICA con {len(children)} historias hijas. Resolvelas todas juntas, "
-        "coordinando los cambios entre los componentes que toca cada una.\n\n"
-        f"Epica {epic_key}: {epic['summary']}\n{epic['description']}\n\n"
-        f"--- Historias hijas (orden sugerido por el planificador de epicas) ---\n{children_text}\n"
-        f"{coordination_section}"
-        f"{conflicts_section}"
-        f"--- Grafo de impacto (por componente) ---\n{chr(10).join(graph_parts)}\n"
-        f"--- Hallazgos Sonar (reales, por componente) ---\n{chr(10).join(sonar_parts)}"
-    )
-    jira_context = {
-        "ticket_id": epic_key,
-        "summary": epic["summary"],
-        "description": epic["description"],
-        "repository_origen": ",".join(distinct_components),
-        "status": epic.get("status"),
-        "sprint": epic.get("sprint"),
-    }
-
-    firewall_result = evaluate_firewall(prompt, jira_context, sonar_errors)
-    child_ticket_keys = [c["ticket_id"] for c in children]
-
-    if firewall_result["status"] == "REJECTED":
-        logger.warning(f"Rechazado por el firewall: {firewall_result['reason']}")
-        _handle_rejected(epic_key, jira_context, firewall_result, is_epic=True, child_ticket_keys=child_ticket_keys)
-
-    # _deliver ya espeja cada comentario/transicion real (firewall, coding
-    # agent, tests, juez, PR) hacia cada hijo a medida que ocurre -- ya no
-    # hace falta un comentario generico aparte al final.
-    return _deliver(
-        epic_key, epic["summary"], firewall_result, jira_context, target_repo_dir,
-        is_epic=True, child_ticket_keys=child_ticket_keys, conflicts=plan_result.get("conflicts"),
-    )
 
 
 def abandon_ticket_branch(ticket_id: str, target_repo_dir: str) -> None:

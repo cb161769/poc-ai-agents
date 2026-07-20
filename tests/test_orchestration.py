@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 import orchestration
@@ -18,9 +19,12 @@ from orchestration import (
     _check_not_epic,
     _comment_all,
     _deliver,
+    _branch_diff_has_vendor_pollution,
+    _branch_has_recorded_judge_ok,
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
     _filter_active_children,
+    _env_status,
     _git_add_all_excluding_vendor,
     _has_duplicate_project_scaffolding,
     _query_component_risk_history,
@@ -39,7 +43,74 @@ from orchestration import (
 def _init_real_git_repo(repo_dir):
     import subprocess as sp
     sp.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+    # git init's default branch name depends on the machine's git config
+    # (init.defaultBranch) -- forzarlo a "main" deja el nombre determinista
+    # para tests que lo referencian literalmente.
+    sp.run(["git", "checkout", "-q", "-B", "main"], cwd=repo_dir, check=True)
     sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "baseline"], cwd=repo_dir, check=True)
+
+
+def test_held_ticket_lock_raises_pipeline_blocked_when_already_held(monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira"): sin
+    esto, dos corridas sobre el mismo ticket podian comentar/transicionar
+    Jira en paralelo. Se levanta PipelineBlocked (no una excepcion generica)
+    para que se vea en la UI de Prefect como un stop esperado."""
+    monkeypatch.setattr(orchestration, "acquire_ticket_lock", lambda ticket_id: False)
+    released = []
+    monkeypatch.setattr(orchestration, "release_ticket_lock", lambda ticket_id: released.append(ticket_id))
+
+    with pytest.raises(PipelineBlocked):
+        with orchestration._held_ticket_lock("T-1"):
+            pytest.fail("no deberia entrar al bloque 'with' si no se pudo adquirir el lock")
+
+    assert released == []  # nunca lo adquirio, no debe intentar liberarlo
+
+
+def test_held_ticket_lock_releases_on_success(monkeypatch):
+    monkeypatch.setattr(orchestration, "acquire_ticket_lock", lambda ticket_id: True)
+    released = []
+    monkeypatch.setattr(orchestration, "release_ticket_lock", lambda ticket_id: released.append(ticket_id))
+
+    with orchestration._held_ticket_lock("T-1"):
+        pass
+
+    assert released == ["T-1"]
+
+
+def test_held_ticket_lock_releases_even_when_body_raises(monkeypatch):
+    monkeypatch.setattr(orchestration, "acquire_ticket_lock", lambda ticket_id: True)
+    released = []
+    monkeypatch.setattr(orchestration, "release_ticket_lock", lambda ticket_id: released.append(ticket_id))
+
+    with pytest.raises(PipelineBlocked):
+        with orchestration._held_ticket_lock("T-1"):
+            raise PipelineBlocked("tests reales fallaron")
+
+    assert released == ["T-1"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ('"En revisión"', "En revisión"),
+    ("'En revisión'", "En revisión"),
+    ("En revisión", "En revisión"),
+    ('"', '"'),
+    ("", ""),
+])
+def test_env_status_strips_wrapping_quotes(raw, expected):
+    """Bug real confirmado en vivo (multiples corridas, epica KAN-4): 'docker
+    run --env-file'/'docker-compose env_file:' no interpretan comillas como
+    un shell -- '.env' tenia JIRA_REVIEW_STATUS="En revision" (comillas
+    puestas por habito de bash) y la env var terminaba siendo el string
+    literal CON las comillas adentro, asi que transition_ticket() nunca
+    encontraba la transicion pese a que "En revision" (sin comillas)
+    figuraba en la lista de transiciones disponibles.
+    """
+    import os as _os
+    _os.environ["_TEST_ENV_STATUS_VAR"] = raw
+    try:
+        assert _env_status("_TEST_ENV_STATUS_VAR", "default") == expected
+    finally:
+        del _os.environ["_TEST_ENV_STATUS_VAR"]
 
 
 def test_git_add_all_excluding_vendor_stages_real_files(tmp_path):
@@ -75,6 +146,28 @@ def test_git_add_all_excluding_vendor_skips_node_modules(tmp_path):
     assert "node_modules" not in staged
 
 
+def test_git_add_all_excluding_vendor_skips_nested_node_modules(tmp_path):
+    """Bug real confirmado en vivo (epica KAN-4, corrida posterior al fix
+    inicial): ':(exclude)node_modules' solo excluye el directorio en la
+    RAIZ del repo, no anidado -- el 'npm install' real corria dentro de
+    'frontend/', asi que 'frontend/node_modules/...' completo (incluyendo
+    scripts de build de terceros con 'rm -rf') seguia commiteandose pese
+    al fix. Requiere el patron con comodines ':(exclude,glob)**/<dir>/**'.
+    """
+    _init_real_git_repo(tmp_path)
+    (tmp_path / "app.py").write_text("print('hi')")
+    vendor_dir = tmp_path / "frontend" / "node_modules" / "some-package"
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / "package.json").write_text('{"scripts": {"build": "rm -rf dist"}}')
+
+    _git_add_all_excluding_vendor(str(tmp_path))
+
+    import subprocess as sp
+    staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
+    assert "app.py" in staged
+    assert "node_modules" not in staged
+
+
 @pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__"])
 def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, vendor_dir):
     _init_real_git_repo(tmp_path)
@@ -87,6 +180,42 @@ def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, ven
     import subprocess as sp
     staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
     assert staged.strip() == ""
+
+
+def test_branch_diff_has_vendor_pollution_detects_committed_node_modules(tmp_path):
+    """Bug real confirmado en vivo (epica KAN-6, dias de corridas): una rama
+    ya tenia frontend/node_modules/@esbuild/... commiteado de UNA CORRIDA
+    ANTERIOR al fix de _git_add_all_excluding_vendor -- _find_open_branch_for_ticket
+    la sigue encontrando "abierta" y resumible, asi que cada corrida nueva
+    arrastraba esa contaminacion vieja en su diff contra main, y
+    output_guard bloqueaba la epica entera por un falso positivo 'rm -rf'
+    dentro de un script de build vendoreado -- pese a que el fix de
+    exclusion ya estaba andando y ninguna corrida NUEVA metia vendor nuevo.
+    """
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    sp.run(["git", "-C", str(tmp_path), "checkout", "-b", "copilot/T-1-123"], check=True, capture_output=True)
+    vendor_dir = tmp_path / "frontend" / "node_modules" / "@esbuild"
+    vendor_dir.mkdir(parents=True)
+    (vendor_dir / "README.md").write_text("vendored")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "old polluted commit"], check=True)
+
+    reason = _branch_diff_has_vendor_pollution(str(tmp_path), "copilot/T-1-123", "main")
+
+    assert reason is not None
+    assert "node_modules" in reason
+
+
+def test_branch_diff_has_vendor_pollution_none_for_clean_diff(tmp_path):
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    sp.run(["git", "-C", str(tmp_path), "checkout", "-b", "copilot/T-1-123"], check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print('hi')")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "real change"], check=True)
+
+    assert _branch_diff_has_vendor_pollution(str(tmp_path), "copilot/T-1-123", "main") is None
 
 
 def test_ensure_on_trunk_branch_checks_out_main_and_pulls(monkeypatch):
@@ -286,6 +415,30 @@ def test_filter_active_children_respects_custom_terminal_statuses():
 
     assert active == [{"ticket_id": "C-3", "status": "In Progress"}]
     assert {c["ticket_id"] for c in already_terminal} == {"C-1", "C-2"}
+
+
+def test_branch_has_recorded_judge_ok_true_when_graph_confirms(monkeypatch):
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "found\n1\n")
+    assert _branch_has_recorded_judge_ok("KAN-5", "copilot/KAN-5-123") is True
+
+
+def test_branch_has_recorded_judge_ok_false_when_no_matching_run(monkeypatch):
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "found\n0\n")
+    assert _branch_has_recorded_judge_ok("KAN-5", "copilot/KAN-5-123") is False
+
+
+def test_branch_has_recorded_judge_ok_none_when_graph_unavailable(monkeypatch):
+    """Bug real identificado en auditoria ("gaps en los flujos de jira"):
+    _check_already_completed marcaba Done confiando solo en que el nombre de
+    rama matcheara el patron 'copilot/{ticket}-*' y estuviera mergeada, sin
+    corroborar contra un veredicto OK real registrado en el grafo -- best-
+    effort, igual que _query_component_risk_history: si Neo4j no responde,
+    no debe bloquear la corrida, solo devolver None (indeterminado)."""
+    def fake_run(cmd, **kwargs):
+        raise RuntimeError("comando fallo (cypher-shell): conexion rechazada")
+
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+    assert _branch_has_recorded_judge_ok("KAN-5", "copilot/KAN-5-123") is None
 
 
 def test_query_component_risk_history_combines_both_queries(monkeypatch):
@@ -535,7 +688,7 @@ def test_retry_local_diff_mirrors_blocked_transition_to_epic_children(monkeypatc
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo de nuevo"})
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitioned.append((status, ticket_key)))
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
 
@@ -689,7 +842,7 @@ def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict
 
     transitions = []
     comments = []
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((status, ticket_key)))
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
 
     result = _deliver(
@@ -908,6 +1061,52 @@ def test_deliver_injects_test_plan_into_coding_agent_prompt_and_comments_it(monk
     assert "especialmente los negativos" in captured_prompts[0]
 
 
+def test_deliver_skips_reposting_test_plan_when_already_posted(monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira",
+    KAN-6 real): un ticket bloqueado dias seguidos reposteaba practicamente
+    el mismo Test Plan en cada corrida nueva -- confirmado real: 5 postings
+    identicos en dias distintos, enterrando la señal real de por que se
+    bloqueaba entre ruido repetido. El test plan SIGUE inyectandose en el
+    prompt del coding agent (evidencia fresca), solo se evita el re-post."""
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_test_plan", lambda evidence: "## Casos Negativos\n- entrada invalida")
+    monkeypatch.setattr(orchestration.jira_client, "test_plan_already_posted", lambda ticket_key: True)
+
+    captured_prompts = []
+
+    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+        captured_prompts.append(sanitized)
+        return {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": {"tests_adequate": True},
+        }
+
+    monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(text))
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt original", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert not any("Test Plan" in text for text in comments)
+    # pero SI se sigue inyectando en el prompt del coding agent
+    assert "entrada invalida" in captured_prompts[0]
+
+
 def test_deliver_does_not_touch_prompt_when_test_plan_generation_returns_none(monkeypatch):
     monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
     monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
@@ -1051,7 +1250,7 @@ def test_deliver_epic_sequential_transitions_epic_to_done_when_all_children_alre
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
 
     transitions = []
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((ticket_key, status)))
 
     result = orchestration._deliver_epic_sequential(
         "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
@@ -1084,7 +1283,7 @@ def test_comment_all_mirrors_to_children_in_epic_mode(monkeypatch):
 
 def test_transition_all_posts_once_in_ticket_mode(monkeypatch):
     calls = []
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: calls.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: calls.append((status, ticket_key)))
 
     _transition_all("Blocked", "T-1", False, None)
 
@@ -1093,7 +1292,7 @@ def test_transition_all_posts_once_in_ticket_mode(monkeypatch):
 
 def test_transition_all_mirrors_to_children_in_epic_mode(monkeypatch):
     calls = []
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: calls.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: calls.append((status, ticket_key)))
 
     _transition_all("Blocked", "EPIC-1", True, ["CHILD-1", "CHILD-2"])
 
@@ -1107,7 +1306,7 @@ def test_handle_rejected_transitions_to_blocked_status(monkeypatch):
     """
     transitioned = []
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitioned.append((status, ticket_key)))
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
 
@@ -1120,7 +1319,7 @@ def test_handle_rejected_transitions_to_blocked_status(monkeypatch):
 def test_handle_rejected_mirrors_blocked_transition_to_epic_children(monkeypatch):
     transitioned = []
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitioned.append((status, ticket_key)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitioned.append((status, ticket_key)))
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
 
@@ -1265,7 +1464,7 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
         lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
     )
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(ticket_key))
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((ticket_key, status)))
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
     monkeypatch.setattr(
         orchestration, "run_coding_agent_local_real",
@@ -1305,7 +1504,7 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
         lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
     )
     monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((ticket_key, status)))
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
     monkeypatch.setattr(
         orchestration, "run_coding_agent_local_real",
@@ -1396,7 +1595,7 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
         lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
     )
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((ticket_key, status)))
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
     monkeypatch.setattr(
         orchestration, "run_coding_agent_local_real",
@@ -2515,7 +2714,7 @@ def test_check_already_completed_true_when_jira_status_already_done(monkeypatch)
     monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: pytest.fail("no deberia tocar git"))
     comments, transitions = [], []
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(ticket_key))
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append(ticket_key))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append(ticket_key))
 
     result = orchestration._check_already_completed(
         "T-1", {"ticket_id": "T-1", "status": orchestration.JIRA_DONE_STATUS}, "/repo",
@@ -2529,16 +2728,38 @@ def test_check_already_completed_true_and_transitions_to_done_when_branch_merged
     _fake_branch_list_merge_base_and_rev_parse(
         monkeypatch, branch_list_stdout="  copilot/T-1-100\n", merged={"copilot/T-1-100"}, base_branch="main",
     )
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "found\n1\n")
     transitions = []
     comments = []
     monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
-    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None: transitions.append((ticket_key, status)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: transitions.append((ticket_key, status)))
 
     result = orchestration._check_already_completed("T-1", {"ticket_id": "T-1", "status": "Code Review"}, "/repo")
 
     assert result is True
     assert transitions == [("T-1", orchestration.JIRA_DONE_STATUS)]
     assert any("copilot/T-1-100" in text for _key, text in comments)
+    assert not any("OJO" in text for _key, text in comments)  # corroborado por el grafo, sin advertencia
+
+
+def test_check_already_completed_warns_when_graph_does_not_corroborate(monkeypatch):
+    """Gap real identificado en auditoria: si el grafo responde pero NO
+    encuentra un veredicto OK registrado para esa rama exacta, todavia se
+    marca Done (mismo criterio best-effort de siempre -- la rama mergeada ya
+    es evidencia real), pero el comentario a Jira deja visible para un
+    humano que no se pudo corroborar contra el grafo."""
+    _fake_branch_list_merge_base_and_rev_parse(
+        monkeypatch, branch_list_stdout="  copilot/T-1-100\n", merged={"copilot/T-1-100"}, base_branch="main",
+    )
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "found\n0\n")
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda status, ticket_key=None, blocked=False: None)
+
+    result = orchestration._check_already_completed("T-1", {"ticket_id": "T-1", "status": "Code Review"}, "/repo")
+
+    assert result is True
+    assert any("OJO" in text for _key, text in comments)
 
 
 def test_check_already_completed_false_when_nothing_indicates_completion(monkeypatch):
@@ -2626,6 +2847,50 @@ def test_run_coding_agent_local_real_abandons_branch_when_tests_already_fail(mon
     assert result["resumed_branch"] is False
     assert result["branch"] != "copilot/T-1-100"
     assert any("-b" in cmd for cmd in git_calls if "checkout" in cmd)
+
+
+def test_run_coding_agent_local_real_abandons_branch_when_diff_already_has_vendor(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (epica KAN-6, dias de corridas): una rama
+    ya tenia node_modules commiteado de una corrida ANTERIOR al fix de
+    _git_add_all_excluding_vendor -- se seguia resumiendo esa misma rama
+    para siempre, y output_guard bloqueaba la epica en cada corrida por un
+    falso positivo 'rm -rf' dentro del vendor viejo, pese a que ninguna
+    corrida NUEVA metia vendor nuevo. Confirma que esto se detecta y
+    abandona ANTES de gastar tiempo corriendo tests reales."""
+    git_calls = []
+    tests_called = []
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        git_calls.append(cmd)
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  copilot/T-1-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)  # todavia abierta
+        if "diff" in cmd and "--name-only" in cmd:
+            return _fake_subprocess_result(stdout="frontend/node_modules/@esbuild/README.md\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout=" M archivo.txt\n")
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="1\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: tests_called.append(1) or {"passed": True, "output": "ok"})
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["resumed_branch"] is False
+    assert result["branch"] != "copilot/T-1-100"
+    assert any("-b" in cmd for cmd in git_calls if "checkout" in cmd)
+    assert tests_called == []  # el chequeo de vendor es mas barato y corre ANTES de correr tests reales
 
 
 def test_run_coding_agent_local_real_abandons_branch_when_structure_duplicated(monkeypatch, tmp_path):
@@ -3190,16 +3455,149 @@ def test_comment_jira_posts_with_marker_when_not_already_posted(monkeypatch):
     assert checked[0][1] == text.split("\n\n", 1)[1]
 
 
+def test_jira_write_failure_logs_error_once_then_warning_on_repeated_auth_failure(monkeypatch):
+    """Bug real identificado en auditoria ("gaps en los flujos de jira"):
+    @task(retries=2) en transition_jira/comment_jira nunca reintentaba de
+    verdad (la excepcion se atrapaba ANTES de que Prefect pudiera
+    reintentar) -- lo cual esta bien para escrituras (retry_utils.py
+    documenta por que no se reintentan POSTs), pero un token de Jira vencido
+    a mitad de una epica larga (confirmado real, KAN-4) hacia que cada
+    escritura posterior fallara con el MISMO WARNING, indistinguible de un
+    typo de nombre de transicion puntual. Confirma que el PRIMER fallo de
+    auth (401/403) se loguea como ERROR bien visible, y los siguientes bajan
+    a WARNING para no inundar el log de una epica de 12 historias."""
+    monkeypatch.setattr(orchestration, "_jira_auth_failed_this_run", False)
+
+    class _FakeLogger:
+        def __init__(self):
+            self.errors, self.warnings = [], []
+
+        def error(self, msg):
+            self.errors.append(msg)
+
+        def warning(self, msg):
+            self.warnings.append(msg)
+
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: fake_logger)
+    auth_error = httpx.HTTPStatusError(
+        "401", request=MagicMock(), response=MagicMock(status_code=401),
+    )
+
+    def fake_transition(ticket_key, status):
+        raise auth_error
+
+    monkeypatch.setattr(orchestration.jira_client, "transition_ticket", fake_transition)
+
+    orchestration.transition_jira("Blocked", ticket_key="T-1")
+    orchestration.transition_jira("Blocked", ticket_key="T-2")
+
+    assert len(fake_logger.errors) == 1
+    assert "invalido/expirado" in fake_logger.errors[0]
+    assert len(fake_logger.warnings) == 1
+    assert "token de Jira ya confirmado invalido" in fake_logger.warnings[0]
+
+
+def test_jira_write_failure_stays_warning_for_non_auth_errors(monkeypatch):
+    monkeypatch.setattr(orchestration, "_jira_auth_failed_this_run", False)
+
+    class _FakeLogger:
+        def __init__(self):
+            self.errors, self.warnings = [], []
+
+        def error(self, msg):
+            self.errors.append(msg)
+
+        def warning(self, msg):
+            self.warnings.append(msg)
+
+    fake_logger = _FakeLogger()
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: fake_logger)
+    monkeypatch.setattr(
+        orchestration.jira_client, "transition_ticket",
+        lambda ticket_key, status: (_ for _ in ()).throw(ValueError("no hay una transicion llamada 'X'")),
+    )
+
+    orchestration.transition_jira("X", ticket_key="T-1")
+
+    assert fake_logger.errors == []
+    assert len(fake_logger.warnings) == 1
+
+
+def test_comment_jira_truncates_body_before_marker_so_marker_survives(monkeypatch):
+    """Gap real identificado en auditoria: jira_client.post_audit_comment()
+    trunca por tamano como red de seguridad general, pero si ese corte
+    cayera despues de concatenar el marcador de idempotencia (que se agrega
+    al FINAL del texto), se llevaria puesto el marcador -- rompiendo la
+    deteccion de duplicados justo en los comentarios largos (reportes
+    tecnicos) que mas la necesitan. Confirma que comment_jira trunca el
+    cuerpo ANTES de agregar el marcador, para que el marcador siempre
+    sobreviva entero al final del texto posteado."""
+    posted = []
+    monkeypatch.setattr(orchestration.jira_client, "post_audit_comment", lambda key, text: posted.append(text))
+    monkeypatch.setattr(orchestration.jira_client, "comment_already_posted", lambda key, marker: False)
+
+    huge_text = "x" * (orchestration.jira_client._COMMENT_MAX_CHARS + 5000)
+    with patch("prefect.context.get_run_context", return_value=_fake_flow_run_context("run-1")):
+        orchestration.comment_jira.fn(huge_text, ticket_key="T-1")
+
+    assert len(posted) == 1
+    sent = posted[0]
+    assert sent.rstrip().endswith("]")  # el marcador "[ref: ...]" quedo entero al final
+    assert len(sent) <= orchestration.jira_client._COMMENT_MAX_CHARS + 100  # sin el corte de post_audit_comment aplicandose encima
+
+
 def test_transition_jira_calls_jira_client_directly(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         orchestration.jira_client, "transition_ticket",
         lambda ticket_key, status: captured.update(ticket_key=ticket_key, status=status),
     )
+    monkeypatch.setattr(orchestration.jira_client, "set_pipeline_blocked_label", lambda *a, **k: None)
 
     orchestration.transition_jira.fn("Blocked", ticket_key="T-1")
 
     assert captured == {"ticket_key": "T-1", "status": "Blocked"}
+
+
+def test_transition_jira_sets_blocked_label_explicitly_from_caller_intent(monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira",
+    KAN-6 real): este proyecto de Jira solo tiene 4 estados -- no existe un
+    estado "Blocked" real, asi que JIRA_BLOCKED_STATUS y JIRA_REVIEW_STATUS
+    terminan configurados con el MISMO string. Si 'blocked' se infiriera
+    comparando status == JIRA_BLOCKED_STATUS, un ticket con veredicto OK
+    real (transicionado a JIRA_REVIEW_STATUS, que en ESTE proyecto es el
+    mismo string) se marcaria como bloqueado por error. Confirma que
+    'blocked' es una senal explicita del caller, no inferida del string."""
+    monkeypatch.setattr(orchestration.jira_client, "transition_ticket", lambda *a, **k: None)
+    label_calls = []
+    monkeypatch.setattr(
+        orchestration.jira_client, "set_pipeline_blocked_label",
+        lambda ticket_key, blocked: label_calls.append((ticket_key, blocked)),
+    )
+    # Simula el caso real de colision: BLOCKED y REVIEW son el MISMO string.
+    same_status_string = "En revisión"
+
+    orchestration.transition_jira.fn(same_status_string, ticket_key="T-1", blocked=True)
+    orchestration.transition_jira.fn(same_status_string, ticket_key="T-1", blocked=False)
+
+    assert label_calls == [("T-1", True), ("T-1", False)]
+
+
+def test_transition_all_propagates_blocked_to_every_child(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        orchestration, "transition_jira",
+        lambda status, ticket_key=None, blocked=False: calls.append((ticket_key, status, blocked)),
+    )
+
+    orchestration._transition_all("En revisión", "EPIC-1", True, ["C-1", "C-2"], blocked=True)
+
+    assert calls == [
+        ("EPIC-1", "En revisión", True),
+        ("C-1", "En revisión", True),
+        ("C-2", "En revisión", True),
+    ]
 
 
 def test_fetch_jira_ticket_passes_known_components_to_jira_client(monkeypatch):

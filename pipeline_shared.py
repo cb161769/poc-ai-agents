@@ -12,10 +12,16 @@ hand-maintaining its own copy.
 Usage from bash:
     python3 pipeline_shared.py retryable-policy-references
     # prints one value per line
+    python3 pipeline_shared.py lock-acquire <TICKET_ID>
+    # prints ACQUIRED=true|false, exit 0 if acquired / 1 if not
+    python3 pipeline_shared.py lock-release <TICKET_ID>
 """
+import os
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 
 class ErrorCategory(str, Enum):
@@ -125,12 +131,81 @@ def outcome_to_state(outcome: str) -> TicketState:
     return OUTCOME_TO_TICKET_STATE.get(outcome, TicketState.PENDING)
 
 
+# Gap real identificado en auditoria ("gaps en los flujos de jira"): ni
+# orchestration.py ni run_poc_loop.sh tenian ninguna arbitracion entre
+# procesos sobre el MISMO ticket -- un humano re-corriendo run_poc_loop.sh a
+# mano mientras un flow de Prefect disparado por webhook todavia esta
+# corriendo (o dos corridas agendadas solapadas) podian transicionar/
+# comentar el mismo ticket en paralelo, con resultados intercalados y una
+# condicion de carrera real en transition_ticket() (GET de transiciones
+# disponibles, despues POST -- no atomico). Lock de archivo simple (no
+# fcntl/flock: tiene que funcionar igual desde bash y desde Python, y
+# portable entre el contenedor Linux real y una corrida local en Windows).
+LOCK_DIR = Path(__file__).resolve().parent / "locks"
+# Generoso a proposito: una epica real de 12 historias puede tardar bastante
+# mas que un ticket individual -- mejor un lock stale que tarda en liberarse
+# solo que uno que se roba en medio de una corrida real todavia viva.
+DEFAULT_LOCK_STALE_SECONDS = 2 * 60 * 60
+
+
+def _ticket_lock_path(ticket_id: str) -> Path:
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    return LOCK_DIR / f"{ticket_id}.lock"
+
+
+def acquire_ticket_lock(ticket_id: str, stale_after_seconds: int = DEFAULT_LOCK_STALE_SECONDS) -> bool:
+    """Creacion atomica de archivo (O_CREAT|O_EXCL) como lock -- si ya existe
+    y es reciente, otro proceso esta trabajando este ticket ahora mismo:
+    devuelve False (el caller decide degradar, nunca bloquea indefinidamente
+    esperando). Si existe pero es mas vieja que stale_after_seconds, se
+    asume que el proceso dueno crasheo sin liberar el lock (ej. el
+    contenedor se mato a mitad de una corrida) y se la pisa -- best-effort,
+    no perfectamente atomico contra otro robo concurrente exactamente en
+    esa ventana, pero esta pensado para la concurrencia de baja frecuencia y
+    ritmo humano de este pipeline, no para un lock de alta contencion.
+    """
+    path = _ticket_lock_path(ticket_id)
+    payload = f"{os.getpid()}:{time.time()}"
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, payload.encode("utf-8"))
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            age_seconds = time.time() - path.stat().st_mtime
+        except FileNotFoundError:
+            return acquire_ticket_lock(ticket_id, stale_after_seconds)  # se libero justo entre el exists y el stat
+        if age_seconds <= stale_after_seconds:
+            return False
+        path.write_text(payload)
+        return True
+
+
+def release_ticket_lock(ticket_id: str) -> None:
+    _ticket_lock_path(ticket_id).unlink(missing_ok=True)
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] != "retryable-policy-references":
-        print("usage: pipeline_shared.py retryable-policy-references", file=sys.stderr)
-        sys.exit(1)
-    for ref in sorted(RETRYABLE_POLICY_REFERENCES):
-        print(ref)
+    if len(sys.argv) == 2 and sys.argv[1] == "retryable-policy-references":
+        for ref in sorted(RETRYABLE_POLICY_REFERENCES):
+            print(ref)
+        return
+
+    if len(sys.argv) == 3 and sys.argv[1] == "lock-acquire":
+        acquired = acquire_ticket_lock(sys.argv[2])
+        print(f"ACQUIRED={'true' if acquired else 'false'}")
+        sys.exit(0 if acquired else 1)
+
+    if len(sys.argv) == 3 and sys.argv[1] == "lock-release":
+        release_ticket_lock(sys.argv[2])
+        return
+
+    print(
+        "usage: pipeline_shared.py retryable-policy-references | lock-acquire <TICKET_ID> | lock-release <TICKET_ID>",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 if __name__ == "__main__":

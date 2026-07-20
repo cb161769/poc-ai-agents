@@ -1,6 +1,7 @@
 .env
 cache/
 logs/*.jsonl
+locks/
 qdrant_storage/
 node_modules/
 *.class

@@ -3,6 +3,8 @@ parsing helpers -- no network involved, these never hit the real Jira API.
 """
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 import jira_client
 from jira_client import (
     _adf_has_code_block,
@@ -14,6 +16,100 @@ from jira_client import (
     _parse_sprint_field,
     fetch_epic_with_children,
 )
+
+
+def _fake_comments_page(comments: list, total: int) -> MagicMock:
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"comments": comments, "total": total}
+    return resp
+
+
+def _fake_comment(marker_text: str) -> dict:
+    return {"body": {"content": [{"content": [{"text": marker_text, "type": "text"}]}]}}
+
+
+@patch("jira_client.httpx.get")
+def test_comment_already_posted_true_when_marker_on_first_page(mock_get, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_get.return_value = _fake_comments_page([_fake_comment("[ref: run-1:abc]")], total=1)
+
+    assert jira_client.comment_already_posted("T-1", "[ref: run-1:abc]") is True
+    assert mock_get.call_count == 1
+
+
+@patch("jira_client.httpx.get")
+def test_comment_already_posted_false_when_not_found_within_page_limit(mock_get, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_get.return_value = _fake_comments_page([_fake_comment("otra cosa")], total=1)
+
+    assert jira_client.comment_already_posted("T-1", "[ref: run-1:abc]") is False
+
+
+@patch("jira_client.httpx.get")
+def test_comment_already_posted_paginates_past_first_50_to_find_older_marker(mock_get, monkeypatch):
+    """Bug real identificado en auditoria ("gaps en los flujos de jira"): un
+    ticket con varias corridas del pipeline (test plan, estado del agente,
+    salida de tests, veredicto del juez, link al PR, comprobante tecnico --
+    varios comentarios por corrida) hace que un marcador de una corrida
+    anterior se corra mas alla de una sola pagina de 50 -- la version
+    original (maxResults=50, sin paginar) fallaba en detectarlo. Confirma
+    que ahora sigue pidiendo paginas siguientes hasta encontrarlo."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    page_1 = _fake_comments_page([_fake_comment("otra cosa") for _ in range(100)], total=120)
+    page_2 = _fake_comments_page([_fake_comment("[ref: run-old:xyz]")] + [_fake_comment("mas") for _ in range(19)], total=120)
+    mock_get.side_effect = [page_1, page_2]
+
+    assert jira_client.comment_already_posted("T-1", "[ref: run-old:xyz]") is True
+    assert mock_get.call_count == 2
+    assert mock_get.call_args_list[1].kwargs["params"]["startAt"] == 100
+
+
+@patch("jira_client.httpx.get")
+def test_comment_already_posted_stops_after_bounded_page_limit(mock_get, monkeypatch):
+    """Best-effort acotado, no un scan sin fin -- un ticket con miles de
+    comentarios historicos no debe convertir cada comment_jira() en una
+    cadena larga de requests HTTP secuenciales."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_get.return_value = _fake_comments_page([_fake_comment("otra cosa") for _ in range(100)], total=10000)
+
+    assert jira_client.comment_already_posted("T-1", "[ref: nunca-esta:zzz]") is False
+    assert mock_get.call_count == jira_client._COMMENT_ALREADY_POSTED_MAX_PAGES
+
+
+@patch("jira_client.httpx.get")
+def test_test_plan_already_posted_true_when_present(mock_get, monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira",
+    KAN-6 real): un ticket bloqueado dias seguidos regeneraba y reposteaba
+    practicamente el mismo Test Plan en CADA corrida nueva (confirmado real:
+    5 postings identicos en dias distintos), enterrando la señal real de
+    por que se bloqueaba entre ruido repetido."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_get.return_value = _fake_comments_page(
+        [_fake_comment("🧪 Test Plan (Prefect):\n\nCasos funcionales...")], total=1,
+    )
+
+    assert jira_client.test_plan_already_posted("T-1") is True
+
+
+@patch("jira_client.httpx.get")
+def test_test_plan_already_posted_false_when_absent(mock_get, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_get.return_value = _fake_comments_page([_fake_comment("otro comentario cualquiera")], total=1)
+
+    assert jira_client.test_plan_already_posted("T-1") is False
 
 
 def test_adf_to_text_none_is_empty_string():
@@ -590,3 +686,74 @@ def test_post_audit_comment_sends_real_adf_body(mock_post, monkeypatch):
 
     sent_body = mock_post.call_args.kwargs["json"]["body"]
     assert sent_body["content"][0]["type"] == "heading"
+
+
+@patch("jira_client.httpx.post")
+def test_post_audit_comment_truncates_oversized_body(mock_post, monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira"): un
+    reporte tecnico/razonamiento del juez generado por un LLM sin ningun tope
+    de longitud podia superar el tamano real que Jira Cloud acepta para un
+    comentario -- ese 400 se atrapaba como cualquier otro fallo (best-effort,
+    solo WARNING en orchestration.py) y el comentario se perdia entero en
+    silencio. Confirma que se trunca ANTES de mandarlo, en vez de dejar que
+    Jira lo rechace."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_post.return_value = MagicMock(json=lambda: {"id": "1"})
+
+    huge_text = "x" * (jira_client._COMMENT_MAX_CHARS + 5000)
+    jira_client.post_audit_comment("T-1", huge_text)
+
+    sent_body = mock_post.call_args.kwargs["json"]["body"]
+    sent_text = _adf_to_text(sent_body)
+    assert len(sent_text) < len(huge_text)
+    assert "truncado" in sent_text
+
+
+@patch("jira_client.httpx.put")
+def test_set_pipeline_blocked_label_adds_label_when_blocked(mock_put, monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira",
+    KAN-6 real): este proyecto de Jira solo tiene 4 estados -- no existe un
+    estado "Blocked" real, asi que JIRA_BLOCKED_STATUS y JIRA_REVIEW_STATUS
+    terminan siendo el MISMO string ("En revision"). Un ticket bloqueado
+    dias por output_guard quedaba visualmente identico a uno con un PR real
+    listo para revisar. Confirma que se agrega un label distintivo."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_put.return_value = MagicMock(raise_for_status=lambda: None)
+
+    jira_client.set_pipeline_blocked_label("T-1", blocked=True)
+
+    sent = mock_put.call_args.kwargs["json"]
+    assert sent == {"update": {"labels": [{"add": "pipeline-blocked"}]}}
+
+
+@patch("jira_client.httpx.put")
+def test_set_pipeline_blocked_label_removes_label_when_not_blocked(mock_put, monkeypatch):
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+    mock_put.return_value = MagicMock(raise_for_status=lambda: None)
+
+    jira_client.set_pipeline_blocked_label("T-1", blocked=False)
+
+    sent = mock_put.call_args.kwargs["json"]
+    assert sent == {"update": {"labels": [{"remove": "pipeline-blocked"}]}}
+
+
+@patch("jira_client.httpx.put")
+def test_set_pipeline_blocked_label_degrades_gracefully_on_failure(mock_put, monkeypatch):
+    """Best-effort: una senal visual extra nunca debe tirar abajo la
+    corrida real -- mismo criterio que comment_already_posted."""
+    monkeypatch.setenv("JIRA_URL", "https://example.atlassian.net")
+    monkeypatch.setenv("JIRA_EMAIL", "a@b.com")
+    monkeypatch.setenv("JIRA_API_TOKEN", "tok")
+
+    def raise_error(*a, **k):
+        raise httpx.ConnectError("caido")
+
+    mock_put.side_effect = raise_error
+
+    jira_client.set_pipeline_blocked_label("T-1", blocked=True)  # no debe lanzar

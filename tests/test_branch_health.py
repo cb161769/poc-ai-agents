@@ -93,6 +93,33 @@ def test_resolve_abandons_when_tests_already_fail(monkeypatch):
     assert result["resumed"] is False
 
 
+def test_resolve_abandons_when_diff_already_has_vendor(monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-6, dias de corridas): una rama
+    ya tenia node_modules commiteado de una corrida ANTERIOR al fix de
+    exclusion de vendor -- se seguia resumiendo para siempre, y
+    output_guard bloqueaba la epica en cada corrida por un falso positivo
+    'rm -rf' dentro del vendor viejo. Mismo fix que orchestration.py's
+    run_coding_agent_local_real, portado a este CLI (Camino B bash)."""
+    monkeypatch.setattr(branch_health.ensure_on_trunk_branch, "fn", lambda repo: "main")
+    monkeypatch.setattr(branch_health, "_find_open_branch_for_ticket", lambda *a: "copilot/KAN-2-100")
+    monkeypatch.setattr(branch_health, "_check_pr_rejected_for_branch", lambda *a: False)
+    tests_called = []
+    monkeypatch.setattr(branch_health.run_tests, "fn", lambda repo: tests_called.append(1) or {"passed": True, "output": "ok"})
+
+    def fake_run(cmd, **kwargs):
+        if "diff" in cmd and "--name-only" in cmd:
+            return _fake_subprocess_result(stdout="frontend/node_modules/@esbuild/README.md\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(branch_health.subprocess, "run", fake_run)
+
+    result = branch_health.resolve("KAN-2", "/repo")
+
+    assert "node_modules" in result["abandon_reason"]
+    assert result["resumed"] is False
+    assert tests_called == []  # el chequeo de vendor es mas barato y corre ANTES de correr tests reales
+
+
 def test_resolve_abandons_when_duplicate_scaffolding(monkeypatch):
     monkeypatch.setattr(branch_health.ensure_on_trunk_branch, "fn", lambda repo: "main")
     monkeypatch.setattr(branch_health, "_find_open_branch_for_ticket", lambda *a: "copilot/KAN-2-100")

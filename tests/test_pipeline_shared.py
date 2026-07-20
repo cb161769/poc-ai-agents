@@ -1,13 +1,18 @@
 """Unit tests for pipeline_shared.py -- la fuente unica de constantes/logica
 compartida entre orchestration.py, run_poc_loop.sh, y judge_agent.py.
 """
+import time
+
 import judge_agent
+import pipeline_shared
 from pipeline_shared import (
     POLICY_REGISTRY,
     RETRYABLE_POLICY_REFERENCES,
     ErrorCategory,
     TicketState,
+    acquire_ticket_lock,
     outcome_to_state,
+    release_ticket_lock,
 )
 
 
@@ -61,3 +66,47 @@ def test_policy_registry_security_references_are_never_retryable():
     for ref, rule in POLICY_REGISTRY.items():
         if rule.category == ErrorCategory.SECURITY:
             assert rule.retryable is False, f"{ref} es de seguridad pero quedo marcado retryable=True"
+
+
+def test_acquire_ticket_lock_true_when_no_existing_lock(tmp_path, monkeypatch):
+    """Gap real identificado en auditoria ("gaps en los flujos de jira"): sin
+    esto, dos corridas sobre el mismo ticket (un humano re-corriendo
+    run_poc_loop.sh a mano mientras un flow de Prefect todavia esta
+    corriendo) podian comentar/transicionar Jira en paralelo, intercalado."""
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    assert acquire_ticket_lock("KAN-5") is True
+    assert (tmp_path / "locks" / "KAN-5.lock").exists()
+
+
+def test_acquire_ticket_lock_false_when_already_held(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    assert acquire_ticket_lock("KAN-5") is True
+    assert acquire_ticket_lock("KAN-5") is False
+
+
+def test_acquire_ticket_lock_steals_stale_lock(tmp_path, monkeypatch):
+    """Un proceso que crashea a mitad de una corrida (ej. el contenedor se
+    mata) nunca libera su lock -- sin esto, un ticket quedaria bloqueado
+    para siempre. Se roba despues de stale_after_seconds."""
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    assert acquire_ticket_lock("KAN-5", stale_after_seconds=0) is True
+    time.sleep(0.05)
+    assert acquire_ticket_lock("KAN-5", stale_after_seconds=0) is True
+
+
+def test_release_ticket_lock_allows_reacquiring(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    assert acquire_ticket_lock("KAN-5") is True
+    release_ticket_lock("KAN-5")
+    assert acquire_ticket_lock("KAN-5") is True
+
+
+def test_release_ticket_lock_is_safe_when_nothing_to_release(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    release_ticket_lock("KAN-does-not-exist")  # no debe lanzar
+
+
+def test_acquire_ticket_lock_different_tickets_do_not_conflict(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline_shared, "LOCK_DIR", tmp_path / "locks")
+    assert acquire_ticket_lock("KAN-5") is True
+    assert acquire_ticket_lock("KAN-6") is True

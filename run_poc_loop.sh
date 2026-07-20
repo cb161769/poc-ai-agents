@@ -74,6 +74,28 @@ fail() {
   exit 1
 }
 
+# Gap real identificado en auditoria ("gaps en los flujos de jira"): ni
+# run_poc_loop.sh ni orchestration.py tenian ninguna arbitracion entre
+# procesos sobre el MISMO ticket -- un humano re-corriendo este script a
+# mano mientras un flow de Prefect disparado por webhook todavia esta
+# corriendo (o dos corridas solapadas) podian comentar/transicionar el mismo
+# ticket en paralelo. Reusa el lock de archivo real de pipeline_shared.py
+# (mismo patron que RETRYABLE_POLICY_REFS mas abajo -- fuente unica
+# compartida con orchestration.py, no una reimplementacion en bash).
+release_ticket_lock() {
+  if [ -n "${TICKET_ID:-}" ]; then
+    python3 "${SCRIPT_DIR}/pipeline_shared.py" lock-release "${TICKET_ID}" >/dev/null 2>&1 || true
+  fi
+}
+
+acquire_ticket_lock_or_fail() {
+  local ticket_id="$1"
+  if ! python3 "${SCRIPT_DIR}/pipeline_shared.py" lock-acquire "${ticket_id}" >/dev/null 2>&1; then
+    fail "${ticket_id}: ya hay otra corrida de este pipeline trabajando este ticket ahora mismo (lock de archivo activo en locks/${ticket_id}.lock). Si esto persiste sin ninguna corrida real en curso, es un lock huerfano de un proceso que crasheo -- se libera solo despues de un tiempo (ver pipeline_shared.DEFAULT_LOCK_STALE_SECONDS en pipeline_shared.py)."
+  fi
+  trap release_ticket_lock EXIT
+}
+
 # Bounded retry (2 reintentos, backoff 1s/2s) para comandos que le pegan a
 # servicios reales (curl al firewall, cypher-shell a Neo4j) -- mismo criterio
 # que ya usa orchestration.py por task de Prefect y retry_utils.py del lado
@@ -1157,6 +1179,8 @@ if command -v cypher-shell >/dev/null 2>&1; then
 fi
 
 if [ "${EPIC_MODE}" = "true" ]; then
+  TICKET_ID="${EPIC_KEY}"
+  acquire_ticket_lock_or_fail "${EPIC_KEY}"
   run_epic_etapas
   run_pipeline_delivery
   exit 0
@@ -1174,6 +1198,7 @@ if [ "${ISSUE_TYPE}" = "Epic" ]; then
 fi
 
 TICKET_ID=$(echo "${JIRA_JSON}" | jq -r '.ticket_id')
+acquire_ticket_lock_or_fail "${TICKET_ID}"
 SUMMARY=$(echo "${JIRA_JSON}" | jq -r '.summary')
 DESCRIPTION=$(echo "${JIRA_JSON}" | jq -r '.description')
 REPO_ORIGEN=$(echo "${JIRA_JSON}" | jq -r '.repository_origen')

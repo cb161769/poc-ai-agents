@@ -35,6 +35,7 @@ sys.path.insert(0, str(SCRIPT_DIR.parent))
 
 import orchestration  # noqa: E402
 from orchestration import (  # noqa: E402
+    _branch_diff_has_vendor_pollution,
     _check_pr_rejected_for_branch,
     _find_open_branch_for_ticket,
     _has_duplicate_project_scaffolding,
@@ -79,13 +80,17 @@ def resolve(ticket_id: str, target_repo_dir: str) -> dict:
         if pr_rejected:
             abandon_reason = "la PR previa de esta rama fue rechazada/cerrada sin mergear"
         else:
-            health_check = run_tests.fn(target_repo_dir)
-            if not health_check["passed"]:
-                abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+            vendor_pollution = _branch_diff_has_vendor_pollution(target_repo_dir, existing_branch, base_branch)
+            if vendor_pollution:
+                abandon_reason = vendor_pollution
             else:
-                structural_issue = _has_duplicate_project_scaffolding(target_repo_dir)
-                if structural_issue:
-                    abandon_reason = f"estructura duplicada detectada: {structural_issue}"
+                health_check = run_tests.fn(target_repo_dir)
+                if not health_check["passed"]:
+                    abandon_reason = "los tests reales YA fallan en esta rama antes de aplicar ningun cambio nuevo"
+                else:
+                    structural_issue = _has_duplicate_project_scaffolding(target_repo_dir)
+                    if structural_issue:
+                        abandon_reason = f"estructura duplicada detectada: {structural_issue}"
 
         if abandon_reason:
             subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])

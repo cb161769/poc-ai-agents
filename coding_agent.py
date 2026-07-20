@@ -35,6 +35,8 @@ import difflib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -707,6 +709,101 @@ def tool_query_sonar(target_repo_dir: str, component: str) -> str:
     return "\n".join(lines)
 
 
+def _has_dotnet_project_file(work_dir: Path) -> bool:
+    return bool(list(work_dir.glob("*.csproj")) or list(work_dir.glob("*.sln")))
+
+
+# binario -> (chequeo del marcador real de ese stack en work_dir, imagen
+# Docker real) -- MISMO mapeo que scripts/run_module_tests.sh::detect_stack()
+# ya usa para el testing-agent real, mantenido en sync a mano (tabla chica y
+# estable, no amerita un bridge bash/Python como pipeline_shared.py).
+#
+# Gap real confirmado en vivo (epica KAN-4/KAN-6, dias de corridas): el
+# coding agent corre sus propios comandos de verificacion (npm install/npm
+# test, mvn test, etc, via run_shell_command) DIRECTO en el contenedor donde
+# corre el propio agente (poc-ai-agents-testrunner) -- deliberadamente
+# minimo (Python + git + jq + cypher-shell, ver Dockerfile.testrunner), NO
+# trae Node/Maven/Go/Ruby/Rust/.NET. 'npm install' fallaba SIEMPRE con "npm:
+# not found", indistinguible para el agente (y para el juez, que solo ve el
+# resultado final) de un fallo real del codigo que genero. El testing-agent
+# real (run_tests()/scripts/run_module_tests.sh) ya resuelve exactamente
+# este problema corriendo cada stack en su propia imagen via
+# Docker-outside-of-Docker -- _resolve_stack_image_if_needed aplica el MISMO
+# patron a los comandos ad-hoc del coding agent.
+_STACK_RUNTIME_IMAGES = {
+    "mvn": (lambda d: (d / "pom.xml").exists(), "maven:3.9-eclipse-temurin-17"),
+    "mvnw": (lambda d: (d / "pom.xml").exists(), "maven:3.9-eclipse-temurin-17"),
+    "dotnet": (_has_dotnet_project_file, "mcr.microsoft.com/dotnet/sdk:8.0"),
+    "go": (lambda d: (d / "go.mod").exists(), "golang:1.22"),
+    "bundle": (lambda d: (d / "Gemfile").exists(), "ruby:3.3"),
+    "rspec": (lambda d: (d / "Gemfile").exists(), "ruby:3.3"),
+    "cargo": (lambda d: (d / "Cargo.toml").exists(), "rust:1.78"),
+    "pipenv": (lambda d: (d / "Pipfile").exists(), "python:3.10-slim"),
+    "npm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+    "npx": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+    "node": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+    "yarn": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+    "pnpm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+}
+
+
+def _resolve_stack_image_if_needed(command: str, work_dir: Path) -> str | None:
+    """None si el comando puede (o debe) correr nativo -- el binario que
+    necesita ya esta disponible en este contenedor, no hay Docker para
+    containerizar, o no se reconoce ningun runtime de stack en el comando.
+    Solo devuelve una imagen cuando containerizar es realmente lo que
+    destraba el comando (el binario falta LOCALMENTE pero el marcador real
+    del stack SI esta en work_dir), para no pagar overhead de contenedor en
+    comandos genericos (git, ls, cat, python3 -- este ultimo YA disponible
+    en testrunner, que es python:3.10-slim).
+    """
+    try:
+        first_token = shlex.split(command)[0]
+    except (ValueError, IndexError):
+        return None
+    if shutil.which(first_token):
+        return None
+    hit = _STACK_RUNTIME_IMAGES.get(first_token)
+    if not hit:
+        return None
+    has_marker, image = hit
+    if shutil.which("docker") is None or not has_marker(work_dir):
+        return None
+    return image
+
+
+def _run_command_in_stack_container(image: str, command: str, target_repo_dir: str, work_dir: Path) -> str:
+    """Docker-outside-of-Docker, mismo patron que orchestration.py::run_tests()
+    ya usa: HOST_TARGET_REPO_DIR (seteada solo en corridas via DooD, ver ese
+    comentario) es el path real y visible para el daemon del HOST -- el
+    daemon no puede montar un path que solo existe DENTRO de este
+    contenedor. Sin ella (host real, no DooD), cae a target_repo_dir tal
+    cual. Timeout mas generoso que el camino nativo (600s vs 120s): un
+    'npm install' real (mas 'npx playwright install --with-deps') puede
+    tardar bastante mas que un comando nativo cualquiera.
+    """
+    target_repo_root = Path(target_repo_dir).resolve()
+    rel = work_dir.relative_to(target_repo_root)
+    host_target_repo_dir = os.environ.get("HOST_TARGET_REPO_DIR", target_repo_dir)
+    host_work_dir = f"{host_target_repo_dir}/{rel.as_posix()}" if str(rel) != "." else host_target_repo_dir
+
+    print(
+        f"(el binario que este comando necesita no esta disponible en este contenedor -- "
+        f"delegando a la imagen real '{image}' via Docker-outside-of-Docker)",
+        file=sys.stderr,
+    )
+    try:
+        result = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{host_work_dir}:/work", "-w", "/work", image, "sh", "-c", command],
+            capture_output=True, text=True, timeout=600,
+        )
+        stdout = _truncate(result.stdout, _MAX_SHELL_OUTPUT_CHARS)
+        stderr = _truncate(result.stderr, _MAX_SHELL_OUTPUT_CHARS)
+        return f"exit_code={result.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    except subprocess.TimeoutExpired:
+        return "error: el comando (containerizado, imagen real) supero el timeout de 600s"
+
+
 def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") -> str:
     """cwd (opcional, relativo a target_repo_dir): en que subcarpeta correr
     el comando -- sin esto, siempre corria en la RAIZ del repo, lo que
@@ -731,6 +828,10 @@ def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") ->
         prompt = "¿Ejecutar este comando POTENCIALMENTE DESTRUCTIVO igual? [s/n]: "
     if not _confirm(prompt):
         return "el usuario rechazo ejecutar este comando"
+
+    stack_image = _resolve_stack_image_if_needed(command, work_dir)
+    if stack_image:
+        return _run_command_in_stack_container(stack_image, command, target_repo_dir, work_dir)
 
     try:
         result = subprocess.run(
