@@ -193,6 +193,18 @@ _SCAFFOLD_COMMAND_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Gap real identificado en una auditoria de arquitectura previa (chat.py,
+# "sin regla de seguridad especifica para comandos de shell peligrosos"):
+# HOY el unico gate es el [s/n] generico de _confirm() -- sin ninguna señal
+# extra de "este comando en particular es especialmente riesgoso" antes de
+# aprobarlo. No bloquea nada nuevo (mismo humano en el medio de siempre),
+# solo hace mas dificil aprobar uno de estos distraidamente.
+_DANGEROUS_COMMAND_PATTERN = re.compile(
+    r"(rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r|git\s+reset\s+--hard|git\s+push\s+.*--force"
+    r"|git\s+clean\s+-[a-z]*f|drop\s+table|drop\s+database|>\s*/etc/|:\(\)\s*\{\s*:\|:\s*&\s*\}\s*;\s*:)",
+    re.IGNORECASE,
+)
+
 
 def _normalize_listed_dir(path: str) -> str:
     return (path or ".").strip().rstrip("/") or "."
@@ -713,7 +725,11 @@ def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") ->
 
     print(f"\nEl agente quiere correr en {work_dir}:", file=sys.stderr)
     print(f"  $ {command}", file=sys.stderr)
-    if not _confirm("¿Ejecutar este comando? [s/n]: "):
+    prompt = "¿Ejecutar este comando? [s/n]: "
+    if _DANGEROUS_COMMAND_PATTERN.search(command):
+        print("⚠️  COMANDO POTENCIALMENTE DESTRUCTIVO ⚠️  (ej. borra archivos, reescribe historial de git, o similar)", file=sys.stderr)
+        prompt = "¿Ejecutar este comando POTENCIALMENTE DESTRUCTIVO igual? [s/n]: "
+    if not _confirm(prompt):
         return "el usuario rechazo ejecutar este comando"
 
     try:
@@ -1092,7 +1108,7 @@ async def run_coding_agent(
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
                 messages.append({"role": "user", "content": tool_results})
                 compact_old_tool_results(messages, _READ_ONLY_TOOL_NAMES)
-                warn_if_context_large(messages, logger, "coding agent")
+                warn_if_context_large(messages, logger, "coding agent", backend=backend, system_prompt=CODING_AGENT_SYSTEM_PROMPT)
 
     return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
 

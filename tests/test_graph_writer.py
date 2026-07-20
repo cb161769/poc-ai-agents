@@ -44,6 +44,17 @@ def test_build_write_params_normalizes_defaults():
     assert params["components"] == ["AuthService"]
 
 
+def test_build_write_params_keeps_state():
+    """TicketState (pipeline_shared.py) se persiste como property real del
+    nodo :Run -- confirma que _build_write_params no lo pierde, y que
+    ausente (payload viejo, pre-TicketState) cae a None en vez de romper."""
+    params = graph_writer._build_write_params(_base_payload(state="partial_failure"))
+    assert params["state"] == "partial_failure"
+
+    params_missing = graph_writer._build_write_params(_base_payload())
+    assert params_missing["state"] is None
+
+
 def test_build_write_params_keeps_is_epic_and_children():
     params = graph_writer._build_write_params(
         _base_payload(ticket_key="EPIC-1", is_epic=True, child_ticket_keys=["JIRA-1", "JIRA-2"])

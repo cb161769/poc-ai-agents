@@ -23,10 +23,12 @@ import asyncio
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import judge_agent  # noqa: E402
+from judge_agent import _reasoning_ignores_real_diff_files, _verdict_is_self_contradictory  # noqa: E402
 
 CASES_PATH = Path(__file__).resolve().parent / "judge_eval_cases.jsonl"
 RUNS_LOG = Path(__file__).resolve().parent.parent / "logs" / "eval_judge_runs.jsonl"
@@ -38,11 +40,19 @@ def load_cases() -> list:
 
 async def run_case(case: dict) -> dict:
     expected_policy_reference = case.get("expected_policy_reference")
+    # Gap real identificado en una auditoria de arquitectura previa: sin
+    # esto, todos los casos pesaban igual en el accuracy global -- una
+    # accuracy alta podia esconder que el juez falla sistematicamente en
+    # UNA categoria puntual (ej. siempre se equivoca con seguridad pero
+    # acierta todo lo demas). Retrocompatible: casos sin "category" en el
+    # dataset actual caen en "uncategorized", no rompen nada.
+    category = case.get("category", "uncategorized")
     try:
         verdict = await judge_agent.judge_with_tools(case["payload"])
     except Exception as exc:  # noqa: BLE001 — eval harness, we want to record the failure, not crash
         return {
             "case_id": case["case_id"],
+            "category": category,
             "expected": case["expected_verdict"],
             "actual": "ERROR",
             "correct": False,
@@ -50,23 +60,47 @@ async def run_case(case: dict) -> dict:
             "actual_policy_reference": None,
             "policy_reference_correct": False,
             "reasoning": str(exc),
+            "reasoning_quality_flags": [],
+            # Gap real: un fallo de herramienta/infra (ej. el bug real de
+            # get_neo4j_schema encontrado esta sesion) se contaba igual que
+            # un desacuerdo de juicio real -- ahora se separa para no
+            # mezclar "el juez razono mal" con "algo se rompio antes de que
+            # el juez pudiera razonar".
+            "is_tool_or_infra_failure": True,
             "_meta": {},
         }
 
     actual = verdict.get("verdict", "ERROR")
     actual_policy_reference = verdict.get("policy_reference")
+    correct = actual == case["expected_verdict"]
+
+    # Gap real identificado en una auditoria de arquitectura previa: el
+    # juez puede ACERTAR el veredicto (verdict/policy_reference correctos)
+    # pero justificarlo mal (cita evidencia equivocada, razona sobre algo
+    # irrelevante) -- reusa las MISMAS heuristicas que judge_agent.py ya usa
+    # en produccion para disparar sus propios nudges, en vez de sumar un
+    # segundo LLM evaluador (costo/latencia nueva) solo para los evals.
+    reasoning_quality_flags = []
+    if _verdict_is_self_contradictory(verdict):
+        reasoning_quality_flags.append("self_contradictory")
+    if _reasoning_ignores_real_diff_files(case["payload"], verdict):
+        reasoning_quality_flags.append("ignores_real_diff")
+
     return {
         "case_id": case["case_id"],
+        "category": category,
         "expected": case["expected_verdict"],
         "actual": actual,
-        "correct": actual == case["expected_verdict"],
+        "correct": correct,
         "expected_policy_reference": expected_policy_reference,
         "actual_policy_reference": actual_policy_reference,
         # Solo tiene sentido comparar policy_reference cuando el veredicto en
         # si tambien salio bien -- si el veredicto ya esta mal, la cita de
         # politica no importa (ni se puede evaluar de forma justa).
-        "policy_reference_correct": (actual == case["expected_verdict"]) and (actual_policy_reference == expected_policy_reference),
+        "policy_reference_correct": correct and (actual_policy_reference == expected_policy_reference),
         "reasoning": verdict.get("reasoning", ""),
+        "reasoning_quality_flags": reasoning_quality_flags,
+        "is_tool_or_infra_failure": False,
         "_meta": verdict.get("_meta", {}),
     }
 
@@ -138,6 +172,37 @@ async def main():
     total_cost = sum(r["_meta"].get("estimated_cost_usd", 0) for r in results)
     total_latency = sum(r["_meta"].get("latency_seconds", 0) for r in results)
     print(f"\nCosto estimado total: ${total_cost:.4f}  ·  Latencia total: {total_latency:.1f}s")
+
+    # Accuracy por categoria -- una accuracy global alta puede esconder que
+    # el juez falla sistematicamente en una categoria puntual.
+    categories = sorted({r["category"] for r in results})
+    if categories and categories != ["uncategorized"]:
+        print("\n== Accuracy por categoria ==")
+        for cat in categories:
+            cat_results = [r for r in results if r["category"] == cat]
+            cat_correct = sum(1 for r in cat_results if r["correct"])
+            print(f"  {cat}: {cat_correct}/{len(cat_results)} ({cat_correct / len(cat_results):.0%})")
+
+    # Calidad de razonamiento -- independiente de si el veredicto en si dio
+    # correcto: un caso puede acertar la etiqueta y razonar mal igual.
+    flagged_reasoning = [r for r in results if r["reasoning_quality_flags"]]
+    if flagged_reasoning:
+        flag_counts = Counter(flag for r in flagged_reasoning for flag in r["reasoning_quality_flags"])
+        print(f"\n== Calidad de razonamiento (independiente de si el veredicto acerto) ==")
+        print(f"  {len(flagged_reasoning)}/{len(results)} casos con al menos una senal de razonamiento sospechoso: {dict(flag_counts)}")
+        for r in flagged_reasoning:
+            correct_note = "acerto el veredicto pero" if r["correct"] else "y ademas fallo el veredicto,"
+            print(f"   ⚠️ {r['case_id']}: {correct_note} razonamiento sospechoso ({', '.join(r['reasoning_quality_flags'])})")
+
+    # Robustez ante fallo de herramientas/infra -- separado del accuracy de
+    # juicio real (antes se mezclaban: un caso que crasheaba por un bug de
+    # infra contaba identico a un caso donde el juez razono mal de verdad).
+    tool_failures = [r for r in results if r["is_tool_or_infra_failure"]]
+    if tool_failures:
+        print(f"\n== Robustez ante fallo de herramientas/infra ==")
+        print(f"  {len(tool_failures)}/{len(results)} casos ({len(tool_failures) / len(results):.0%}) crashearon antes de que el juez pudiera dar un veredicto real.")
+        for r in tool_failures:
+            print(f"   💥 {r['case_id']}: {r['reasoning'][:200]}")
 
     if matrix["fn"] > 0:
         sys.exit(1)  # el error grave (dejar pasar algo que deberia bloquearse) hace fallar el eval

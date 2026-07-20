@@ -68,7 +68,8 @@ UNWIND $components AS component_name
 
 WITH root
 MERGE (run:Run {{run_id: $run_id}})
-  ON CREATE SET run.ts = $ts, run.branch = $branch, run.backend = $backend
+  ON CREATE SET run.ts = $ts, run.branch = $branch, run.backend = $backend, run.state = $state
+  ON MATCH SET run.state = $state
 MERGE (run)-[:FOR_TICKET]->(root)
 
 WITH run
@@ -132,6 +133,7 @@ def _build_write_params(payload: dict) -> dict:
         "components": payload.get("components") or [],
         "branch": payload.get("branch"),
         "backend": payload.get("backend"),
+        "state": payload.get("state"),
         "ts": payload.get("ts") or "",
         "decisions": decisions,
     }

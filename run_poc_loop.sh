@@ -1016,9 +1016,26 @@ EOF
     echo "=================================================================="
 
     local applied=false branch base_branch diff_text tests_gate_result
-    base_branch=$(git -C "${TARGET_REPO_DIR}" rev-parse --abbrev-ref HEAD)
-    branch="copilot/${TICKET_ID}-$(date +%s)"
-    git -C "${TARGET_REPO_DIR}" checkout -b "${branch}" >/dev/null
+    # Bug real confirmado esta sesion: antes esto creaba una rama nueva a
+    # ciegas (copilot/${TICKET_ID}-$(date +%s)) sin nunca chequear trunk
+    # real/rama abierta existente/PR rechazada/scaffolding duplicado -- la
+    # MISMA causa raiz que genero PRs apuntando entre si en una epica real
+    # (KAN-4), que orchestration.py ya arreglo pero nunca se porto a este
+    # camino bash. scripts/branch_health.py reusa la logica REAL de
+    # orchestration.py (mismo patron que pipeline_shared.py ya usa para que
+    # bash consuma Python sin reimplementar nada) -- deja el repo parado en
+    # la rama correcta (nueva o retomada) y expone el resultado como
+    # variables de entorno.
+    local BRANCH BASE_BRANCH RESUMED PR_REJECTED ABANDON_REASON
+    eval "$(python3 "${SCRIPT_DIR}/scripts/branch_health.py" resolve "${TICKET_ID}" "${TARGET_REPO_DIR}")"
+    branch="${BRANCH}"
+    base_branch="${BASE_BRANCH}"
+    if [ "${RESUMED}" = "true" ]; then
+      echo "Retomando rama existente '${branch}' en vez de crear una nueva."
+    fi
+    if [ -n "${ABANDON_REASON}" ]; then
+      echo "La rama previa de este ticket parecia rota (${ABANDON_REASON}) -- se abandono, arrancando de cero desde '${base_branch}' en la rama nueva '${branch}'."
+    fi
 
     local backend_available=false
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -1060,9 +1077,24 @@ EOF
       AGENT_BACKEND="gh_copilot_suggest"
     fi
 
+    # Bug real confirmado esta sesion: 'git commit' no tenia NINGUN manejo de
+    # error, y este script no tiene 'set -e' -- un commit fallido (ej.
+    # identidad de git no configurada, la MISMA causa real de esta noche)
+    # seguia derecho a 'applied=true' y posteaba "Copilot aplico un cambio...
+    # pendiente de revision" a Jira aunque NO se hubiera commiteado nada real.
+    # Mas grave que el bug analogo que se arreglo hoy en orchestration.py
+    # (que al menos crasheaba ruidosamente) -- este mentia en silencio.
+    local has_real_commit=false
     if [ -n "$(git -C "${TARGET_REPO_DIR}" status --porcelain)" ]; then
       git -C "${TARGET_REPO_DIR}" add -A
-      git -C "${TARGET_REPO_DIR}" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null
+      if git -C "${TARGET_REPO_DIR}" commit -m "Copilot suggestion for ${TICKET_ID}" >/dev/null 2>&1; then
+        has_real_commit=true
+      else
+        echo "ADVERTENCIA: 'git commit' fallo (revisa identidad de git configurada: git config user.name/git config user.email en ${TARGET_REPO_DIR}) -- se trata como que no se aplico ningun cambio."
+      fi
+    fi
+
+    if [ "${has_real_commit}" = "true" ]; then
       applied=true
       echo "Cambio aplicado y commiteado en la rama '${branch}' de ${TARGET_REPO_DIR} — NO en '${base_branch}'."
       echo "Revisalo con: git -C \"${TARGET_REPO_DIR}\" diff ${base_branch}..${branch}"
@@ -1090,8 +1122,14 @@ EOF
       fi
     else
       git -C "${TARGET_REPO_DIR}" checkout "${base_branch}" >/dev/null 2>&1
-      git -C "${TARGET_REPO_DIR}" branch -D "${branch}" >/dev/null 2>&1
-      echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, o el comando no modifico archivos)."
+      if [ "${RESUMED:-false}" != "true" ]; then
+        # Mismo criterio que orchestration.py: solo se borra una rama recien
+        # creada y vacia -- una rama RETOMADA puede traer commits reales de
+        # una corrida anterior, borrarla aca los destruiria solo porque ESTE
+        # intento puntual no sumo nada nuevo (o el commit fallo).
+        git -C "${TARGET_REPO_DIR}" branch -D "${branch}" >/dev/null 2>&1
+      fi
+      echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, el comando no modifico archivos, o el commit fallo)."
       post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
       branch=""
       log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"

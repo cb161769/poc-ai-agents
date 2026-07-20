@@ -710,7 +710,7 @@ async def judge_with_tools(payload: dict) -> dict:
                         )
                 messages.append({"role": "user", "content": tool_results})
                 compact_old_tool_results(messages, read_only_tool_names)
-                warn_if_context_large(messages, logger, "juez")
+                warn_if_context_large(messages, logger, "juez", backend=backend, system_prompt=JUDGE_SYSTEM_PROMPT)
 
     raise RuntimeError("el juez agoto los turnos de herramientas sin dar un veredicto final")
 

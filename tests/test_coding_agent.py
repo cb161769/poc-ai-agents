@@ -171,6 +171,51 @@ def test_tool_run_shell_command_skips_when_rejected(tmp_path, monkeypatch):
     assert "rechazo" in result
 
 
+def test_tool_run_shell_command_warns_on_dangerous_pattern(tmp_path, monkeypatch, capsys):
+    """Gap real identificado en una auditoria de arquitectura previa
+    (chat.py, 'sin regla de seguridad especifica para comandos de shell
+    peligrosos'): el gate sigue siendo el mismo [s/n] humano de siempre
+    (nada nuevo se bloquea), pero un comando destructivo real ahora muestra
+    una advertencia explicita antes de pedir confirmacion, en vez de verse
+    identico a un 'echo' cualquiera.
+    """
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    ca.tool_run_shell_command(str(tmp_path), "rm -rf /")
+
+    stderr = capsys.readouterr().err
+    assert "POTENCIALMENTE DESTRUCTIVO" in stderr
+
+
+def test_tool_run_shell_command_no_warning_for_safe_command(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    ca.tool_run_shell_command(str(tmp_path), "echo hello")
+
+    stderr = capsys.readouterr().err
+    assert "POTENCIALMENTE DESTRUCTIVO" not in stderr
+
+
+def test_dangerous_command_pattern_matches_known_destructive_commands():
+    dangerous = [
+        "rm -rf /",
+        "rm -fr .",
+        "git reset --hard HEAD~5",
+        "git push origin main --force",
+        "git clean -fd",
+        "DROP TABLE users;",
+        "echo pwned > /etc/passwd",
+    ]
+    for cmd in dangerous:
+        assert ca._DANGEROUS_COMMAND_PATTERN.search(cmd), f"deberia matchear: {cmd!r}"
+
+
+def test_dangerous_command_pattern_does_not_match_safe_commands():
+    safe = ["npm test", "git status", "git commit -m 'fix'", "ls -la", "cat README.md"]
+    for cmd in safe:
+        assert not ca._DANGEROUS_COMMAND_PATTERN.search(cmd), f"NO deberia matchear: {cmd!r}"
+
+
 def test_tool_run_shell_command_runs_in_monorepo_subdir_via_cwd(tmp_path, monkeypatch):
     """Confirmado real contra ai-agents-code: sin cwd, 'npm test' corria en
     la raiz del monorepo (donde no hay package.json) y siempre fallaba --

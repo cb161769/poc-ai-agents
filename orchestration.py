@@ -39,6 +39,7 @@ run_poc_loop.sh is kept as-is for anyone who prefers a plain bash run
 without standing up Prefect — both drive the exact same scripts underneath.
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -74,7 +75,7 @@ from coding_agent import _STACK_MARKERS
 from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
-from pipeline_shared import RETRYABLE_POLICY_REFERENCES
+from pipeline_shared import RETRYABLE_POLICY_REFERENCES, TicketState, outcome_to_state
 
 logger = get_logger(__name__)
 
@@ -402,11 +403,33 @@ def transition_jira(status: str, ticket_key: str | None = None):
         get_run_logger().warning(f"No se pudo transicionar el ticket {key} a '{status}': {exc}")
 
 
+def _comment_idempotency_marker(text: str) -> str:
+    """Gap real identificado en una auditoria de arquitectura previa:
+    comment_jira (mas abajo) es un @task(retries=2) sin ninguna proteccion
+    contra postear el mismo comentario dos veces. Best-effort: sin un
+    flow_run_id real disponible (fuera de un contexto de Prefect -- ej. los
+    tests que llaman comment_jira.fn() directo), devuelve "" y comment_jira
+    cae al comportamiento de SIEMPRE (postea sin chequear duplicados), nunca
+    bloquea ni cambia de forma el texto en ese caso.
+    """
+    try:
+        from prefect.context import get_run_context
+        flow_run_id = get_run_context().flow_run.id
+    except Exception:
+        return ""
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    return f"[ref: {flow_run_id}:{text_hash}]"
+
+
 @task(retries=2, retry_delay_seconds=5, name="comment-jira")
 def comment_jira(text: str, ticket_key: str | None = None):
     key = ticket_key or os.environ["JIRA_TICKET_KEY"]
+    marker = _comment_idempotency_marker(text)
     try:
-        jira_client.post_audit_comment(key, text)
+        if marker and jira_client.comment_already_posted(key, marker):
+            get_run_logger().info(f"Comentario ya posteado antes en {key} (marcador {marker}) -- no se duplica.")
+            return
+        jira_client.post_audit_comment(key, f"{text}\n\n{marker}" if marker else text)
     except Exception as exc:
         get_run_logger().warning(f"No se pudo comentar en el ticket {key}: {exc}")
 
@@ -1630,6 +1653,7 @@ def _build_graph_payload(
     child_ticket_keys: list | None = None,
     output_guard_status: str = "SKIPPED",
     output_guard_reason: str | None = None,
+    state: str | None = None,
 ) -> dict:
     judge_status = "SKIPPED"
     judge_reason = None
@@ -1648,6 +1672,7 @@ def _build_graph_payload(
         "components": components,
         "branch": branch,
         "backend": backend,
+        "state": state,
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "decisions": [
             {"stage": "firewall", "status": firewall_result.get("status"), "reason": firewall_result.get("reason"), "policy_reference": None},
@@ -2510,7 +2535,21 @@ def _deliver_epic_sequential(
         last_judge_verdict = judge_verdict
 
         if judge_verdict is None:
-            comment_jira(f"🧑‍⚖️ Agente juez (Prefect): no pudo evaluar {child_id} -- continua sin veredicto.", ticket_key=child_id)
+            # Decision de diseno explicita (TicketState.PARTIAL_FAILURE,
+            # pipeline_shared.py): esto ya aplico un cambio REAL (rama +
+            # commit) antes de que el juez fallara en evaluarlo -- el modelo
+            # de este pipeline es "cada paso humano-revisable con Jira como
+            # bitacora", NO una transaccion atomica, asi que la compensacion
+            # es marcar y explicar (esta linea), nunca revertir el commit/PR
+            # automaticamente (accion irreversible sobre un sistema externo,
+            # se deja 100% humana -- ver abandon_ticket_branch()).
+            comment_jira(
+                f"🧑‍⚖️ Agente juez (Prefect): no pudo evaluar {child_id} -- continua sin veredicto. "
+                f"Se aplico un cambio real (rama '{branch}') pero un paso posterior no se completo -- "
+                "el codigo NO se revirtio automaticamente, requiere revision manual antes de mergear o descartar "
+                f"(para descartar: 'python3 orchestration.py --abandon {child_id}').",
+                ticket_key=child_id,
+            )
             # Confirmado real (KAN-2): antes esto no transicionaba nada -- el
             # hijo quedaba clavado en JIRA_IN_PROGRESS_STATUS para siempre,
             # indistinguible de un hijo que sigue en curso de verdad. "sin
@@ -2578,6 +2617,24 @@ def _deliver_epic_sequential(
     ]
     if completed and outcome_counts.get("ok", 0) == 0:
         summary_lines.append("⚠️ Ninguna historia aplico cambios reales -- revisar antes de asumir que la epica esta lista.")
+
+    # Estado agregado de la epica (TicketState, pipeline_shared.py) -- mismo
+    # criterio de severidad que la transicion de Jira de abajo (blocked_at >
+    # no-verdict > todo ok > el resto), pero como valor tipado persistido en
+    # el grafo real en vez de solo inferible leyendo el comentario de texto.
+    ticket_states = [outcome_to_state(c["outcome"]) for c in completed]
+    if blocked_at:
+        epic_state = TicketState.BLOCKED_POLICY
+    elif TicketState.PARTIAL_FAILURE in ticket_states:
+        epic_state = TicketState.PARTIAL_FAILURE
+    elif ticket_states and all(s == TicketState.DONE for s in ticket_states):
+        epic_state = TicketState.DONE
+    elif TicketState.DONE in ticket_states:
+        epic_state = TicketState.PARTIAL_FAILURE
+    elif ticket_states:
+        epic_state = TicketState.BLOCKED_AGENT
+    else:
+        epic_state = TicketState.PENDING
     if blocked_at:
         summary_lines.append(f"Se corto en {blocked_at} -- sin tocar: {', '.join(remaining) if remaining else 'ninguna'}.")
     if pr_result and pr_result.get("pr_url"):
@@ -2627,6 +2684,7 @@ def _deliver_epic_sequential(
             tests_status="PASSED" if completed else "SKIPPED", tests_reason=None,
             judge_verdict=last_judge_verdict, branch=branch, backend=backend,
             is_epic=True, child_ticket_keys=[c["ticket_id"] for c in ordered_children],
+            state=epic_state.value,
         )
     )
 
@@ -2837,12 +2895,54 @@ def run_epic_pipeline(epic_key: str):
     )
 
 
+def abandon_ticket_branch(ticket_id: str, target_repo_dir: str) -> None:
+    """Accion humana EXPLICITA, nunca llamada desde ningun flujo automatico
+    del pipeline -- decision de diseno real (TicketState.PARTIAL_FAILURE,
+    ver el comentario que ya se postea cuando el juez no puede evaluar un
+    cambio real ya aplicado): la compensacion de un fallo parcial es marcar
+    y explicar, NO revertir automaticamente (borrar una rama/cerrar una PR
+    real es una accion irreversible sobre un sistema externo). Esta funcion
+    es el "botón" que un humano usa DESPUES de revisar un PARTIAL_FAILURE y
+    decidir que efectivamente hay que descartarlo.
+
+    Invocable como: python3 orchestration.py --abandon <TICKET_ID>
+    """
+    candidates = _list_ticket_branch_candidates(target_repo_dir, ticket_id)
+    if not candidates:
+        print(f"{ticket_id}: no se encontro ninguna rama copilot/{ticket_id}-* (local o remota) para abandonar.")
+        return
+
+    for branch in candidates:
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", "main"], capture_output=True)
+        subprocess.run(["git", "-C", target_repo_dir, "checkout", "master"], capture_output=True)
+        local_del = subprocess.run(["git", "-C", target_repo_dir, "branch", "-D", branch], capture_output=True, text=True)
+        remote_del = subprocess.run(
+            ["git", "-C", target_repo_dir, "push", "origin", "--delete", branch], capture_output=True, text=True
+        )
+        print(f"{ticket_id}: rama '{branch}' -- local: {'borrada' if local_del.returncode == 0 else 'no existia local'}, "
+              f"remota: {'borrada' if remote_del.returncode == 0 else 'no se pudo borrar (revisar a mano)'}")
+
+    try:
+        comment_jira(
+            f"🗑️ Rama(s) de este ticket abandonada(s) a pedido explicito de un humano (`--abandon`): "
+            f"{', '.join(candidates)}. El codigo de esos intentos NO se conserva.",
+            ticket_key=ticket_id,
+        )
+    except Exception as exc:
+        print(f"{ticket_id}: no se pudo comentar en Jira ({exc}) -- las ramas igual se borraron.")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--epic":
         if len(sys.argv) < 3:
             print("usage: orchestration.py --epic <EPIC_KEY>", file=sys.stderr)
             sys.exit(1)
         run_epic_pipeline(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--abandon":
+        if len(sys.argv) < 3:
+            print("usage: orchestration.py --abandon <TICKET_ID>", file=sys.stderr)
+            sys.exit(1)
+        abandon_ticket_branch(sys.argv[2], detect_target_repo())
     else:
         if len(sys.argv) > 1:
             os.environ["JIRA_TICKET_KEY"] = sys.argv[1]

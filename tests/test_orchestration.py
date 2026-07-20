@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1646,6 +1647,53 @@ def test_deliver_epic_sequential_summary_warns_when_no_real_changes_applied(monk
     assert "Ninguna historia aplico cambios reales" in epic_summary
 
 
+def test_deliver_epic_sequential_records_blocked_agent_state_when_all_no_op(monkeypatch):
+    """El estado agregado de la epica (TicketState, pipeline_shared.py) que
+    se persiste en el grafo real via record_run_in_graph tiene que reflejar
+    que NINGUNA historia aplico un cambio real -- BLOCKED_AGENT, no DONE."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": False, "branch": None, "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda evidence: None)
+
+    recorded_payloads = []
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda payload: recorded_payloads.append(payload))
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert recorded_payloads[0]["state"] == "blocked_agent"
+
+
+def test_deliver_epic_sequential_records_done_state_when_all_already_completed(monkeypatch):
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: True)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+
+    recorded_payloads = []
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda payload: recorded_payloads.append(payload))
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert recorded_payloads[0]["state"] == "done"
+
+
 def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monkeypatch):
     """Si generate_technical_report devuelve None (backend no disponible o
     fallo real), no se postea ningun comentario extra -- best-effort, no
@@ -3024,6 +3072,70 @@ def test_comment_jira_logs_instead_of_raising_on_failure(monkeypatch):
     assert any("Jira esta caido" in w for w in fake_logger.warnings)
 
 
+def _fake_flow_run_context(flow_run_id: str):
+    ctx = MagicMock()
+    ctx.flow_run.id = flow_run_id
+    return ctx
+
+
+def test_comment_idempotency_marker_empty_without_active_flow_context():
+    """Sin contexto real de Prefect (ej. tests que llaman .fn() directo, o
+    codigo que corre fuera de un flow), el marcador es "" -- comment_jira
+    cae al comportamiento de siempre, nunca bloquea por esto."""
+    assert orchestration._comment_idempotency_marker("hola") == ""
+
+
+def test_comment_idempotency_marker_stable_for_same_text_and_flow_run():
+    with patch("prefect.context.get_run_context", return_value=_fake_flow_run_context("run-1")):
+        marker_a = orchestration._comment_idempotency_marker("mismo texto")
+        marker_b = orchestration._comment_idempotency_marker("mismo texto")
+    assert marker_a == marker_b
+    assert marker_a.startswith("[ref: run-1:")
+
+
+def test_comment_idempotency_marker_differs_for_different_text():
+    with patch("prefect.context.get_run_context", return_value=_fake_flow_run_context("run-1")):
+        marker_a = orchestration._comment_idempotency_marker("texto A")
+        marker_b = orchestration._comment_idempotency_marker("texto B")
+    assert marker_a != marker_b
+
+
+def test_comment_jira_skips_posting_when_marker_already_exists(monkeypatch):
+    """Bug real identificado en una auditoria de arquitectura previa:
+    comment_jira (un @task(retries=2)) no tenia ninguna proteccion contra
+    postear el mismo comentario dos veces si un reintento real de Prefect
+    corria despues de que el POST original ya hubiera llegado a Jira.
+    """
+    posted = []
+    monkeypatch.setattr(orchestration.jira_client, "post_audit_comment", lambda key, text: posted.append((key, text)))
+    monkeypatch.setattr(orchestration.jira_client, "comment_already_posted", lambda key, marker: True)
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    with patch("prefect.context.get_run_context", return_value=_fake_flow_run_context("run-1")):
+        orchestration.comment_jira.fn("hola de nuevo", ticket_key="T-1")
+
+    assert posted == []
+
+
+def test_comment_jira_posts_with_marker_when_not_already_posted(monkeypatch):
+    posted = []
+    checked = []
+    monkeypatch.setattr(orchestration.jira_client, "post_audit_comment", lambda key, text: posted.append((key, text)))
+    monkeypatch.setattr(
+        orchestration.jira_client, "comment_already_posted",
+        lambda key, marker: checked.append((key, marker)) or False,
+    )
+
+    with patch("prefect.context.get_run_context", return_value=_fake_flow_run_context("run-1")):
+        orchestration.comment_jira.fn("hola", ticket_key="T-1")
+
+    assert len(posted) == 1
+    key, text = posted[0]
+    assert key == "T-1"
+    assert text.startswith("hola\n\n[ref: run-1:")
+    assert checked[0][1] == text.split("\n\n", 1)[1]
+
+
 def test_transition_jira_calls_jira_client_directly(monkeypatch):
     captured = {}
     monkeypatch.setattr(
@@ -3103,3 +3215,50 @@ def test_pipeline_shared_cli_prints_retryable_policy_references(capsys):
 
     printed = set(capsys.readouterr().out.split())
     assert printed == pipeline_shared.RETRYABLE_POLICY_REFERENCES
+
+
+def test_abandon_ticket_branch_no_op_when_nothing_found(monkeypatch, capsys):
+    _fake_branch_list_and_merge_base(monkeypatch, branch_list_stdout="", merged=set())
+    commented = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: commented.append(a))
+
+    orchestration.abandon_ticket_branch("KAN-99", "/repo")
+
+    assert "no se encontro ninguna rama" in capsys.readouterr().out
+    assert commented == []
+
+
+def test_abandon_ticket_branch_deletes_local_and_remote_and_comments(monkeypatch, capsys):
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged=set()
+    )
+    commented = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: commented.append((ticket_key, text)))
+
+    orchestration.abandon_ticket_branch("KAN-2", "/repo")
+
+    out = capsys.readouterr().out
+    assert "copilot/KAN-2-100" in out
+    assert len(commented) == 1
+    ticket_key, text = commented[0]
+    assert ticket_key == "KAN-2"
+    assert "abandonada" in text
+    assert "copilot/KAN-2-100" in text
+
+
+def test_abandon_ticket_branch_survives_jira_comment_failure(monkeypatch, capsys):
+    """Best-effort: si comentar en Jira falla, las ramas ya se borraron --
+    no debe propagar la excepcion (mismo criterio de graceful-degradation
+    que el resto de las acciones de Jira en este modulo)."""
+    _fake_branch_list_and_merge_base(
+        monkeypatch, branch_list_stdout="  copilot/KAN-2-100\n", merged=set()
+    )
+
+    def fake_comment_jira(*a, **k):
+        raise RuntimeError("Jira no disponible")
+
+    monkeypatch.setattr(orchestration, "comment_jira", fake_comment_jira)
+
+    orchestration.abandon_ticket_branch("KAN-2", "/repo")  # no debe lanzar
+
+    assert "no se pudo comentar en Jira" in capsys.readouterr().out

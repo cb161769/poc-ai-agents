@@ -611,6 +611,41 @@ def post_audit_comment(ticket_key: str, text: str) -> dict:
     return resp.json()
 
 
+def comment_already_posted(ticket_key: str, marker: str) -> bool:
+    """Idempotencia real de comment_jira() (orchestration.py) -- gap
+    identificado en una auditoria de arquitectura previa: comment_jira es un
+    @task(retries=2) sin ninguna proteccion contra duplicados, asi que un
+    reintento real de Prefect (ej. el POST llego a Jira pero la respuesta se
+    perdio por una red inestable) podia postear el MISMO comentario dos
+    veces. Antes de postear, orchestration.py chequea si ya existe un
+    comentario con este marcador exacto (embebido al final del texto).
+    Best-effort: si esta consulta falla (red, credenciales), devuelve False
+    -- mejor un duplicado ocasional que perder el comentario real por
+    completo.
+    """
+    jira_url = os.environ["JIRA_URL"].rstrip("/")
+    email = require_secret("JIRA_EMAIL")
+    token = require_secret("JIRA_API_TOKEN")
+    auth = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+
+    try:
+        resp = httpx.get(
+            f"{jira_url}/rest/api/3/issue/{ticket_key}/comment",
+            headers=headers,
+            params={"maxResults": 50, "orderBy": "-created"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return False
+
+    for comment in resp.json().get("comments", []):
+        if marker in json.dumps(comment.get("body", {})):
+            return True
+    return False
+
+
 def transition_ticket(ticket_key: str, target_status_name: str) -> dict:
     """Moves the real Jira ticket to the workflow status matching
     target_status_name (case-insensitive), e.g. "In Progress", so the

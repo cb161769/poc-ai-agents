@@ -232,7 +232,7 @@ async def plan_epic(epic: dict, children: list) -> dict:
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
                 messages.append({"role": "user", "content": tool_results})
                 compact_old_tool_results(messages, read_only_tool_names)
-                warn_if_context_large(messages, logger, "epic planner")
+                warn_if_context_large(messages, logger, "epic planner", backend=backend, system_prompt=EPIC_PLANNER_SYSTEM_PROMPT)
 
     logger.warning("epic planner: agoto los turnos sin un resultado final, cae al orden mecanico")
     return _fallback_result(children)

@@ -78,12 +78,21 @@ RETRY_POLICY_PER_BACKEND = {
 # proveedor) -- es una limitacion conocida, no una validacion que finge
 # existir.
 MODEL_LIMITS = {
-    "anthropic": {"max_tokens": 1536},
+    # context_window_tokens: ventana de contexto de ENTRADA real -- distinto
+    # de max_tokens (limite de SALIDA, de arriba). Gap real (usuario, "hay
+    # gaps en el context window"): warn_if_context_large (agent_loop.py)
+    # usaba el mismo umbral fijo (basado en OLLAMA_NUM_CTX) sin importar que
+    # backend estuviera realmente sirviendo el turno -- una corrida en
+    # Anthropic (ventana real ~200k tokens) recibia el mismo umbral chico
+    # pensado para Ollama (8192 tokens default), o viceversa.
+    "anthropic": {"max_tokens": 1536, "context_window_tokens": 200_000},
     # Ollama es local/gratis (sin tradeoff de costo, a diferencia de
     # Anthropic) -- mas alto para que un JSON con format:"json" forzado no
     # se corte antes de cerrar el objeto, que es JSON invalido igual aunque
-    # la gramatica este bien.
-    "ollama": {"max_tokens": 4096},
+    # la gramatica este bien. context_window_tokens=None: a diferencia de
+    # Anthropic, no es un numero fijo -- depende de OLLAMA_NUM_CTX (el
+    # operador lo configura segun el modelo real que este corriendo).
+    "ollama": {"max_tokens": 4096, "context_window_tokens": None},
 }
 
 _LOG_DIR = Path(__file__).resolve().parent / "logs"

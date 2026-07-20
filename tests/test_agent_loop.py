@@ -1005,7 +1005,7 @@ def test_warn_if_context_large_logs_when_over_threshold(monkeypatch):
     """Gap real (usuario, "hay gaps en el context window"): antes no habia
     NINGUNA senal de que una conversacion se estuviera acercando al limite
     real del backend -- esto agrega visibilidad (nunca trunca)."""
-    monkeypatch.setattr(agent_loop, "CONTEXT_SIZE_WARNING_CHARS", 10)
+    monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", "10")
     logger = MagicMock()
 
     warn_if_context_large([{"role": "user", "content": "x" * 20}], logger, "juez")
@@ -1016,12 +1016,53 @@ def test_warn_if_context_large_logs_when_over_threshold(monkeypatch):
 
 
 def test_warn_if_context_large_silent_when_under_threshold(monkeypatch):
-    monkeypatch.setattr(agent_loop, "CONTEXT_SIZE_WARNING_CHARS", 1000)
+    monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", "1000")
     logger = MagicMock()
 
     warn_if_context_large([{"role": "user", "content": "x" * 20}], logger, "juez")
 
     logger.warning.assert_not_called()
+
+
+def test_warn_if_context_large_includes_system_prompt_in_estimate(monkeypatch):
+    """Bug real confirmado esta sesion: el system_prompt se manda en CADA
+    turno igual que los messages, pero antes se excluia del calculo por
+    completo -- subestimaba la presion real sobre la ventana de contexto en
+    varios miles de caracteres fijos por turno (confirmado real:
+    CODING_AGENT_SYSTEM_PROMPT/JUDGE_SYSTEM_PROMPT son ~8-9k caracteres cada
+    uno, ~27% del OLLAMA_NUM_CTX default por si solos)."""
+    monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", "15")
+    logger = MagicMock()
+
+    # 10 caracteres de mensaje, bajo el umbral de 15 por si solo -- pero
+    # sumado a un system_prompt de 10 caracteres, supera el umbral.
+    warn_if_context_large([{"role": "user", "content": "x" * 10}], logger, "juez", system_prompt="y" * 10)
+
+    logger.warning.assert_called_once()
+    assert "system prompt" in logger.warning.call_args[0][0]
+
+
+def test_context_warning_threshold_uses_anthropic_context_window(monkeypatch):
+    """Bug real confirmado esta sesion: el umbral era fijo (siempre basado
+    en OLLAMA_NUM_CTX) sin importar que backend estuviera realmente
+    sirviendo el turno -- una corrida en Anthropic (ventana real ~200k
+    tokens) recibia el mismo umbral chico pensado para Ollama."""
+    monkeypatch.delenv("CONTEXT_SIZE_WARNING_CHARS", raising=False)
+    monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", None)
+
+    anthropic_threshold = agent_loop._context_warning_threshold_chars("anthropic")
+    ollama_threshold = agent_loop._context_warning_threshold_chars("ollama")
+
+    assert anthropic_threshold == 200_000 * 4
+    assert ollama_threshold == agent_loop.OLLAMA_NUM_CTX * 4
+    assert anthropic_threshold > ollama_threshold
+
+
+def test_context_warning_threshold_respects_env_override_for_any_backend(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", "500")
+
+    assert agent_loop._context_warning_threshold_chars("anthropic") == 500
+    assert agent_loop._context_warning_threshold_chars("ollama") == 500
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):

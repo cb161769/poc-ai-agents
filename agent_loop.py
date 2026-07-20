@@ -720,25 +720,47 @@ def compact_old_tool_results(messages: list, read_only_tool_names: set, keep_las
 # requeriria un tokenizer distinto por modelo, desproporcionado para esto),
 # etiquetada como tal en el mensaje de warning. Nunca trunca nada -- solo
 # visibilidad donde hoy no habia ninguna.
-CONTEXT_SIZE_WARNING_CHARS = int(os.environ.get("CONTEXT_SIZE_WARNING_CHARS", str(OLLAMA_NUM_CTX * 4)))
+#
+# Bug real confirmado esta sesion (segunda vuelta del mismo gap): este
+# umbral era fijo (siempre basado en OLLAMA_NUM_CTX), sin importar que
+# backend estuviera realmente sirviendo el turno -- una corrida en
+# Anthropic (ventana real ~200k tokens) recibia el mismo umbral chico
+# pensado para Ollama, generando warnings falsos-positivos con muchisimo
+# margen real de sobra. CONTEXT_SIZE_WARNING_CHARS (env var) sigue
+# funcionando como override manual absoluto si esta seteada; sin ella, el
+# umbral default ahora se deriva del backend real de MODEL_LIMITS.
+_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE = os.environ.get("CONTEXT_SIZE_WARNING_CHARS")
+
+
+def _context_warning_threshold_chars(backend: str) -> int:
+    if _CONTEXT_SIZE_WARNING_CHARS_OVERRIDE:
+        return int(_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE)
+    context_tokens = MODEL_LIMITS.get(backend, {}).get("context_window_tokens") or OLLAMA_NUM_CTX
+    return context_tokens * 4
 
 
 def _estimate_message_chars(messages: list) -> int:
     return sum(len(str(m.get("content", ""))) for m in messages)
 
 
-def warn_if_context_large(messages: list, logger, label: str) -> None:
+def warn_if_context_large(messages: list, logger, label: str, backend: str = "ollama", system_prompt: str = "") -> None:
     """Best-effort: loguea UN warning real (no trunca, no lanza) cuando el
-    historial acumulado de esta conversacion supera CONTEXT_SIZE_WARNING_CHARS
-    -- llamar despues de compact_old_tool_results() para medir lo que
-    efectivamente se va a reenviar en el proximo turno.
+    historial acumulado de esta conversacion (MAS el system_prompt, que se
+    manda en CADA turno igual que los messages -- bug real confirmado esta
+    sesion: antes se excluia del calculo por completo, subestimando la
+    presion real sobre la ventana de contexto en varios miles de tokens
+    fijos por turno) supera el umbral real de este backend. Llamar despues
+    de compact_old_tool_results() para medir lo que efectivamente se va a
+    reenviar en el proximo turno.
     """
-    estimated_chars = _estimate_message_chars(messages)
-    if estimated_chars > CONTEXT_SIZE_WARNING_CHARS:
+    threshold = _context_warning_threshold_chars(backend)
+    estimated_chars = _estimate_message_chars(messages) + len(system_prompt)
+    if estimated_chars > threshold:
         logger.warning(
-            f"{label}: el historial acumulado de esta conversacion es de ~{estimated_chars} caracteres "
-            f"(~{estimated_chars // 4} tokens estimados a 4 caracteres/token, umbral configurado "
-            f"{CONTEXT_SIZE_WARNING_CHARS} caracteres) -- riesgo real de truncamiento o rechazo del backend."
+            f"{label}: el historial acumulado de esta conversacion (incluido el system prompt) es de "
+            f"~{estimated_chars} caracteres (~{estimated_chars // 4} tokens estimados a 4 caracteres/token, "
+            f"umbral real para backend '{backend}': {threshold} caracteres) -- riesgo real de truncamiento o "
+            "rechazo del backend."
         )
 
 
