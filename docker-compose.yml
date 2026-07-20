@@ -199,6 +199,12 @@ services:
   prefect-server:
     image: prefecthq/prefect:2-latest
     container_name: poc-prefect-server
+    # Bug real confirmado repetidas veces esta sesion: sin restart policy,
+    # este era el UNICO servicio long-running (junto con falco) que se
+    # quedaba caido para siempre tras un crash silencioso, hasta que alguien
+    # corria 'docker compose up -d prefect-server' a mano -- causaba fallos
+    # de test/pipeline enganosos (ConnectError) que parecian bugs de codigo.
+    restart: unless-stopped
     command: ["prefect", "server", "start", "--host", "0.0.0.0"]
     ports:
       - "4200:4200"
@@ -219,8 +225,16 @@ services:
   falco:
     image: falcosecurity/falco:latest
     container_name: poc-falco
+    # Mismo motivo que prefect-server: sin esto, un crash silencioso apaga
+    # el monitoreo de seguridad de runtime indefinidamente, sin ninguna
+    # alerta ni forma de notarlo salvo revisando 'docker ps' a mano.
+    restart: unless-stopped
     privileged: true
     pid: host
+    # Riesgo aceptado (Docker-outside-of-Docker, necesario para que Falco
+    # monitoree el runtime real del host): este mount le da a este
+    # contenedor control efectivo sobre el daemon Docker del HOST -- ver
+    # seccion "Riesgos aceptados" del README.
     volumes:
       - /var/run/docker.sock:/host/var/run/docker.sock
       - /proc:/host/proc:ro
@@ -285,6 +299,10 @@ services:
       - "8090:8090"
     volumes:
       - ./logs:/app/logs
+      # Riesgo aceptado (Docker-outside-of-Docker, necesario para disparar
+      # el pipeline real via "docker run" cuando llega un webhook): este
+      # mount le da a este contenedor control efectivo sobre el daemon
+      # Docker del HOST -- ver seccion "Riesgos aceptados" del README.
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env

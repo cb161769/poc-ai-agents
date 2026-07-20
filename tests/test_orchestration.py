@@ -1610,6 +1610,42 @@ def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypat
     assert ("C-1", "# Comprobante real generado por el modelo") in comments
 
 
+def test_deliver_epic_sequential_summary_warns_when_no_real_changes_applied(monkeypatch):
+    """Bug real confirmado en vivo (operacion de esta noche): con TODAS las
+    historias en outcome "no-op" (el agente no aplico ningun cambio real --
+    ej. confirmaciones interactivas auto-rechazadas por falta de stdin), el
+    comentario resumen antes decia "2/2 historias procesadas" sin ninguna
+    forma de distinguir eso de una epica genuinamente completa. Ahora
+    desglosa por outcome real y agrega una advertencia explicita.
+    """
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": False, "branch": None, "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda evidence: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    epic_summary = next(text for tk, text in comments if tk == "EPIC-1" and "Modo epica secuencial" in text)
+    assert "2 no-op" in epic_summary
+    assert "Ninguna historia aplico cambios reales" in epic_summary
+
+
 def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monkeypatch):
     """Si generate_technical_report devuelve None (backend no disponible o
     fallo real), no se postea ningun comentario extra -- best-effort, no
@@ -1862,6 +1898,89 @@ def test_run_coding_agent_local_real_detects_commits_made_by_the_model_itself(mo
     assert result["branch"] is not None
     # NO se llamo "branch -D" (la rama con el commit real no se borro)
     assert not any(cmd[-2:-1] == ["branch"] and "-D" in cmd for cmd in git_calls)
+
+
+def test_run_coding_agent_local_does_not_crash_when_git_commit_fails(monkeypatch, tmp_path):
+    """Mismo bug que run_coding_agent_local_real, camino gh_copilot_suggest
+    (Camino B2): un 'git commit' fallido no debe crashear la epica.
+    """
+    class FakeSuggestResult:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "gh":
+            return FakeSuggestResult()
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="M file.txt\n")
+        if "commit" in cmd:
+            raise orchestration.subprocess.CalledProcessError(128, cmd, stderr="Author identity unknown")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local("T-1", "prompt", str(tmp_path))
+
+    assert result["applied"] is False
+
+
+def test_retry_coding_agent_local_real_does_not_crash_when_git_commit_fails(monkeypatch, tmp_path):
+    """Mismo bug en el camino de reintento (feedback del juez): un
+    'git commit' fallido no debe crashear la epica, y ademas no debe
+    reportar applied=True cuando en realidad no quedo nada commiteado.
+    """
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return _fake_subprocess_result(stdout="abc123\n")  # mismo checkpoint siempre -- sin commits propios del modelo
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="M file.txt\n")  # el agente escribio algo real
+        if "commit" in cmd:
+            raise orchestration.subprocess.CalledProcessError(128, cmd, stderr="Author identity unknown")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.retry_coding_agent_local_real("T-1", "feedback", str(tmp_path))
+
+    assert result["applied"] is False
+
+
+def test_run_coding_agent_local_real_does_not_crash_when_git_commit_fails(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (operacion de esta noche): un 'git commit'
+    fallido (ej. identidad de git no configurada en el clon) lanzaba
+    CalledProcessError sin atrapar, tirando abajo la epica ENTERA via Prefect
+    en vez de bloquear solo esta historia puntual y seguir con las demas.
+    """
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "listo", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="M file.txt\n")  # el agente escribio algo real
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="0\n")  # sin commits propios del modelo todavia
+        if "commit" in cmd:
+            raise orchestration.subprocess.CalledProcessError(128, cmd, stderr="Author identity unknown")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    # No crashea (no propaga CalledProcessError) -- se degrada a "no aplicado".
+    assert result["applied"] is False
 
 
 def test_run_coding_agent_local_real_surfaces_self_verified_and_risk_graph(monkeypatch, tmp_path):

@@ -541,6 +541,44 @@ def test_run_coding_agent_nudges_to_investigate_first_when_refusal_comes_before_
     assert nudge_sent == ca.TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION
 
 
+def test_run_coding_agent_blocks_cleanly_after_repeated_eof_on_confirmation(monkeypatch, tmp_path):
+    """Bug real confirmado en vivo (operacion de esta noche): corriendo sin
+    stdin conectada (contenedor detached), _confirm() (input()) lanza
+    EOFError en cada confirmacion -- el catch generico las convertia en un
+    tool-result mas ("error llamando a la herramienta: EOF when reading a
+    line"), y el modelo gastaba ~15 turnos intentando workarounds inutiles
+    (heredocs, escapes) pensando que era un bug de la tool. Ahora, tras 2
+    EOFError seguidos, se bloquea limpio con un mensaje honesto en vez de
+    agotar los turnos.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    def raise_eof():
+        raise EOFError("EOF when reading a line")
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Investiga primero (para pasar el gate real de "investiga antes de escribir").
+            content = [{"type": "tool_use", "id": "call_1", "name": "list_directory", "input": {"path": "."}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "tool_use", "id": f"call_{call_count['n']}", "name": "write_file", "input": {"path": f"f{call_count['n']}.txt", "content": "x"}}]
+        return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert call_count["n"] == 3  # investigar -> EOFError 1 -> EOFError 2 -> bloquea, no agota los 15 turnos
+    assert result["status"] == "blocked"
+    assert "terminal interactiva" in result["summary"]
+
+
 def test_run_coding_agent_nudges_when_model_refuses_to_call_tool(monkeypatch, tmp_path):
     """Confirmado real esta sesion: algunos modelos anuncian que van a crear
     un archivo pero explican en texto que "no pueden sin confirmacion

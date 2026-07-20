@@ -112,6 +112,15 @@ fi
 curl -sf "${QDRANT_URL:-http://localhost:6333}/readyz" >/dev/null 2>&1
 check "Qdrant listo en ${QDRANT_URL:-http://localhost:6333}" "$?"
 
+# --- Prefect server ---
+# Gap real confirmado esta sesion (recurrente varias veces): poc-prefect-server
+# se cae solo periodicamente -- sin este chequeo, la corrida real recien
+# fallaba a mitad de camino con un httpx.ConnectError/ConnectTimeout dificil
+# de distinguir de un bug de codigo real.
+PREFECT_HEALTH_URL="${PREFECT_API_URL:-http://localhost:4200/api}"
+curl -sf "${PREFECT_HEALTH_URL%/api}/api/health" >/dev/null 2>&1
+check "Prefect server alcanzable en ${PREFECT_HEALTH_URL%/api}" "$?" "(correr 'docker compose up -d prefect-server')"
+
 # --- Jira ---
 if [ -n "${JIRA_URL:-}" ] && [ -n "${JIRA_EMAIL:-}" ] && [ -n "${JIRA_API_TOKEN:-}" ]; then
   curl -sf -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "${JIRA_URL%/}/rest/api/3/myself" >/dev/null 2>&1
@@ -191,13 +200,34 @@ fi
 # --- Repo objetivo real (donde estas parado, no sample-repo/) ---
 # run_poc_loop.sh/orchestration.py operan sobre el repo git en el que el
 # usuario esta parado al invocarlos, no sobre una carpeta fija — el mismo
-# chequeo que hace el pipeline antes de crear una rama.
-if TARGET_REPO_DIR_CHECK="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+# chequeo que hace el pipeline antes de crear una rama. Argumento posicional
+# opcional ($1): path de un clon especifico a chequear en vez de "donde
+# estoy parado" -- usado por run_epic_dood.sh para validar el clon real
+# ANTES de arrancar el contenedor, sin necesitar que el usuario este parado
+# ahi.
+if [ -n "${1:-}" ]; then
+  TARGET_REPO_DIR_CHECK="$1"
+else
+  TARGET_REPO_DIR_CHECK="$(git rev-parse --show-toplevel 2>/dev/null)"
+fi
+if [ -n "${TARGET_REPO_DIR_CHECK}" ] && git -C "${TARGET_REPO_DIR_CHECK}" rev-parse --show-toplevel >/dev/null 2>&1; then
   printf "  %s  %s\n" "${PASS}" "Parado dentro de un repo git real (${TARGET_REPO_DIR_CHECK})"
   if [ -z "$(git -C "${TARGET_REPO_DIR_CHECK}" status --porcelain)" ]; then
     printf "  %s  %s\n" "${PASS}" "Working tree limpio (sin cambios sin commitear)"
   else
     check "Working tree limpio (sin cambios sin commitear)" "1" "(hace commit o 'git stash' antes de correr run_poc_loop.sh)"
+  fi
+  # Gap real confirmado en vivo (operacion de esta noche): un clon fresco
+  # (ej. Docker-outside-of-Docker con un target-repo recien clonado) puede
+  # no tener user.name/user.email configurados localmente -- el primer 'git
+  # commit' real que intenta el coding agent tira CalledProcessError
+  # ("Author identity unknown") recien A MITAD de una corrida real.
+  if [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --get user.name 2>/dev/null)" ] \
+     && [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --get user.email 2>/dev/null)" ]; then
+    printf "  %s  %s\n" "${PASS}" "Identidad de git configurada (user.name/user.email)"
+  else
+    check "Identidad de git configurada (user.name/user.email)" "1" \
+      "(correr: git -C '${TARGET_REPO_DIR_CHECK}' config user.name '...' && git -C '${TARGET_REPO_DIR_CHECK}' config user.email '...')"
   fi
 else
   check "Parado dentro de un repo git real" "1" "(cd a tu proyecto real antes de correr check_prereqs.sh/run_poc_loop.sh — ya no se usa sample-repo/ por defecto)"

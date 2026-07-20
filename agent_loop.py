@@ -87,12 +87,31 @@ def _estimate_cost_usd(backend: str, model: str, input_tokens: int, output_token
     return estimate_cost_usd(backend, model, input_tokens, output_tokens)
 
 
+# Bug real confirmado en vivo (operacion de esta noche): _backend_available
+# solo chequea bool(ANTHROPIC_API_KEY) (que la variable este seteada, no que
+# sea VALIDA) -- con una key vencida/revocada, call_with_fallback reintenta
+# Anthropic en CADA turno, agotando un 401 real cada vez antes de recien
+# ahi caer a Ollama (confirmado: el mismo '401 Unauthorized' se repitio en
+# casi todos los turnos de dos corridas reales completas). Este set vive a
+# nivel de modulo -- cada corrida real de coding_agent.py/judge_agent.py/
+# epic_planner.py es su propio subprocess de Python, asi que esto ya scopea
+# correctamente "por corrida" sin necesitar limpieza explicita entre
+# corridas distintas.
+_backends_failed_hard_this_run: set = set()
+
+
+def _is_hard_auth_failure(exc: Exception) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (401, 403)
+
+
 def _backend_available(backend: str) -> bool:
     """Chequeo real de si este backend puede atender una llamada ahora:
     credenciales/alcanzabilidad (mismo criterio que _select_backend ya
     usaba) MAS presupuesto diario si LLM_DAILY_BUDGET_USD esta seteada
     (llm_backends.is_within_budget -- sin la env var, siempre True).
     """
+    if backend in _backends_failed_hard_this_run:
+        return False
     reachable = False
     if backend == "anthropic":
         reachable = bool(os.environ.get("ANTHROPIC_API_KEY"))
@@ -604,7 +623,16 @@ async def call_with_fallback(
             )
             return blocks, stop_reason, usage, backend
         except Exception as exc:
-            logger.warning(f"backend '{backend}' fallo, probando el siguiente disponible: {exc}")
+            if _is_hard_auth_failure(exc):
+                # No-transitorio -- reintentar este backend en el PROXIMO
+                # turno de la misma corrida solo repetiria el mismo 401/403
+                # (confirmado real: se repitio en casi todos los turnos de
+                # dos corridas completas). Se recuerda para el resto de esta
+                # corrida en vez de re-probarlo turno a turno.
+                _backends_failed_hard_this_run.add(backend)
+                logger.warning(f"backend '{backend}' fallo con auth invalida ({exc}) -- se descarta para el resto de esta corrida.")
+            else:
+                logger.warning(f"backend '{backend}' fallo, probando el siguiente disponible: {exc}")
             last_exc = exc
             continue
 

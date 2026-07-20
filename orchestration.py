@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -948,12 +949,20 @@ def run_coding_agent_local(ticket_id: str, sanitized_prompt: str, target_repo_di
 
     if suggest.returncode == 0 and status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Copilot suggestion for {ticket_id}"], check=True)
-        return {
-            "applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest",
-            "resumed_branch": bool(existing_branch), "resumed_pr_rejected": pr_rejected,
-            "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
-        }
+        try:
+            subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Copilot suggestion for {ticket_id}"], check=True)
+            return {
+                "applied": True, "branch": branch, "base_branch": base_branch, "backend": "gh_copilot_suggest",
+                "resumed_branch": bool(existing_branch), "resumed_pr_rejected": pr_rejected,
+                "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
+            }
+        except subprocess.CalledProcessError as exc:
+            # Bug real confirmado en vivo (operacion de esta noche): un
+            # 'git commit' fallido (ej. identidad de git no configurada en
+            # el clon) no debe crashear la epica ENTERA -- se trata como
+            # "no se aplico ningun cambio" para ESTA historia puntual, y el
+            # resto de la epica sigue.
+            get_run_logger().warning(f"{ticket_id}: 'git commit' fallo ({exc}) -- se trata como que no se aplico ningun cambio.")
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
     if not existing_branch:
@@ -1163,8 +1172,16 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
 
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
-        subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
-        has_own_commits = True
+        try:
+            subprocess.run(["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent change for {ticket_id}"], check=True)
+            has_own_commits = True
+        except subprocess.CalledProcessError as exc:
+            # Bug real confirmado en vivo (operacion de esta noche): un
+            # 'git commit' fallido (ej. identidad de git no configurada en
+            # el clon) crasheaba la epica ENTERA via CalledProcessError sin
+            # atrapar -- ahora se trata como que esta historia puntual no
+            # aplico cambios, sin tirar abajo el resto de la epica.
+            get_run_logger().warning(f"{ticket_id}: 'git commit' fallo ({exc}) -- se trata como que no se aplico ningun cambio.")
 
     if has_own_commits:
         return {
@@ -1299,9 +1316,25 @@ def retry_coding_agent_local_real(
 
     if status.strip():
         subprocess.run(["git", "-C", target_repo_dir, "add", "-A"], check=True)
-        subprocess.run(
-            ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
-        )
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo_dir, "commit", "-m", f"Coding agent retry for {ticket_id} (feedback del juez)"], check=True
+            )
+            has_own_commits = True
+        except subprocess.CalledProcessError as exc:
+            # Bug real confirmado en vivo (operacion de esta noche): un
+            # 'git commit' fallido crasheaba la epica ENTERA sin atrapar --
+            # ahora, si tampoco habia commits previos del propio modelo
+            # (has_own_commits via checkpoint), se reporta applied=False en
+            # vez de mentir "applied: True" con nada realmente commiteado.
+            get_run_logger().warning(f"{ticket_id}: 'git commit' fallo en el reintento ({exc}) -- se trata como que no se aplico ningun cambio nuevo.")
+
+    if not has_own_commits:
+        return {
+            "applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
+            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+        }
+
     # Ya no se borra aca -- el llamador decide: _retry_local_diff es siempre
     # el ultimo intento de esa cadena y limpia el archivo el mismo; el modo
     # epica secuencial (_deliver_epic_sequential) en cambio necesita este
@@ -2532,7 +2565,19 @@ def _deliver_epic_sequential(
 
     processed_ids = {c["ticket_id"] for c in completed} | ({blocked_at} if blocked_at else set())
     remaining = [c["ticket_id"] for c in ordered_children if c["ticket_id"] not in processed_ids]
-    summary_lines = [f"🧩 Modo epica secuencial (Prefect): {len(completed)}/{len(ordered_children)} historias procesadas."]
+    # Bug real confirmado en vivo (operacion de esta noche): "X/12 historias
+    # procesadas" cuenta CUALQUIER outcome (incluido "no-op" -- el agente no
+    # aplico ningun cambio) igual que "ok" (cambio real aplicado) -- una
+    # corrida con 12 no-op posteaba "12/12 historias procesadas", indistinguible
+    # de una epica genuinamente completa. Ahora se desglosa por outcome real.
+    outcome_counts = Counter(c["outcome"] for c in completed)
+    outcome_breakdown = ", ".join(f"{count} {outcome}" for outcome, count in outcome_counts.items())
+    summary_lines = [
+        f"🧩 Modo epica secuencial (Prefect): {len(completed)}/{len(ordered_children)} historias procesadas"
+        f"{f' ({outcome_breakdown})' if outcome_breakdown else ''}."
+    ]
+    if completed and outcome_counts.get("ok", 0) == 0:
+        summary_lines.append("⚠️ Ninguna historia aplico cambios reales -- revisar antes de asumir que la epica esta lista.")
     if blocked_at:
         summary_lines.append(f"Se corto en {blocked_at} -- sin tocar: {', '.join(remaining) if remaining else 'ninguna'}.")
     if pr_result and pr_result.get("pr_url"):

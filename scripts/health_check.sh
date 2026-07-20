@@ -12,6 +12,14 @@
 # Si ALERT_WEBHOOK_URL (o el alias FALCO_ALERT_WEBHOOK_URL) esta configurada
 # y algun chequeo falla, postea un resumen ahi -- mismo formato que usa
 # run_poc_loop.sh/orchestration.py para alertas del juez/testing agent.
+#
+# Gap real confirmado esta sesion: este script no estaba conectado a NADA --
+# ni cron real, ni systemd timer. Ejemplo de crontab (cada 15 minutos, con
+# salida acumulada en su propio log):
+#   */15 * * * * cd /ruta/al/repo && ./scripts/health_check.sh --json >> logs/health_check.jsonl 2>&1
+# (Windows/WSL: registrar el mismo comando en el Programador de tareas o en
+# el cron de la distro WSL -- no se instala automaticamente desde aca,
+# depende demasiado del entorno del operador.)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,6 +90,28 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   fi
 fi
 
+# --- Credenciales Jira / Azure DevOps (gap real confirmado esta sesion) ---
+# check_prereqs.sh ya validaba esto, pero solo AL MOMENTO de arrancar una
+# corrida -- el JIRA_API_TOKEN de esta sesion se vencio A MITAD de la
+# operacion sin que nada lo detectara hasta una verificacion manual. Con
+# esto en un cron de health_check.sh, un token vencido se detecta en
+# minutos, no cuando falla una corrida real (o peor, en silencio).
+if [ -n "${JIRA_URL:-}" ] && [ -n "${JIRA_EMAIL:-}" ] && [ -n "${JIRA_API_TOKEN:-}" ]; then
+  if curl -sf -u "${JIRA_EMAIL}:${JIRA_API_TOKEN}" "${JIRA_URL%/}/rest/api/3/myself" >/dev/null 2>&1; then
+    add_check "jira_credentials" true ""
+  else
+    add_check "jira_credentials" false "JIRA_API_TOKEN invalida o vencida (${JIRA_URL})"
+  fi
+fi
+
+if [ -n "${AZURE_DEVOPS_ORG_URL:-}" ] && [ -n "${AZURE_DEVOPS_PAT:-}" ]; then
+  if curl -sf -u ":${AZURE_DEVOPS_PAT}" "${AZURE_DEVOPS_ORG_URL%/}/_apis/projects?api-version=7.1" >/dev/null 2>&1; then
+    add_check "azure_devops_credentials" true ""
+  else
+    add_check "azure_devops_credentials" false "AZURE_DEVOPS_PAT invalido o vencido (${AZURE_DEVOPS_ORG_URL})"
+  fi
+fi
+
 RESULT_JSON=$(jq -n --argjson ok "${overall_ok}" --argjson checks "${CHECKS_JSON}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '{ts: $ts, ok: $ok, checks: $checks}')
 
@@ -102,5 +132,11 @@ else
   echo "== Health check de infraestructura =="
   echo "${CHECKS_JSON}" | jq -r '.[] | if .ok then "  ✅  \(.name)" else "  ❌  \(.name) \(.detail)" end'
 fi
+
+# Rotacion oportunista: cada corrida de health_check.sh (via cron/timer) de
+# paso mantiene logs/*.jsonl bajo control, sin necesitar un segundo cron
+# separado solo para eso. Nunca afecta el exit code de health_check.sh --
+# un fallo de rotacion no es un fallo de infraestructura real.
+bash "${SCRIPT_DIR}/rotate_logs.sh" >/dev/null 2>&1 || true
 
 [ "${overall_ok}" = "true" ]

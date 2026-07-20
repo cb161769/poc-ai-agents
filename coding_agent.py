@@ -884,6 +884,7 @@ async def run_coding_agent(
     verification_nudge_given = False
     self_review_nudge_given = False
     tool_call_nudge_given = False
+    consecutive_eof_errors = 0
 
     def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
@@ -1063,6 +1064,29 @@ async def run_coding_agent(
                             if name.startswith("neo4j-cypher__"):
                                 consulted_risk_graph = True
                             output = await _call_mcp_tool(sessions, name, tool_input)
+                    except EOFError:
+                        # Bug real confirmado en vivo (operacion de esta
+                        # noche): sin stdin conectada (corrida detached),
+                        # CADA confirmacion interactiva (_confirm) lanza
+                        # EOFError -- el catch generico de abajo lo
+                        # convertia en un tool-result mas ("error llamando a
+                        # la herramienta: EOF when reading a line"), y el
+                        # modelo interpretaba eso como un bug de la tool
+                        # (intentaba heredocs/escapes distintos durante
+                        # ~15 turnos) en vez de que el sistema reconociera
+                        # "no hay terminal interactiva" y bloqueara limpio.
+                        consecutive_eof_errors += 1
+                        if consecutive_eof_errors >= 2:
+                            return _finalize({
+                                "status": "blocked",
+                                "summary": (
+                                    "No hay una terminal interactiva conectada para confirmar cambios (EOF al "
+                                    "pedir confirmacion) -- correr con stdin conectado (ej. 'yes s | docker run "
+                                    "-i ...' o -it) si se espera que el agente escriba archivos."
+                                ),
+                                "files_changed": [],
+                            })
+                        output = "error: no se pudo leer la confirmacion (EOF) -- reintentando"
                     except Exception as exc:
                         output = f"error llamando a la herramienta: {exc}"
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})

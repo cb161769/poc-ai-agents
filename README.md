@@ -373,6 +373,15 @@ cat logs/falco_alerts.jsonl       # alertas persistidas
 
 **Las alertas se correlacionan ANTES de que el juez decida, no solo después en un comentario**: `run_judge()` (tanto en `run_poc_loop.sh` como en `orchestration.py`) busca la ventana de Falco de la corrida actual **antes** de invocar al juez, y si hay alertas reales, se las suma al payload que el juez evalúa — para que la evidencia de runtime de la MISMA corrida pueda pesar en el veredicto, no solo llegar como un comentario de Jira que un humano lee después de que la decisión ya se tomó. El mismo fetch también dispara el comentario/webhook de siempre. Es informativo para el juez, no un gate duro por sí solo — el juez decide qué peso darle.
 
+#### 10.1. Riesgos aceptados de infraestructura
+
+Decisiones de diseño con un trade-off real de seguridad/operación, tomadas a propósito para esta PoC — documentadas explícitamente en vez de asumidas silenciosamente:
+
+- **`/var/run/docker.sock` montado en `falco`, `pr-webhook`, y el testrunner CLI (Docker-outside-of-Docker)**: cualquiera de esos contenedores tiene control efectivo sobre el daemon Docker del **host** (no solo sobre sí mismo) — es lo que le permite a Falco monitorear contenedores hermanos, y al pipeline lanzar tests reales/corridas anidadas. Es necesario para la arquitectura elegida (DooD), no un descuido; en un despliegue real de producción esto se resolvería con un daemon Docker dedicado y aislado, no el del host.
+- **`.env` en texto plano en disco**: todas las credenciales (Jira, Azure DevOps, Anthropic, Sonar) viven en un archivo sin cifrar — sin vault ni secret manager. Aceptable para desarrollo local/PoC, no para un despliegue compartido.
+- **Falco corre `privileged: true` con `pid: host`**: requerido para que pueda observar syscalls del sistema real, no solo de su propio namespace — reducir el privilegio le quitaría la función.
+- **Credenciales sin monitoreo continuo por defecto**: `check_prereqs.sh` sólo valida Jira/Azure DevOps al momento de invocarse; `scripts/health_check.sh` sí las revisa (§ arriba, agregado tras confirmar en vivo que un token puede vencerse a mitad de una sesión de trabajo sin que nada lo note) pero necesita estar programado en cron/systemd para dar cobertura continua real — no corre solo.
+
 ### 11. Agente juez (segunda opinión, con acceso real a MCP y poder de bloqueo)
 
 Cada corrida — **aprobada o rechazada por el firewall** — pasa además por un **modelo distinto** (Claude, no `gh copilot`) que audita: si el firewall decidió bien, si el cambio real resuelve el ticket, y si la corrida completa tiene sentido. Además del texto del ticket/diff, el juez recibe como contexto real: la autocrítica `self_review` del coding agent (§6.4), las alertas de Falco de esta misma corrida (§10), los hallazgos nuevos de Sonar sobre el diff (§9.1), y los conflictos que `epic_planner.py` haya detectado si es una épica (§6.1) — todo señal, ninguno decide por sí solo, el juez es quien pesa todo eso.

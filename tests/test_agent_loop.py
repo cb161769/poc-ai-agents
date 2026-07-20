@@ -881,6 +881,63 @@ def test_call_with_fallback_raises_when_no_backend_available(monkeypatch):
         asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
 
 
+def test_is_hard_auth_failure_true_for_401_and_403():
+    for status in (401, 403):
+        exc = httpx.HTTPStatusError("error", request=httpx.Request("POST", "http://test"), response=_fake_response(status))
+        assert agent_loop._is_hard_auth_failure(exc) is True
+
+
+def test_is_hard_auth_failure_false_for_transient_errors():
+    exc = httpx.HTTPStatusError("error", request=httpx.Request("POST", "http://test"), response=_fake_response(500))
+    assert agent_loop._is_hard_auth_failure(exc) is False
+    assert agent_loop._is_hard_auth_failure(RuntimeError("boom")) is False
+
+
+def test_backend_available_false_when_marked_failed_hard(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_backends_failed_hard_this_run", {"anthropic"})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key-for-test")
+
+    assert agent_loop._backend_available("anthropic") is False
+
+
+def test_call_with_fallback_skips_backend_after_hard_auth_failure(monkeypatch):
+    """Bug real confirmado en vivo (operacion de esta noche): con una
+    ANTHROPIC_API_KEY invalida/revocada, _backend_available solo chequeaba
+    que la variable estuviera SETEADA (no que fuera valida) -- call_with_fallback
+    reintentaba Anthropic en CADA turno, repitiendo el mismo 401 real en
+    casi todos los turnos de dos corridas completas. Ahora, tras un 401/403,
+    el backend se recuerda como roto para el resto de esta corrida (el set a
+    nivel de modulo) y NO se vuelve a probar en el turno siguiente.
+    """
+    monkeypatch.setenv("LLM_BACKEND_PRIORITY", "anthropic,ollama")
+    monkeypatch.setattr(agent_loop, "_backends_failed_hard_this_run", set())
+
+    def fake_backend_available(backend):
+        return backend not in agent_loop._backends_failed_hard_this_run
+
+    monkeypatch.setattr(agent_loop, "_backend_available", fake_backend_available)
+
+    call_log = []
+
+    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
+        call_log.append(backend)
+        if backend == "anthropic":
+            raise httpx.HTTPStatusError("error", request=httpx.Request("POST", "http://test"), response=_fake_response(401))
+        return [{"type": "text", "text": "ok"}], "end_turn", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(agent_loop, "_call_model_turn", fake_call_model_turn)
+
+    # Primer turno: prueba anthropic (falla 401), cae a ollama.
+    asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
+    assert call_log == ["anthropic", "ollama"]
+    assert "anthropic" in agent_loop._backends_failed_hard_this_run
+
+    # Segundo turno (misma corrida): NO vuelve a probar anthropic.
+    call_log.clear()
+    asyncio.run(call_with_fallback(client=None, messages=[], tools=[], system_prompt="sys"))
+    assert call_log == ["ollama"]
+
+
 def _make_turn(turn_index: int, tool_name: str) -> tuple:
     tool_id = f"call_{turn_index}"
     assistant = {"role": "assistant", "content": [{"type": "tool_use", "id": tool_id, "name": tool_name, "input": {}}]}
