@@ -109,6 +109,29 @@ JUDGE_POLICY_IDS = [
     "other",
 ]
 
+# Esquema real de la respuesta final esperada (ver "esquema exacto" al final
+# de JUDGE_SYSTEM_PROMPT) -- se le pasa a Ollama via el parametro "format"
+# (JSON Schema real, no solo el string "json") SOLO en el reintento de
+# correccion, restringiendo el decoding a este esquema exacto en vez de
+# "cualquier JSON valido" (docs.ollama.com/capabilities/structured-outputs).
+JUDGE_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["OK", "FLAGGED"]},
+        "firewall_assessment": {"type": "string"},
+        "change_assessment": {"type": "string"},
+        "reasoning": {"type": "string"},
+        # Sin enum/nullable estricto a proposito: _normalize_policy_reference()
+        # ya corrige un valor faltante/invalido a "other" (o None si el
+        # veredicto es OK) despues del parseo -- restringir demasiado el
+        # esquema aca (null + enum juntos) es terreno no confirmado por los
+        # docs de Ollama, y no hace falta para el proposito real (evitar que
+        # la respuesta completa deje de ser JSON parseable).
+        "policy_reference": {"type": "string"},
+    },
+    "required": ["verdict", "reasoning"],
+}
+
 # RETRYABLE_POLICY_REFERENCES ahora vive en pipeline_shared.py (fuente
 # unica -- antes estaba definida acá Y duplicada en orchestration.py Y en un
 # array bash en run_poc_loop.sh; la copia de bash no tenia test de
@@ -680,7 +703,7 @@ async def judge_with_tools(payload: dict) -> dict:
                         # main() lo maneja como error, sin loop infinito.
                         retry_text, retry_usage = await _final_text_with_json_retry(
                             client, backend, messages, tools, JUDGE_SYSTEM_PROMPT,
-                            ollama_model=ollama_model_state["active"],
+                            ollama_model=ollama_model_state["active"], json_schema=JUDGE_RESULT_SCHEMA,
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)

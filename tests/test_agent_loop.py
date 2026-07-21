@@ -514,6 +514,89 @@ def test_call_model_turn_ollama_force_json_omits_format_when_tools_offered(monke
     assert captured["json"]["tools"]
 
 
+def test_call_model_turn_ollama_force_json_uses_real_schema_when_provided(monkeypatch):
+    """Gap real identificado en auditoria de herramientas (epica KAN-4):
+    format:"json" solo garantiza JSON valido, CUALQUIERA -- no el esquema
+    que coding_agent.py/judge_agent.py realmente esperan. Ollama soporta
+    pasarle un JSON Schema real a "format" (structured outputs), que
+    restringe el decoding al esquema exacto. Cuando el caller pasa
+    json_schema, "format" debe llevar ese esquema, no el string generico.
+    """
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+    schema = {"type": "object", "properties": {"status": {"type": "string"}}, "required": ["status"]}
+
+    asyncio.run(
+        agent_loop._call_model_turn(
+            client, "ollama", [{"role": "user", "content": "hola"}], [], "sys",
+            force_json=True, json_schema=schema,
+        )
+    )
+
+    assert captured["json"]["format"] == schema
+
+
+def test_call_model_turn_ollama_force_json_without_schema_falls_back_to_generic_json(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(
+        agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", force_json=True)
+    )
+
+    assert captured["json"]["format"] == "json"
+
+
+def test_call_model_turn_ollama_enables_thinking_for_qwen3(monkeypatch):
+    """qwen3 soporta "thinking" real (docs.ollama.com/capabilities/thinking),
+    expuesto en un campo de respuesta SEPARADO de content/tool_calls -- no
+    rompe el parseo existente, asi que se activa por default para modelos
+    conocidos por nombre.
+    """
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(
+        agent_loop._call_model_turn(
+            client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", ollama_model="qwen3:8b",
+        )
+    )
+
+    assert captured["json"]["think"] is True
+
+
+def test_call_model_turn_ollama_omits_thinking_for_unrecognized_model(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(
+        agent_loop._call_model_turn(
+            client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", ollama_model="qwen2.5-coder:7b",
+        )
+    )
+
+    assert "think" not in captured["json"]
+
+
+def test_call_model_turn_ollama_thinking_disabled_via_env(monkeypatch):
+    monkeypatch.setattr(agent_loop, "OLLAMA_THINKING_ENABLED", False)
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(
+        agent_loop._call_model_turn(
+            client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", ollama_model="qwen3:8b",
+        )
+    )
+
+    assert "think" not in captured["json"]
+
+
 def test_final_text_with_json_retry_ollama_forces_json_and_drops_tools(monkeypatch):
     captured = {}
 

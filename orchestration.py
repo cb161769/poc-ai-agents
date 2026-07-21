@@ -102,6 +102,11 @@ FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
 # largo que el default de cache_utils (300s) es correcto aca -- 1 hora por
 # default, configurable por si hace falta ajustarlo.
 GRAPH_CACHE_TTL_SECONDS = int(os.environ.get("GRAPH_CACHE_TTL_SECONDS", "3600"))
+# Cota de seguridad externa para el subproceso de judge_agent.py: las cotas
+# internas (MAX_TOOL_TURNS=6 * OLLAMA_TIMEOUT_SECONDS=300 por turno) ya
+# acotan el peor caso a decenas de minutos, pero sin esto un backend LLM
+# degradado podia colgar la task de Prefect indefinidamente sin señal clara.
+JUDGE_SUBPROCESS_TIMEOUT_SECONDS = int(os.environ.get("JUDGE_SUBPROCESS_TIMEOUT_SECONDS", "1200"))
 
 
 def _env_status(name: str, default: str) -> str:
@@ -1890,13 +1895,25 @@ def run_judge(
         "conflicts": conflicts,
         "new_sonar_issues": new_sonar_issues,
     }
-    result = subprocess.run(
-        ["python3", str(SCRIPT_DIR / "judge_agent.py")],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        cwd=SCRIPT_DIR,
-    )
+    try:
+        result = subprocess.run(
+            ["python3", str(SCRIPT_DIR / "judge_agent.py")],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            cwd=SCRIPT_DIR,
+            timeout=JUDGE_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Sin este timeout, un Ollama degradado-pero-no-caido podia dejar
+        # esta task de Prefect colgada en silencio por tiempo indefinido --
+        # las cotas internas (MAX_TOOL_TURNS=6, OLLAMA_TIMEOUT_SECONDS=300
+        # por turno) ya acotan el peor caso a decenas de minutos, pero sin
+        # una red de seguridad externa ni una señal distinta de "se colgó".
+        raise RuntimeError(
+            f"juez: timeout tras {JUDGE_SUBPROCESS_TIMEOUT_SECONDS}s sin respuesta "
+            f"(posible backend LLM degradado): {exc}"
+        )
     if result.returncode != 0:
         raise RuntimeError(f"juez fallo: {result.stderr.strip()}")
     # Gap real de observabilidad (Prefect): con returncode==0, result.stderr

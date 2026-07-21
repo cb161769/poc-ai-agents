@@ -188,7 +188,11 @@ def build_docker_run_command(ticket_id: str, is_epic: bool = False) -> list:
 
 def trigger_pipeline_for_ticket(ticket_id: str) -> None:
     cmd = build_docker_run_command(ticket_id, is_epic=_is_epic_ticket(ticket_id))
-    subprocess.Popen(cmd)  # no bloqueante -- el webhook ya respondio 200
+    proc = subprocess.Popen(cmd)  # no bloqueante -- el webhook ya respondio 200
+    # Sin esto el proceso hijo queda zombie/defunct al terminar: este
+    # servicio corre indefinidamente (pr_webhook stays up), asi que cada
+    # pipeline disparado por webhook se iba acumulando sin ser reapeado.
+    threading.Thread(target=proc.wait, daemon=True).start()
 
 
 @app.post("/webhooks/azure-devops", dependencies=[Depends(require_api_key)])

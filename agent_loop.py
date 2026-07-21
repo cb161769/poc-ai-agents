@@ -18,6 +18,7 @@ Model backend, in order of preference (same for both callers):
 import asyncio
 import json
 import os
+import re
 from contextlib import AsyncExitStack
 
 import httpx
@@ -79,6 +80,20 @@ OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 # (deterministico) es el default correcto para tareas de verificacion, no
 # de generacion creativa.
 OLLAMA_TEMPERATURE = float(os.environ.get("OLLAMA_TEMPERATURE", "0.0"))
+# Modelos Ollama documentados con soporte real de "thinking" (razonamiento
+# interno antes de responder, expuesto aparte en message.thinking -- no se
+# mezcla con message.content/tool_calls, asi que activarlo no rompe el
+# parseo existente): qwen3, gpt-oss, deepseek-r1, deepseek-v3.1
+# (docs.ollama.com/capabilities/thinking). Activarlo en un modelo que no lo
+# soporta no esta documentado como seguro -- se gatea por nombre en vez de
+# mandarlo siempre, para no arriesgar una corrida real con un modelo nuevo
+# que no fue verificado.
+OLLAMA_THINKING_ENABLED = os.environ.get("OLLAMA_THINKING_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+_OLLAMA_THINKING_MODEL_PATTERN = re.compile(r"qwen3|gpt-oss|deepseek-r1|deepseek-v3", re.IGNORECASE)
+
+
+def _ollama_model_supports_thinking(model: str) -> bool:
+    return bool(_OLLAMA_THINKING_MODEL_PATTERN.search(model or ""))
 
 # Pricing y orden de preferencia viven en llm_backends.py (el registro de
 # backends) -- _estimate_cost_usd() se mantiene aca como wrapper fino para
@@ -410,6 +425,7 @@ async def _post_with_retry(client: httpx.AsyncClient, backend: str, url: str, **
 async def _call_model_turn(
     client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str,
     anthropic_model: str = None, ollama_model: str = None, force_json: bool = False,
+    json_schema: dict | None = None,
 ) -> tuple:
     """Returns (content_blocks, stop_reason, usage) normalized to the
     Anthropic content-block shape regardless of which backend answered.
@@ -547,7 +563,26 @@ async def _call_model_turn(
         # llamar (la respuesta final, o el reintento de correccion que
         # siempre pasa tools=[]).
         if force_json and not tools:
-            request_body["format"] = "json"
+            # Real: format:"json" solo garantiza JSON valido, CUALQUIERA --
+            # no el esquema que coding_agent.py/judge_agent.py realmente
+            # esperan. Confirmado real (epica KAN-4): el reintento de
+            # correccion producia JSON sintacticamente valido pero con
+            # status:"blocked" citando su propia confusion, o directamente
+            # con las claves equivocadas. Ollama soporta pasarle un JSON
+            # Schema real a "format" (no solo el string "json"), que
+            # restringe el decoding a ESE esquema exacto -- mucho mas fuerte
+            # que "algo de JSON" (docs.ollama.com/capabilities/structured-outputs).
+            # Los callers que conocen su esquema exacto lo pasan via
+            # json_schema; sin eso, se mantiene el comportamiento anterior.
+            request_body["format"] = json_schema if json_schema is not None else "json"
+        if OLLAMA_THINKING_ENABLED and _ollama_model_supports_thinking(ollama_model):
+            # "thinking" es un campo de respuesta APARTE de content/tool_calls
+            # (docs.ollama.com/capabilities/thinking) -- activarlo no cambia
+            # el parseo existente de _ollama_response_to_blocks(), solo le da
+            # al modelo espacio real para razonar antes de decidir "llamo una
+            # tool" vs "respondo ya", que es exactamente el paso donde
+            # qwen2.5-coder:7b/ornith:9b se confundian mas seguido.
+            request_body["think"] = True
 
         resp = await _post_with_retry(
             client, "ollama", f"{OLLAMA_URL}/api/chat", json=request_body, timeout=OLLAMA_TIMEOUT_SECONDS
@@ -583,6 +618,7 @@ async def _call_model_turn(
 async def call_with_fallback(
     client: httpx.AsyncClient, messages: list, tools: list, system_prompt: str, exclude: set = None,
     anthropic_model: str = None, ollama_model: str = None, force_json: bool = False,
+    json_schema: dict | None = None,
 ) -> tuple:
     """Fallback EN VIVO entre backends -- a diferencia de _select_backend()
     (que elige un backend una sola vez al arrancar la corrida), esto se
@@ -620,6 +656,7 @@ async def call_with_fallback(
             blocks, stop_reason, usage = await _call_model_turn(
                 client, backend, messages, tools, system_prompt,
                 anthropic_model=anthropic_model, ollama_model=ollama_model, force_json=force_json,
+                json_schema=json_schema,
             )
             return blocks, stop_reason, usage, backend
         except Exception as exc:
@@ -645,7 +682,7 @@ async def call_with_fallback(
 
 async def _final_text_with_json_retry(
     client: httpx.AsyncClient, backend: str, messages: list, tools: list, system_prompt: str,
-    anthropic_model: str = None, ollama_model: str = None,
+    anthropic_model: str = None, ollama_model: str = None, json_schema: dict | None = None,
 ) -> tuple:
     """Called when a model's final answer wasn't valid JSON: appends a
     correction request and makes ONE more model call (bounded, no loop).
@@ -662,6 +699,7 @@ async def _final_text_with_json_retry(
     content, _stop_reason, usage = await _call_model_turn(
         client, backend, messages, [], system_prompt,
         anthropic_model=anthropic_model, ollama_model=ollama_model, force_json=True,
+        json_schema=json_schema,
     )
     messages.append({"role": "assistant", "content": content})
     final_text = next((b["text"] for b in content if b.get("type") == "text"), "")

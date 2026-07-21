@@ -859,6 +859,37 @@ def test_judge_with_tools_retries_when_json_valid_but_verdict_key_missing(monkey
     assert result["reasoning"] == "corregido"
 
 
+def test_judge_with_tools_passes_real_json_schema_to_retry(monkeypatch):
+    """Gap real identificado en auditoria de herramientas: format:"json" en
+    Ollama solo garantiza JSON valido, cualquiera -- no el esquema real que
+    judge_agent.py espera. El reintento de correccion ahora le pasa el
+    esquema real (JUDGE_RESULT_SCHEMA) via json_schema para que Ollama
+    restrinja el decoding a ese esquema exacto."""
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    captured = {}
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        captured.update(kwargs)
+        return '{"verdict": "OK", "reasoning": "listo"}', {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+
+    asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
+
+    assert captured["json_schema"] == judge_agent.JUDGE_RESULT_SCHEMA
+
+
 def test_judge_with_tools_nudges_and_corrects_hallucinated_verdict_from_json_retry(monkeypatch):
     """Bug real confirmado en vivo esta sesion (investigacion KAN-5, dos
     vueltas): el camino de reintento de JSON invalido (_final_text_with_json_retry)

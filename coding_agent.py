@@ -158,6 +158,20 @@ _TOOL_CALL_REFUSAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Confirmado real (epica KAN-4, qwen2.5-coder:7b, 12/12 historias bloqueadas):
+# cuando el modelo se confunde a mitad de la investigacion (no llama una tool
+# ni devuelve JSON), el reintento de _final_text_with_json_retry() le pide
+# JSON valido -- Y LO CONSIGUE, pero con status "blocked" y un summary que
+# literalmente repite el mensaje del reintento ("la respuesta anterior no
+# fue JSON valido"). Como el JSON es sintacticamente valido, ese resultado
+# nunca llegaba al chequeo de maybe_switch_ollama_model (que solo dispara
+# cuando el reintento ADEMAS falla en parsear) -- se aceptaba como "blocked"
+# final sin darle a otro modelo la chance real de investigar. Distinto de un
+# bloqueo legitimo por ticket ambiguo (esos nunca mencionan JSON, hablan de
+# rutas/specs faltantes) -- este patron es especificamente el modelo
+# citando su propia confusion de formato, no una decision real sobre el ticket.
+_JSON_CONFUSION_BLOCKED_PATTERN = re.compile(r"json", re.IGNORECASE)
+
 TOOL_CALL_NUDGE_MESSAGE = (
     "Ya podes hacerlo -- la confirmacion humana la pide automaticamente la herramienta misma "
     "(write_file/edit_file/run_shell_command) apenas la llamas, vos no necesitas pedir permiso en texto "
@@ -220,6 +234,26 @@ def _has_valid_self_review(result: dict) -> bool:
     if not isinstance(self_review, dict):
         return False
     return all(isinstance(self_review.get(field), bool) for field in _SELF_REVIEW_FIELDS)
+
+# Esquema real de la respuesta final esperada (ver CODING_AGENT_SYSTEM_PROMPT
+# mas abajo, "esquema exacto") -- se le pasa a Ollama via el parametro
+# "format" (JSON Schema real, no solo el string "json") SOLO en el reintento
+# de correccion (_final_text_with_json_retry pasa tools=[]), restringiendo el
+# decoding a este esquema exacto en vez de "cualquier JSON valido"
+# (docs.ollama.com/capabilities/structured-outputs).
+CODING_AGENT_RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["done", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}},
+        "self_review": {
+            "type": "object",
+            "properties": {field: {"type": "boolean"} for field in _SELF_REVIEW_FIELDS},
+        },
+    },
+    "required": ["status", "summary", "files_changed"],
+}
 
 CODING_AGENT_SYSTEM_PROMPT = """Sos un agente de codigo real, trabajando sobre un repositorio git real que \
 ya esta parado en una rama nueva (nunca la rama base) creada especificamente para este cambio.
@@ -1143,7 +1177,7 @@ async def run_coding_agent(
                         # Un solo reintento acotado antes de degradar a blocked.
                         retry_text, retry_usage = await _final_text_with_json_retry(
                             client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
-                            ollama_model=ollama_model_state["active"],
+                            ollama_model=ollama_model_state["active"], json_schema=CODING_AGENT_RESULT_SCHEMA,
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
                         total_output_tokens += retry_usage.get("output_tokens", 0)
@@ -1158,6 +1192,17 @@ async def run_coding_agent(
                             ):
                                 continue
                             return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
+
+                    if (
+                        result.get("status") == "blocked"
+                        and _JSON_CONFUSION_BLOCKED_PATTERN.search(result.get("summary", ""))
+                        and maybe_switch_ollama_model(
+                            ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                            "coding agent",
+                            "reporto 'blocked' citando su propia confusion sobre el formato JSON, no una ambiguedad real del ticket",
+                        )
+                    ):
+                        continue
 
                     if result.get("status") == "done" and not has_run_verification and not verification_nudge_given:
                         # Un solo empujon -- si en el turno extra tampoco

@@ -4,6 +4,7 @@ abierta. Usa FastAPI TestClient directo contra el app real; subprocess.Popen
 siempre mockeado (nunca lanza un docker run real en los tests).
 """
 import importlib
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -155,15 +156,38 @@ def test_is_epic_ticket_degrades_gracefully_on_jira_lookup_failure(monkeypatch):
     assert pr_webhook._is_epic_ticket("KAN-4") is False
 
 
+class _FakeProc:
+    def wait(self):
+        return 0
+
+
 def test_trigger_pipeline_for_ticket_uses_epic_command_for_epic_tickets(monkeypatch):
     monkeypatch.setattr(pr_webhook, "_is_epic_ticket", lambda ticket_id: True)
     captured = {}
     monkeypatch.setattr(pr_webhook, "build_docker_run_command", lambda ticket_id, is_epic=False: captured.update(ticket_id=ticket_id, is_epic=is_epic) or ["echo", "noop"])
-    monkeypatch.setattr(pr_webhook.subprocess, "Popen", lambda cmd: None)
+    monkeypatch.setattr(pr_webhook.subprocess, "Popen", lambda cmd: _FakeProc())
 
     pr_webhook.trigger_pipeline_for_ticket("KAN-4")
 
     assert captured == {"ticket_id": "KAN-4", "is_epic": True}
+
+
+def test_trigger_pipeline_for_ticket_reaps_child_process_in_background(monkeypatch):
+    """Gap real identificado en auditoria de subprocesos: subprocess.Popen(cmd)
+    nunca se esperaba (.wait()) -- pr_webhook.py corre indefinidamente
+    (servicio FastAPI de larga duracion), asi que cada pipeline disparado
+    por webhook dejaba un proceso zombie/defunct sin reapear. Confirma que
+    ahora se lanza un hilo daemon que llama a proc.wait()."""
+    monkeypatch.setattr(pr_webhook, "_is_epic_ticket", lambda ticket_id: False)
+    monkeypatch.setattr(pr_webhook, "build_docker_run_command", lambda ticket_id, is_epic=False: ["echo", "noop"])
+    fake_proc = _FakeProc()
+    wait_called = threading.Event()
+    fake_proc.wait = wait_called.set
+    monkeypatch.setattr(pr_webhook.subprocess, "Popen", lambda cmd: fake_proc)
+
+    pr_webhook.trigger_pipeline_for_ticket("KAN-9")
+
+    assert wait_called.wait(timeout=2), "proc.wait() nunca se llamo -- el hijo queda zombie"
 
 
 def test_webhook_requires_header_when_api_key_configured(tmp_path, monkeypatch):

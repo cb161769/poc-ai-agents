@@ -3494,7 +3494,7 @@ def test_run_judge_payload_includes_self_review(monkeypatch):
         stdout = json.dumps({"verdict": "OK", "reasoning": "ok"})
         stderr = ""
 
-    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None):
+    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None, timeout=None):
         captured["input"] = json.loads(input)
         return FakeCompletedProcess()
 
@@ -3518,7 +3518,7 @@ def test_run_judge_payload_includes_new_sonar_issues(monkeypatch):
         stdout = json.dumps({"verdict": "OK", "reasoning": "ok"})
         stderr = ""
 
-    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None):
+    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None, timeout=None):
         captured["input"] = json.loads(input)
         return FakeCompletedProcess()
 
@@ -3531,6 +3531,45 @@ def test_run_judge_payload_includes_new_sonar_issues(monkeypatch):
     )
 
     assert captured["input"]["new_sonar_issues"] == new_sonar_issues
+
+
+def test_run_judge_passes_timeout_to_subprocess(monkeypatch):
+    """Gap real identificado en auditoria de subprocesos: el subprocess.run()
+    del juez no tenia ningun timeout -- las cotas internas (MAX_TOOL_TURNS=6
+    * OLLAMA_TIMEOUT_SECONDS=300/turno) acotan el peor caso a decenas de
+    minutos, pero sin una red de seguridad externa un backend LLM degradado
+    podia colgar la task de Prefect indefinidamente. Confirma que se pasa
+    timeout= con el valor configurado."""
+    captured = {}
+
+    class FakeCompletedProcess:
+        returncode = 0
+        stdout = json.dumps({"verdict": "OK", "reasoning": "ok"})
+        stderr = ""
+
+    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None, timeout=None):
+        captured["timeout"] = timeout
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    orchestration.run_judge.fn({"ticket_id": "T-1"}, {"status": "APPROVED"}, "local_diff", "diff", "tests")
+
+    assert captured["timeout"] == orchestration.JUDGE_SUBPROCESS_TIMEOUT_SECONDS
+
+
+def test_run_judge_raises_clear_error_on_timeout(monkeypatch):
+    """Cuando el subproceso del juez excede JUDGE_SUBPROCESS_TIMEOUT_SECONDS,
+    debe fallar con un RuntimeError claro (no dejar propagar el
+    TimeoutExpired crudo), para que el caller (que ya sabe degradar sobre
+    RuntimeError) lo maneje igual que cualquier otro fallo del juez."""
+    def fake_run(cmd, input=None, capture_output=None, text=None, cwd=None, timeout=None):
+        raise orchestration.subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="timeout"):
+        orchestration.run_judge.fn({"ticket_id": "T-1"}, {"status": "APPROVED"}, "local_diff", "diff", "tests")
 
 
 def test_rescan_sonar_returns_empty_list_when_script_fails(monkeypatch):

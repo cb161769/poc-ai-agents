@@ -965,6 +965,107 @@ def test_run_coding_agent_still_blocks_when_json_invalid_and_only_one_ollama_can
     assert result["status"] == "blocked"
 
 
+def test_run_coding_agent_passes_real_json_schema_to_retry(monkeypatch, tmp_path):
+    """Gap real identificado en auditoria de herramientas: format:"json" en
+    Ollama solo garantiza JSON valido, cualquiera -- no el esquema real que
+    coding_agent.py espera. El reintento de correccion ahora le pasa el
+    esquema real (CODING_AGENT_RESULT_SCHEMA) via json_schema para que
+    Ollama restrinja el decoding a ese esquema exacto, no solo "algo de JSON".
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    captured = {}
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        captured.update(kwargs)
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert captured["json_schema"] == ca.CODING_AGENT_RESULT_SCHEMA
+
+
+def test_run_coding_agent_switches_ollama_model_when_blocked_cites_own_json_confusion(monkeypatch, tmp_path):
+    """Gap real confirmado en la epica KAN-4 (qwen2.5-coder:7b, 12/12
+    historias bloqueadas): cuando el modelo se confunde a mitad de la
+    investigacion y el reintento de _final_text_with_json_retry() le pide
+    JSON valido, el modelo A VECES lo consigue -- pero con status "blocked"
+    y un summary que literalmente repite el mensaje del reintento ("la
+    respuesta anterior no fue JSON valido"). Como el JSON resultante es
+    sintacticamente valido, el chequeo de maybe_switch_ollama_model (que
+    solo dispara si el reintento TAMBIEN falla en parsear) nunca se
+    ejercitaba para este caso -- se aceptaba como blocked final sin darle a
+    otro modelo la chance real de investigar. Distinto de un bloqueo
+    legitimo por ticket ambiguo (esos no mencionan JSON).
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el segundo modelo", "files_changed": []}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return (
+            '{"status": "blocked", "summary": "La respuesta anterior no fue JSON valido. '
+            'No puedo continuar sin un comando real.", "files_changed": []}',
+            {"input_tokens": 1, "output_tokens": 1},
+        )
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    assert result["summary"] == "listo con el segundo modelo"
+
+
+def test_run_coding_agent_does_not_switch_model_on_legitimate_ticket_ambiguity_block(monkeypatch, tmp_path):
+    """Un bloqueo legitimo (el ticket no especifica rutas/estructura, sin
+    ninguna mencion de JSON) NO debe disparar el cambio de modelo -- ese es
+    un veredicto real sobre el ticket, no una confusion de formato, y
+    reintentarlo con otro modelo solo gastaria tiempo en un ticket que
+    genuinamente necesita mas detalle.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        content = [{
+            "type": "text",
+            "text": '{"status": "blocked", "summary": "El ticket no especifica la ruta del componente.", "files_changed": []}',
+        }]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert call_count["n"] == 1
+
+
 def test_run_coding_agent_switches_ollama_model_when_tool_refusal_persists_after_nudge(monkeypatch, tmp_path):
     monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)

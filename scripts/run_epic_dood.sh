@@ -91,12 +91,22 @@ if ! docker image inspect poc-ai-agents-testrunner >/dev/null 2>&1; then
   docker build -f "${ROOT_DIR}/Dockerfile.testrunner" -t poc-ai-agents-testrunner "${ROOT_DIR}" || fail "fallo el build de la imagen"
 fi
 
-echo "== 4. Traduciendo el path del clon para el daemon del HOST (Docker-outside-of-Docker) =="
+echo "== 4. Traduciendo paths del HOST para el daemon (Docker-outside-of-Docker) =="
+# MSYS_NO_PATHCONV=1 (mas abajo) es necesario para que git-bash NO reescriba
+# los paths DEL CONTENEDOR (/repo, /target-repo dentro del -lc) como si
+# fueran paths de Windows -- pero eso tambien apaga la traduccion automatica
+# de los paths reales DEL HOST (ROOT_DIR/TARGET_REPO_CLONE_DIR, en formato
+# posix /c/Users/... de git-bash), que el docker.exe nativo de Windows no
+# entiende. Bug real confirmado: "docker: open /c/Users/.../.env: El sistema
+# no puede encontrar la ruta especificada." -- se traducen a mano ambos,
+# igual que ya se hacia solo para HOST_TARGET_REPO_DIR.
 if command -v cygpath >/dev/null 2>&1; then
   HOST_TARGET_REPO_DIR="$(cygpath -w "${TARGET_REPO_CLONE_DIR}")"
+  HOST_ROOT_DIR="$(cygpath -w "${ROOT_DIR}")"
 else
   # Host no-Windows: el daemon real y este script ven el mismo path.
   HOST_TARGET_REPO_DIR="${TARGET_REPO_CLONE_DIR}"
+  HOST_ROOT_DIR="${ROOT_DIR}"
 fi
 echo "HOST_TARGET_REPO_DIR=${HOST_TARGET_REPO_DIR}"
 
@@ -106,11 +116,21 @@ if [ "${NO_AUTO_CONFIRM:-0}" != "1" ]; then
 fi
 
 DOCKER_RUN=(docker run -i --rm --name "epic-run-${EPIC_KEY,,}-$(date +%s)"
-  -v "${ROOT_DIR}:/repo"
-  -v "${TARGET_REPO_CLONE_DIR}:/target-repo"
+  -v "${HOST_ROOT_DIR}:/repo"
+  -v "${HOST_TARGET_REPO_DIR}:/target-repo"
   -v /var/run/docker.sock:/var/run/docker.sock
-  --env-file "${ROOT_DIR}/.env"
+  --env-file "${HOST_ROOT_DIR}/.env"
   -e "HOST_TARGET_REPO_DIR=${HOST_TARGET_REPO_DIR}"
+  # .env apunta a localhost:PUERTO para uso desde el host -- dentro de este
+  # contenedor (en poc-ai-agents_poc-net) "localhost" es el propio
+  # contenedor, no docker-compose. Se sobreescriben con los container_name
+  # reales del docker-compose, resolubles por DNS en la misma red.
+  -e "NEO4J_URI=bolt://poc-neo4j:7687"
+  -e "SONAR_URL=http://poc-sonarqube:9000"
+  -e "QDRANT_URL=http://poc-qdrant:6333"
+  -e "FIREWALL_URL=http://poc-ai-firewall:8080"
+  -e "OLLAMA_URL=http://poc-ollama:11434"
+  -e "PREFECT_API_URL=http://poc-prefect-server:4200/api"
   --network poc-ai-agents_poc-net
   -w /target-repo
   poc-ai-agents-testrunner
@@ -118,7 +138,15 @@ DOCKER_RUN=(docker run -i --rm --name "epic-run-${EPIC_KEY,,}-$(date +%s)"
 )
 
 if [ "${NO_AUTO_CONFIRM:-0}" != "1" ]; then
+  # Bug real confirmado: con 'set -o pipefail' (arriba), cuando docker run
+  # termina (incluso OK) 'yes' sigue escribiendo al pipe ya cerrado y muere
+  # con SIGPIPE (141) -- pipefail promueve ESE codigo a la salida de todo
+  # el pipeline, reportando "fallo" aunque la corrida real haya terminado
+  # bien. El codigo real que importa es el de docker run, no el de yes.
   yes s | MSYS_NO_PATHCONV=1 "${DOCKER_RUN[@]}"
+  docker_exit="${PIPESTATUS[1]}"
 else
   MSYS_NO_PATHCONV=1 "${DOCKER_RUN[@]}"
+  docker_exit=$?
 fi
+exit "${docker_exit}"
