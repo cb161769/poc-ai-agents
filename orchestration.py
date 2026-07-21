@@ -39,6 +39,7 @@ run_poc_loop.sh is kept as-is for anyone who prefers a plain bash run
 without standing up Prefect — both drive the exact same scripts underneath.
 """
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -68,10 +69,12 @@ import httpx
 from prefect import flow, get_run_logger, task
 from prefect.artifacts import create_markdown_artifact
 
+import conversation_memory
 import epic_planner
 import graph_writer
 import jira_client
 import output_guard
+from cache_utils import cached_call
 from coding_agent import _STACK_MARKERS
 from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
@@ -88,6 +91,16 @@ logger = get_logger(__name__)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
+# Gap real identificado en auditoria ("orquestacion... necesita cache"):
+# query_graph()/_query_component_risk_history() pegaban un cypher-shell real
+# CADA VEZ, sin ningun cache -- a diferencia de jira_client.py/sonar_client.py/
+# figma_client.py, que ya usan cache_utils.cached_call para exactamente este
+# patron (dato read-mostly, no vale la pena re-pegarle a un servicio externo
+# en cada corrida). El grafo de dependencias/riesgos cambia mucho menos
+# seguido que un ticket de Jira o un hallazgo de Sonar, asi que un TTL mas
+# largo que el default de cache_utils (300s) es correcto aca -- 1 hora por
+# default, configurable por si hace falta ajustarlo.
+GRAPH_CACHE_TTL_SECONDS = int(os.environ.get("GRAPH_CACHE_TTL_SECONDS", "3600"))
 
 
 def _env_status(name: str, default: str) -> str:
@@ -368,8 +381,9 @@ def _query_component_risk_history(component: str) -> str:
     return "\n\n".join(parts)
 
 
-@task(retries=2, retry_delay_seconds=10, name="query-graph")
-def query_graph(component: str) -> str:
+def _fetch_graph_context(component: str) -> str:
+    """El trabajo real de query_graph() -- separado para que cached_call lo
+    reciba como fetch_fn sin cambiar la forma de la tarea de Prefect."""
     neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
     neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
@@ -382,6 +396,19 @@ def query_graph(component: str) -> str:
     if risk_history:
         result += f"\n\n--- Historial real de riesgos/corridas para este componente ---\n{risk_history}"
     return result
+
+
+@task(retries=2, retry_delay_seconds=10, name="query-graph")
+def query_graph(component: str) -> str:
+    # Gap real identificado en auditoria ("orquestacion... necesita cache"):
+    # esto pegaba un cypher-shell real EN CADA CORRIDA, incluidas las varias
+    # corridas repetidas de esta misma sesion sobre la misma epica -- mismo
+    # patron ya resuelto para Jira/Sonar/Figma (cache_utils.cached_call),
+    # nunca aplicado aca. cached_call espera un dict (le agrega "_cache"),
+    # asi que el texto real viaja envuelto en {"text": ...} y se desenvuelve
+    # al salir -- la firma publica de query_graph() no cambia.
+    cached = cached_call("graph-query", {"component": component}, lambda: {"text": _fetch_graph_context(component)}, ttl_seconds=GRAPH_CACHE_TTL_SECONDS)
+    return cached["text"]
 
 
 @task(retries=2, retry_delay_seconds=5, name="query-sonar")
@@ -617,9 +644,33 @@ def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket
     if remote_check.returncode != 0 or not remote_url:
         return {"pushed": False, "pr_url": None, "reason": "el repo objetivo no tiene un remote 'origin' configurado"}
 
-    push_result = subprocess.run(
-        ["git", "-C", target_repo_dir, "push", "-u", "origin", branch], capture_output=True, text=True
-    )
+    # Bug real confirmado en vivo (epica KAN-4, sesion completa): 'git push'
+    # ANTES no llevaba ninguna credencial -- contra un remote HTTPS que
+    # requiere auth (Azure DevOps) fallaba SIEMPRE en un contexto no
+    # interactivo (confirmado reproduciendo el comando exacto: "fatal: could
+    # not read Username... No such file or directory", git intenta pedir
+    # credenciales por /dev/tty y no hay ninguna terminal). Como el fallo
+    # degradaba gracefully (best-effort, "reason": "git push fallo"), esto
+    # nunca crasheaba la corrida -- pero significaba que NINGUN push llegaba
+    # de verdad al remote real en TODA la sesion, pese a tener
+    # AZURE_DEVOPS_PAT disponible (ya se usaba, correctamente, para el POST
+    # de creacion de la PR mas abajo -- pero el push que tiene que pasar
+    # ANTES nunca lo recibia). Mismo patron de header ya probado en vivo
+    # esta sesion (scripts/run_epic_dood.sh): -c http.extraheader, nunca
+    # persistido en .git/config (a diferencia de embeber el PAT en la URL,
+    # que si queda en texto plano ahi -- confirmado real que el clasificador
+    # de seguridad de este mismo harness bloquea exactamente eso como fuga
+    # de credenciales).
+    azure_match_for_push = _AZURE_DEVOPS_REPO_PATTERN.search(remote_url)
+    push_cmd = ["git", "-C", target_repo_dir]
+    if azure_match_for_push:
+        pat_for_push = os.environ.get("AZURE_DEVOPS_PAT")
+        if pat_for_push:
+            auth_header = base64.b64encode(f":{pat_for_push}".encode("utf-8")).decode("ascii")
+            push_cmd += ["-c", f"http.extraheader=Authorization: Basic {auth_header}"]
+    push_cmd += ["push", "-u", "origin", branch]
+
+    push_result = subprocess.run(push_cmd, capture_output=True, text=True)
     if push_result.returncode != 0:
         return {"pushed": False, "pr_url": None, "reason": f"git push fallo: {push_result.stderr.strip()[:300]}"}
 
@@ -1408,12 +1459,26 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
     self_review = None
     self_verified = None
     consulted_risk_graph = None
+    agent_summary = None
     try:
         agent_result = json.loads(result.stdout)
         run_logger.info(f"Resultado del agente: {agent_result.get('status')} — {agent_result.get('summary')}")
         agent_backend = agent_result.get("_meta", {}).get("backend")
         conversation_file = agent_result.get("_conversation_file")
         self_review = agent_result.get("self_review")
+        # Gap real identificado en auditoria ("orquestacion no puede mejorar
+        # sus algoritmos" -- el usuario pidio ver POR QUE una historia
+        # terminaba en no-op): coding_agent.py YA devuelve un "summary" real
+        # explicando que hizo o por que no pudo (ver su propio schema:
+        # "que hiciste, que verificaste, o por que no pudiste"), pero antes
+        # de esto se logueaba UNA VEZ (linea de arriba, solo visible en el
+        # log crudo del contenedor) y despues se descartaba -- el comentario
+        # de Jira que ve un humano solo decia "Copilot no aplico ningun
+        # cambio", sin ninguna razon real. Confirmado real: 11/12 historias
+        # de una epica terminaron en no-op sin ninguna pista de por que.
+        agent_summary = agent_result.get("summary")
+        self_verified = agent_result.get("self_verified")
+        consulted_risk_graph = agent_result.get("consulted_risk_graph")
         # Gap real (usuario, "hay gaps en el coding agent"): coding_agent.py
         # calcula self_verified/consulted_risk_graph (evidencia real, no
         # autoreportada) pero antes de esto nadie los leia del JSON del
@@ -1468,6 +1533,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             "resumed_branch": bool(existing_branch),
             "resumed_pr_rejected": pr_rejected,
             "pr_thread_ids_to_resolve": pr_thread_ids_to_resolve,
+            "summary": agent_summary,
         }
 
     subprocess.run(["git", "-C", target_repo_dir, "checkout", base_branch])
@@ -1486,6 +1552,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         "applied": False, "branch": None, "base_branch": base_branch, "backend": agent_backend,
         "conversation_file": conversation_file, "self_review": None,
         "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+        "summary": agent_summary,
     }
 
 
@@ -1506,7 +1573,14 @@ def retry_coding_agent_local_real(
     if conversation_file and Path(conversation_file).exists():
         conversation_state = json.loads(Path(conversation_file).read_text(encoding="utf-8"))
         payload["sanitized_prompt"] = feedback_text
-        payload["resume_messages"] = conversation_state.get("messages", [])
+        # Gap real identificado en auditoria ("orquestacion... necesita
+        # memoria acotada"): sin esto, el transcript crudo crecia sin limite
+        # a traves de TODA una epica secuencial (12 historias resumiendo la
+        # MISMA conversacion, turno a turno) -- podia acercarse al context
+        # window del backend local de Ollama, degradando su razonamiento
+        # sobre la historia ACTUAL. Best-effort: por debajo del umbral, o si
+        # la generacion del resumen falla, devuelve los mensajes tal cual.
+        payload["resume_messages"] = conversation_memory.maybe_compact_conversation(conversation_state.get("messages", []))
         payload["resume_state"] = {
             "has_investigated": conversation_state.get("has_investigated", False),
             "has_run_verification": conversation_state.get("has_run_verification", False),
@@ -1523,6 +1597,12 @@ def retry_coding_agent_local_real(
             # (coding_agent.py) volvia a exigir list_directory de cero en
             # cada turno nuevo, aunque el turno anterior ya lo hubiera hecho.
             "listed_dirs": conversation_state.get("listed_dirs", []),
+            # Gap real identificado en auditoria ("orquestacion... necesita
+            # cache"): sin esto, cada reintento/historia releia archivos ya
+            # leidos en un turno anterior de la MISMA conversacion, inflando
+            # tokens con contenido duplicado -- ver tool_read_file en
+            # coding_agent.py.
+            "read_file_hashes": conversation_state.get("read_file_hashes", {}),
         }
         Path(conversation_file).unlink(missing_ok=True)
     else:
@@ -1560,6 +1640,7 @@ def retry_coding_agent_local_real(
     self_review = None
     self_verified = None
     consulted_risk_graph = None
+    retry_summary = None
     try:
         agent_result = json.loads(result.stdout)
         run_logger.info(f"Resultado del segundo intento: {agent_result.get('status')} — {agent_result.get('summary')}")
@@ -1568,6 +1649,7 @@ def retry_coding_agent_local_real(
         self_review = agent_result.get("self_review")
         self_verified = agent_result.get("self_verified")
         consulted_risk_graph = agent_result.get("consulted_risk_graph")
+        retry_summary = agent_result.get("summary")
     except json.JSONDecodeError:
         run_logger.warning(f"El agente no devolvio un JSON valido en stdout en el segundo intento para {ticket_id}.")
 
@@ -1583,7 +1665,7 @@ def retry_coding_agent_local_real(
     if not status.strip() and not has_own_commits:
         return {
             "applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
-            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": retry_summary,
         }
 
     if status.strip():
@@ -1604,7 +1686,7 @@ def retry_coding_agent_local_real(
     if not has_own_commits:
         return {
             "applied": False, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
-            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": retry_summary,
         }
 
     # Ya no se borra aca -- el llamador decide: _retry_local_diff es siempre
@@ -1614,7 +1696,7 @@ def retry_coding_agent_local_real(
     # hijo de la epica.
     return {
         "applied": True, "backend": backend, "self_review": self_review, "conversation_file": retry_conversation_file,
-        "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph,
+        "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": retry_summary,
     }
 
 
@@ -2449,9 +2531,17 @@ def _deliver(
                 if retried_verdict is not None:
                     judge_verdict = retried_verdict
         else:
+            # Gap real identificado en auditoria ("no se pueden mejorar los
+            # algoritmos de orquestacion" -- el usuario pidio ver POR QUE una
+            # historia terminaba en no-op): coding_agent.py ya devuelve un
+            # "summary" real explicando que hizo o por que no pudo, pero
+            # antes se descartaba -- el comentario solo decia "no aplico
+            # ningun cambio", sin ninguna razon real visible para un humano.
+            no_op_reason = agent_result.get("summary") or "el agente no devolvio una razon"
             _comment_all(
                 "🤖 Copilot (Prefect): AI Firewall aprobo la solicitud "
-                f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio en esta corrida.",
+                f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio en esta corrida. "
+                f"Razon real del agente: {no_op_reason}",
                 ticket_id, is_epic, child_ticket_keys,
             )
             judge_verdict = _run_judge_safe(
@@ -2714,12 +2804,18 @@ def _deliver_epic_sequential(
         backend = agent_result.get("backend") or backend
 
         if not agent_result["applied"]:
+            # Gap real identificado en auditoria ("no se pueden mejorar los
+            # algoritmos de orquestacion" -- confirmado real: una epica de
+            # 12 historias termino con 11 no-op sin ninguna razon visible).
+            # Ver comentario equivalente en _deliver().
+            no_op_reason = agent_result.get("summary") or "el agente no devolvio una razon"
             comment_jira(
                 f"🤖 Copilot (Prefect, modo epica secuencial): AI Firewall aprobo {child_id} "
-                f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio para esta historia.",
+                f"(redacciones: {firewall_result['redactions_applied']}). Copilot no aplico ningun cambio para esta historia. "
+                f"Razon real del agente: {no_op_reason}",
                 ticket_key=child_id,
             )
-            _post_child_technical_report(epic_key, child_id, backend, "no-op -- el agente no aplico ningun cambio")
+            _post_child_technical_report(epic_key, child_id, backend, f"no-op -- el agente no aplico ningun cambio ({no_op_reason})")
             completed.append({"ticket_id": child_id, "outcome": "no-op"})
             continue
 

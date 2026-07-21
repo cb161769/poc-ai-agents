@@ -486,7 +486,16 @@ def test_query_component_risk_history_degrades_gracefully_on_failure(monkeypatch
     assert "KAN-5" in result
 
 
+def _bypass_graph_cache(monkeypatch):
+    """query_graph() ahora pasa por cached_call (gap real: cypher-shell se
+    pegaba en CADA corrida sin cache, ver test_query_graph_caches_*) --
+    estos tests puntuales verifican la logica de armado del texto, no el
+    cacheo en si, asi que lo saltean llamando fetch_fn() directo."""
+    monkeypatch.setattr(orchestration, "cached_call", lambda namespace, params, fetch_fn, ttl_seconds=None: fetch_fn())
+
+
 def test_query_graph_appends_risk_history_when_present(monkeypatch):
+    _bypass_graph_cache(monkeypatch)
     monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "servicio | lenguaje\nAuthService | Java\n")
     monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "Riesgos documentados:\nscope-mismatch | 1")
 
@@ -498,6 +507,7 @@ def test_query_graph_appends_risk_history_when_present(monkeypatch):
 
 
 def test_query_graph_omits_risk_history_section_when_empty(monkeypatch):
+    _bypass_graph_cache(monkeypatch)
     monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "servicio | lenguaje\nAuthService | Java\n")
     monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "")
 
@@ -505,6 +515,45 @@ def test_query_graph_omits_risk_history_section_when_empty(monkeypatch):
 
     assert "AuthService | Java" in result
     assert "Historial real de riesgos/corridas" not in result
+
+
+def test_query_graph_caches_repeated_calls_for_same_component(monkeypatch, tmp_path):
+    """Gap real identificado en auditoria ("orquestacion... necesita
+    cache"): query_graph()/_query_component_risk_history() pegaban un
+    cypher-shell real EN CADA CORRIDA -- incluidas las muchas corridas
+    repetidas de esta misma sesion sobre la misma epica -- sin ningun cache,
+    a diferencia de Jira/Sonar/Figma (cache_utils.cached_call, mismo
+    patron). Confirma que un segundo query_graph() para el MISMO componente
+    dentro del TTL no vuelve a invocar cypher-shell."""
+    import cache_utils
+    monkeypatch.setattr(cache_utils, "CACHE_DIR", tmp_path)
+    run_calls = []
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: run_calls.append(cmd) or "servicio | lenguaje\nAuthService | Java\n")
+    monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "")
+
+    first = orchestration.query_graph.fn("Frontend")
+    second = orchestration.query_graph.fn("Frontend")
+
+    assert first == second
+    assert len(run_calls) == 1  # el segundo llamado sirvio del cache, no volvio a pegarle a cypher-shell
+
+
+def test_query_graph_uses_separate_cache_entries_per_component(monkeypatch, tmp_path):
+    import cache_utils
+    monkeypatch.setattr(cache_utils, "CACHE_DIR", tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **k):
+        run_calls.append(cmd)
+        return "servicio | lenguaje\nAuthService | Java\n"
+
+    monkeypatch.setattr(orchestration, "_run", fake_run)
+    monkeypatch.setattr(orchestration, "_query_component_risk_history", lambda component: "")
+
+    orchestration.query_graph.fn("Frontend")
+    orchestration.query_graph.fn("AuthService")
+
+    assert len(run_calls) == 2  # componentes distintos -- cada uno pega su propio cypher-shell
 
 
 def test_resolve_single_repo_ok_when_all_agree():
@@ -815,6 +864,40 @@ def test_deliver_retries_and_recovers_when_no_changes_applied_but_judge_flags(mo
     assert result["judge"]["verdict"] == "OK"
     assert len(pr_calls) == 1
     assert pr_calls[0] is not None  # la rama NUEVA creada por el reintento, no None
+
+
+def test_deliver_includes_agent_summary_in_no_op_comment(monkeypatch):
+    """Gap real identificado en auditoria ("no se pueden mejorar los
+    algoritmos de orquestacion" -- confirmado real: una epica de 12
+    historias termino con 11 no-op sin ninguna razon visible en Jira, solo
+    "Copilot no aplico ningun cambio"). Confirma que la razon REAL del
+    agente (agent_result["summary"]) ahora llega al comentario."""
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "_check_already_completed", lambda *a, **k: False)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": False, "branch": None, "base_branch": "main", "backend": "ollama",
+            "conversation_file": None, "self_review": None,
+            "summary": "el ticket no especifica que componente tocar",
+        },
+    )
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "sin cambios, nada que objetar"})
+
+    comments = []
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append(text))
+
+    _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert any("el ticket no especifica que componente tocar" in text for text in comments)
 
 
 def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict(monkeypatch):
@@ -2315,6 +2398,41 @@ def test_run_coding_agent_local_real_surfaces_self_verified_and_risk_graph(monke
     assert result["consulted_risk_graph"] is True
 
 
+def test_run_coding_agent_local_real_surfaces_summary_when_no_op(monkeypatch, tmp_path):
+    """Gap real identificado en auditoria ("no se pueden mejorar los
+    algoritmos de orquestacion" -- confirmado real: una epica de 12
+    historias termino con 11 no-op sin ninguna razon visible en Jira):
+    coding_agent.py YA devuelve un "summary" real explicando por que no
+    pudo aplicar nada (ver su propio schema: "que hiciste... o por que no
+    pudiste"), pero run_coding_agent_local_real() lo descartaba -- solo lo
+    logueaba una vez en el log crudo del contenedor, invisible para
+    cualquiera que solo mire Jira."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "blocked", "summary": "el ticket no especifica que componente tocar",
+            "_meta": {"backend": "ollama"},
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["--abbrev-ref", "HEAD"]:
+            return _fake_subprocess_result(stdout="main\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")  # nada escrito -- no-op real
+        if "rev-list" in cmd:
+            return _fake_subprocess_result(stdout="0\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_coding_agent_local_real("T-1", "prompt", str(tmp_path))
+
+    assert result["applied"] is False
+    assert result["summary"] == "el ticket no especifica que componente tocar"
+
+
 def test_retry_coding_agent_local_real_preserves_consulted_risk_graph_across_turns(monkeypatch, tmp_path):
     """Gap real: antes, cada reintento perdia consulted_risk_graph aunque
     coding_agent.py SI lo acepta como seed (resume_state) -- si el primer
@@ -2356,6 +2474,47 @@ def test_retry_coding_agent_local_real_preserves_consulted_risk_graph_across_tur
     assert captured_payload["resume_state"]["consulted_risk_graph"] is True
     assert result["self_verified"] is True
     assert result["consulted_risk_graph"] is True
+
+
+def test_retry_coding_agent_local_real_threads_read_file_hashes_across_turns(monkeypatch, tmp_path):
+    """Gap real identificado en auditoria ("orquestacion... necesita cache
+    y algoritmos"): sin esto, cada reintento/historia perdia el registro de
+    que archivos ya se leyeron en un turno anterior de la MISMA
+    conversacion -- coding_agent.py SI lo acepta como seed
+    (resume_state.get("read_file_hashes"), ver tool_read_file), pero
+    retry_coding_agent_local_real() nunca se lo pasaba."""
+    conversation_file = tmp_path / "conv.json"
+    conversation_file.write_text(json.dumps({
+        "messages": [], "has_investigated": True, "has_run_verification": True,
+        "initial_plan": "plan", "consulted_risk_graph": False,
+        "read_file_hashes": {"/repo/src/app.py": "abc123"},
+    }), encoding="utf-8")
+
+    captured_payload = {}
+    heads = iter(["checkpoint\n", "checkpoint\n"])
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "blocked", "summary": "no pude", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = cmd[2]
+            captured_payload.update(json.loads(Path(payload_path).read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-1:] == ["HEAD"] and "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=next(heads))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    orchestration.retry_coding_agent_local_real(
+        "T-1", "feedback", str(tmp_path), conversation_file=str(conversation_file),
+    )
+
+    assert captured_payload["resume_state"]["read_file_hashes"] == {"/repo/src/app.py": "abc123"}
 
 
 def test_retry_coding_agent_local_real_detects_commits_made_by_the_model_itself(monkeypatch, tmp_path):
@@ -3302,6 +3461,97 @@ def test_push_and_open_pr_opens_real_pr_via_azure_devops_rest_api(monkeypatch):
     assert result["pr_url"] == "https://dev.azure.com/org/proj/_git/repo/pullrequest/42"
     assert captured["json"]["sourceRefName"] == "refs/heads/copilot/T-1-123"
     assert captured["json"]["targetRefName"] == "refs/heads/main"
+
+
+def test_push_and_open_pr_authenticates_git_push_for_azure_devops(monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-4, sesion completa): 'git
+    push' no llevaba NINGUNA credencial -- contra el remote HTTPS real de
+    Azure DevOps fallaba siempre en un contexto no interactivo (reproducido
+    directo: "fatal: could not read Username... No such file or directory").
+    AZURE_DEVOPS_PAT ya estaba disponible y se usaba (correctamente) para
+    crear la PR via REST API, pero el push que tiene que pasar ANTES nunca
+    la recibia -- asi que NINGUN push llegaba de verdad al remote real en
+    toda la sesion, pese a que la tarea se veia "Completed" en Prefect.
+    """
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+    calls = []
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"pullRequestId": 42}
+
+    monkeypatch.setattr(orchestration.httpx, "post", lambda *a, **k: FakeResp())
+
+    orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    push_cmd = next(c for c in calls if "push" in c)
+    assert "-c" in push_cmd
+    header_index = push_cmd.index("-c") + 1
+    header_value = push_cmd[header_index]
+    assert header_value.startswith("http.extraheader=Authorization: Basic ")
+    # el header nunca debe persistirse en .git/config -- solo pasado inline
+    # via -c para ESTE invocation puntual de git.
+    assert ".git/config" not in " ".join(push_cmd)
+    import base64 as b64
+    encoded = header_value.split("Basic ", 1)[1]
+    assert b64.b64decode(encoded).decode() == ":fake-pat"
+
+
+def test_push_and_open_pr_does_not_add_auth_header_for_non_azure_remote(monkeypatch):
+    """El push a un remote que no es Azure DevOps (ej. GitHub) no debe
+    llevar el header de Basic auth con el PAT de Azure -- comportamiento
+    sin cambios para ese caso."""
+    monkeypatch.setenv("AZURE_DEVOPS_PAT", "fake-pat")
+    calls = []
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = "https://github.com/org/repo.git" if "get-url" in cmd else ("https://github.com/org/repo/pull/7" if cmd[:2] == ["gh", "pr"] else "")
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    push_cmd = next(c for c in calls if "push" in c)
+    assert "-c" not in push_cmd
+
+
+def test_push_and_open_pr_azure_devops_without_pat_skips_auth_header_on_push(monkeypatch):
+    """Sin AZURE_DEVOPS_PAT, el push tampoco debe llevar el header (no hay
+    credencial para armarlo) -- sigue degradando gracefully como antes."""
+    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+    calls = []
+
+    def fake_subprocess_run(cmd, capture_output=None, text=None, cwd=None):
+        calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = "https://dev.azure.com/org/proj/_git/repo" if "get-url" in cmd else ""
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_subprocess_run)
+
+    orchestration.push_and_open_pr.fn("/repo", "copilot/T-1-123", "main", "T-1", "Fix login", "body")
+
+    push_cmd = next(c for c in calls if "push" in c)
+    assert "-c" not in push_cmd
 
 
 def test_push_and_open_pr_azure_devops_without_pat_degrades_gracefully(monkeypatch):

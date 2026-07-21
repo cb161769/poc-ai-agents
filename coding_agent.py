@@ -32,6 +32,7 @@ Every call is appended to logs/coding_agent_runs.jsonl.
 """
 import asyncio
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -387,6 +388,19 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + f"\n... (truncado, {len(text) - limit} caracteres omitidos)"
 
 
+# Gap real identificado en auditoria ("orquestacion... necesita cache y
+# algoritmos"): en una epica secuencial, cada historia resume la MISMA
+# conversacion (ver conversation_memory.py) -- si la historia #5 lee un
+# archivo que la #2 ya leyo y nadie toco desde entonces, el contenido
+# completo se re-embebia en el prompt de nuevo, inflando tokens y
+# enterrando al modelo en contenido duplicado en vez de dejarlo razonar
+# sobre lo nuevo. Sembrado desde resume_state.get("read_file_hashes")
+# (persistido en conversation_file entre historias, mismo mecanismo que
+# listed_dirs/consulted_risk_graph) y devuelto de vuelta en _finalize()
+# para que la PROXIMA historia lo siga usando.
+_read_file_hashes: dict = {}
+
+
 def tool_read_file(target_repo_dir: str, path: str) -> str:
     try:
         full_path = _safe_path(target_repo_dir, path)
@@ -406,9 +420,22 @@ def tool_read_file(target_repo_dir: str, path: str) -> str:
             "usa grep_search para buscar partes especificas en vez de leerlo entero"
         )
     try:
-        return full_path.read_text(encoding="utf-8", errors="replace")
+        content = full_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return f"error leyendo {path}: {exc}"
+
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    # Clave = path ABSOLUTO resuelto (no el relativo que pasa el modelo) --
+    # con la clave relativa, dos target_repo_dir distintos (ej. dos tests,
+    # o dos repos objetivo reales en corridas separadas del mismo proceso)
+    # podrian compartir un nombre de archivo relativo (ej. "hello.txt") y
+    # colisionar en el cache, devolviendo el puntero "ya leiste esto" para
+    # un archivo que en realidad nunca se leyo en ESE repo.
+    cache_key = str(full_path)
+    if _read_file_hashes.get(cache_key) == content_hash:
+        return f"(ya leiste este archivo antes en esta conversacion, sin cambios desde entonces -- hash={content_hash[:12]})"
+    _read_file_hashes[cache_key] = content_hash
+    return content
 
 
 def tool_list_directory(target_repo_dir: str, path: str = ".") -> str:
@@ -998,6 +1025,16 @@ async def run_coding_agent(
     initial_plan = resume_state.get("initial_plan")
     consulted_risk_graph = bool(resume_state.get("consulted_risk_graph"))
     listed_dirs = set(resume_state.get("listed_dirs") or [])
+    # _read_file_hashes es un dict a nivel de modulo (no una variable local
+    # como listed_dirs) porque tool_read_file() se llama via el dict
+    # LOCAL_TOOLS con una firma fija (target_repo_dir, path), sin acceso al
+    # closure de esta funcion. .clear() primero evita que corridas previas
+    # DENTRO DEL MISMO PROCESO (ej. tests, o un futuro caller que reuse el
+    # proceso) filtren hashes de un target_repo_dir/conversacion distinta --
+    # en produccion cada corrida real ya es un subproceso nuevo (python3
+    # coding_agent.py <payload>), asi que esto es defensivo, no el caso comun.
+    _read_file_hashes.clear()
+    _read_file_hashes.update(resume_state.get("read_file_hashes") or {})
     verification_nudge_given = False
     self_review_nudge_given = False
     tool_call_nudge_given = False
@@ -1024,6 +1061,7 @@ async def run_coding_agent(
             "initial_plan": initial_plan,
             "consulted_risk_graph": consulted_risk_graph,
             "listed_dirs": sorted(listed_dirs),
+            "read_file_hashes": dict(_read_file_hashes),
         }
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", prefix="coding_agent_conversation_", delete=False, encoding="utf-8"

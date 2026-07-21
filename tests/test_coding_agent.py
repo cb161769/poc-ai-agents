@@ -65,6 +65,58 @@ def test_tool_read_file_missing_file_returns_error_string(tmp_path):
     assert "error" in result
 
 
+def test_tool_read_file_returns_pointer_on_second_read_of_unchanged_file(tmp_path, monkeypatch):
+    """Gap real identificado en auditoria ("orquestacion... necesita cache
+    y algoritmos"): en una epica secuencial, cada historia resume la MISMA
+    conversacion -- si la historia #5 lee un archivo que la #2 ya leyo y
+    nadie lo toco desde entonces, el contenido completo se re-embebia en el
+    prompt de nuevo, inflando tokens y enterrando al modelo en contenido
+    duplicado."""
+    monkeypatch.setattr(ca, "_read_file_hashes", {})
+    (tmp_path / "hello.txt").write_text("hola mundo")
+
+    first = ca.tool_read_file(str(tmp_path), "hello.txt")
+    second = ca.tool_read_file(str(tmp_path), "hello.txt")
+
+    assert first == "hola mundo"
+    assert "ya leiste este archivo" in second
+    assert "hola mundo" not in second
+
+
+def test_tool_read_file_returns_full_content_when_file_changed(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca, "_read_file_hashes", {})
+    target = tmp_path / "hello.txt"
+    target.write_text("version 1")
+
+    first = ca.tool_read_file(str(tmp_path), "hello.txt")
+    target.write_text("version 2 -- contenido real cambiado")
+    second = ca.tool_read_file(str(tmp_path), "hello.txt")
+
+    assert first == "version 1"
+    assert second == "version 2 -- contenido real cambiado"
+
+
+def test_tool_read_file_different_repos_do_not_collide_on_relative_path(tmp_path, monkeypatch):
+    """Bug real evitado antes de que llegara a produccion: cachear por path
+    RELATIVO (no absoluto) haria que dos repos objetivo distintos con el
+    mismo nombre de archivo relativo (ej. "hello.txt") colisionaran en el
+    cache, devolviendo el puntero "ya leiste esto" para un archivo que en
+    realidad nunca se leyo en ESE repo puntual."""
+    monkeypatch.setattr(ca, "_read_file_hashes", {})
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    (repo_a / "hello.txt").write_text("contenido identico")
+    (repo_b / "hello.txt").write_text("contenido identico")
+
+    result_a = ca.tool_read_file(str(repo_a), "hello.txt")
+    result_b = ca.tool_read_file(str(repo_b), "hello.txt")
+
+    assert result_a == "contenido identico"
+    assert result_b == "contenido identico"  # NO el puntero de dedup
+
+
 def test_tool_list_directory_lists_entries(tmp_path):
     (tmp_path / "a.txt").write_text("")
     (tmp_path / "subdir").mkdir()
