@@ -62,6 +62,24 @@ fi
 
 if [ -d "${TARGET_REPO_CLONE_DIR}/.git" ]; then
   echo "Ya existe un clon en ${TARGET_REPO_CLONE_DIR} -- actualizando en vez de reclonar."
+  # Bug real confirmado esta sesion (epica KAN-4, qwen3:8b -- la primera
+  # corrida que escribio cambios reales, bloqueada aca): el config SYSTEM de
+  # Git para Windows (`C:/Program Files/Git/etc/gitconfig`, NI --global NI
+  # --local, asi que un chequeo que solo mira esos dos lo pasa por alto) trae
+  # core.autocrlf=true -- el HOST escribe CRLF al hacer checkout, pero los
+  # blobs del repo guardan LF. El HOST ve el arbol limpio (su propio git
+  # tambien espera CRLF ahi), pero el chequeo de arbol sucio DENTRO del
+  # contenedor (git de Linux, sin esa conversion) comparaba los mismos bytes
+  # contra los blobs LF reales y encontraba CADA linea de varios archivos
+  # como "modificada" -- un falso "arbol sucio" real, no solo en package.json
+  # (confirmado con 'git diff' desde dentro de un contenedor real contra el
+  # mismo mount). El clone inicial ya evitaba esto con '-c core.autocrlf=false'
+  # (una bandera TRANSITORIA, valida solo para ESA invocacion) -- pero nunca
+  # quedaba persistida en el repo, asi que cualquier corrida que REUSARA el
+  # clon (el camino real de casi todas las corridas) volvia a heredar
+  # core.autocrlf=true del config system al hacer checkout/reset. Se
+  # persiste ANTES del checkout/reset que sigue, para que escriban LF real.
+  git -C "${TARGET_REPO_CLONE_DIR}" config core.autocrlf false
   git "${AUTH_ARGS[@]}" -C "${TARGET_REPO_CLONE_DIR}" fetch origin || fail "no se pudo hacer fetch en el clon existente"
   git -C "${TARGET_REPO_CLONE_DIR}" checkout "${TRUNK_BRANCH}" || fail "no se pudo hacer checkout de '${TRUNK_BRANCH}'"
   git -C "${TARGET_REPO_CLONE_DIR}" reset --hard "origin/${TRUNK_BRANCH}" || fail "no se pudo resetear a origin/${TRUNK_BRANCH}"
@@ -69,16 +87,34 @@ if [ -d "${TARGET_REPO_CLONE_DIR}/.git" ]; then
 else
   git "${AUTH_ARGS[@]}" -c core.autocrlf=false clone -q "${REPO_URL}" "${TARGET_REPO_CLONE_DIR}" \
     || fail "no se pudo clonar ${REPO_URL}"
+  # La bandera de arriba es transitoria (solo aplica al clone en si) -- se
+  # persiste tambien en el config local para que una corrida FUTURA que
+  # reuse este mismo clon (la rama de arriba) parta ya con el valor
+  # correcto, sin depender de que ese branch tambien lo setee.
+  git -C "${TARGET_REPO_CLONE_DIR}" config core.autocrlf false
 fi
 unset AUTH_HEADER
 
 # Bug real confirmado en vivo (operacion de esta noche): un clon fresco sin
 # identidad de git configurada crashea el primer 'git commit' real a mitad
 # de la corrida ("Author identity unknown").
-if [ -z "$(git -C "${TARGET_REPO_CLONE_DIR}" config --get user.name 2>/dev/null)" ]; then
+#
+# Segundo bug real confirmado esta sesion (epica KAN-4, qwen3:8b -- la
+# PRIMERA corrida que llego a escribir cambios reales de verdad, perdidos
+# aca): 'git config --get' (sin --local) resuelve tambien contra el config
+# GLOBAL del HOST (~/.gitconfig) -- en esta maquina eso ya tiene una
+# identidad real seteada, asi que el chequeo de abajo encontraba un valor
+# "no vacio" y NUNCA escribia nada en el config LOCAL del repo. El
+# contenedor (Docker-outside-of-Docker) no monta el ~/.gitconfig del host,
+# asi que adentro solo existe el config local -- vacio -- y el primer 'git
+# commit' real fallaba con "Author identity unknown", descartando un cambio
+# real que el agente si habia escrito. Se fuerza --local en el chequeo para
+# que refleje lo que el contenedor realmente va a ver, no lo que el host
+# resuelve via fallback global.
+if [ -z "$(git -C "${TARGET_REPO_CLONE_DIR}" config --local --get user.name 2>/dev/null)" ]; then
   git -C "${TARGET_REPO_CLONE_DIR}" config user.name "${GIT_AUTHOR_NAME:-poc-ai-agents}"
 fi
-if [ -z "$(git -C "${TARGET_REPO_CLONE_DIR}" config --get user.email 2>/dev/null)" ]; then
+if [ -z "$(git -C "${TARGET_REPO_CLONE_DIR}" config --local --get user.email 2>/dev/null)" ]; then
   git -C "${TARGET_REPO_CLONE_DIR}" config user.email "${GIT_AUTHOR_EMAIL:-poc@local}"
 fi
 

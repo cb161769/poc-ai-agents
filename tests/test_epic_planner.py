@@ -251,3 +251,26 @@ def test_plan_epic_still_falls_back_when_only_one_ollama_candidate(monkeypatch):
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 
     assert result["ordered_children"] == ["JIRA-1", "JIRA-2"]
+
+
+def test_system_prompt_teaches_scaffolding_dependency_distinct_from_graph_dependency():
+    """Gap real confirmado en una epica real (KAN-4): el prompt original solo
+    describia dependencia via el grafo Neo4j (entre componentes YA
+    EXISTENTES) -- nunca decia que una historia puede describir, en su
+    propio texto, que monta la estructura base que OTRA historia necesita
+    para poder trabajar (ej. "montar el proyecto Ionic" antes que "agregar
+    un Header"). Esa relacion es evidente del texto, no del grafo (la
+    estructura todavia no existe como nodo cuando se planifica), y el
+    prompt anterior nunca pedia buscarla -- confirmado real: una historia
+    de componente se intento antes que la historia de andamiaje, y quedo
+    bloqueada porque la estructura esperada no existia. Este test asegura
+    que la guia explicita sobre ese segundo tipo de dependencia no se
+    pierda en un futuro refactor del prompt.
+    """
+    prompt = epic_planner.EPIC_PLANNER_SYSTEM_PROMPT
+    assert "andamiaje" in prompt.lower() or "scaffolding" in prompt.lower()
+    assert "monta" in prompt.lower() or "estructura base" in prompt.lower()
+    # Sigue pidiendo no inventar relaciones de GRAFO sin evidencia -- ese
+    # criterio de cautela no debe desaparecer, solo dejar de aplicarse
+    # tambien al tipo de dependencia evidente del texto.
+    assert "no inventes relaciones" in prompt.lower()

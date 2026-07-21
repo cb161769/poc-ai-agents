@@ -568,8 +568,8 @@
     </div>
     <div class="svc-card" style="--svc-color:#3fb96a">
       <div class="svc-head"><span class="svc-name">ollama</span><span class="svc-port">:11434</span></div>
-      <div class="svc-desc">Backend fallback del agente juez si no hay ANTHROPIC_API_KEY — gratis, offline.</div>
-      <span class="svc-tag">ollama pull llama3.1</span>
+      <div class="svc-desc">Backend fallback del coding agent/juez/planificador de épicas si no hay ANTHROPIC_API_KEY — gratis, offline. Con thinking + model-switching + structured outputs reales (agent_loop.py) para modelos como qwen3.</div>
+      <span class="svc-tag">ollama pull qwen3:8b</span>
     </div>
     <div class="svc-card" style="--svc-color:#f0555a">
       <div class="svc-head"><span class="svc-name">falco</span><span class="svc-port">privileged</span></div>
@@ -580,6 +580,11 @@
       <div class="svc-head"><span class="svc-name">prefect-server</span><span class="svc-port">:4200</span></div>
       <div class="svc-desc">UI + API de Prefect. orchestration.py (host) le reporta cada corrida — reintentos por paso, estado persistido, grafo visual en vez de texto de terminal.</div>
       <span class="svc-tag">orchestration.py</span>
+    </div>
+    <div class="svc-card" style="--svc-color:#ff9f43">
+      <div class="svc-head"><span class="svc-name">pr-webhook</span><span class="svc-port">:8090</span></div>
+      <div class="svc-desc">FastAPI real: dispara el pipeline (Docker-outside-of-Docker) desde un comentario de PR de Azure DevOps, sin volver a la terminal. Detecta épicas solo, respuesta 200 no bloqueante.</div>
+      <span class="svc-tag">pr_webhook.py</span>
     </div>
   </div>
 </section>
@@ -711,7 +716,7 @@
       <div class="stage" style="--stage-color:#f0555a">
         <div class="stage-num">07</div>
         <div class="stage-card">
-          <div class="stage-title">Agente juez (Claude + MCP real)</div>
+          <div class="stage-title">Agente juez (Claude/Ollama + MCP real)</div>
           <div class="stage-desc">Corre en tu máquina (a diferencia del coding agent en la nube), así que se conecta de verdad a mcp-neo4j-cypher y mcp-server-qdrant para VERIFICAR el impacto y el histórico, no solo confiar en el texto. Ve tambien el resultado del testing agent. Audita tanto APPROVED como REJECTED, pero su poder es asimétrico: sobre APPROVED puede bloquear (comenta, transiciona, marca la rama); sobre REJECTED solo puede alertar — nunca revierte el rechazo del firewall. Backend Anthropic → Ollama local (ambos alcanzables desde run_poc_loop.sh y orchestration.py) → se omite sin frenar la corrida.</div>
           <div class="stage-io"><b>tools</b> neo4j-cypher · qdrant-rag <b>· out</b> judge_verdicts.jsonl</div>
         </div>

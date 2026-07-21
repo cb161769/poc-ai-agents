@@ -462,6 +462,10 @@
       <div class="proof-row"><span class="desc">El propio modelo local podía comitear por su cuenta vía shell — el chequeo original solo miraba el working tree y borraba la rama con el commit real adentro, creyendo que "no aplicó nada"</span><span class="fixed">Resuelto</span></div>
       <div class="proof-row"><span class="desc">CRLF introducido por Windows renormalizaba archivos ya trackeados y rompía el chequeo de árbol limpio en cada corrida real dentro de un contenedor Linux</span><span class="fixed">Resuelto</span></div>
       <div class="proof-row"><span class="desc">El cuerpo de la PR real volcaba el pedido original completo de la épica (miles de caracteres) en vez de describir el cambio real de esa rama</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">El chequeo de identidad de git resolvía contra el config GLOBAL del host aunque solo el config LOCAL del repo viaja dentro del contenedor — daba "todo OK" mientras el primer commit real del agente adentro fallaba con "Author identity unknown"</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">El `git push` a Azure DevOps no tenía NINGÚN wireado de credenciales — nunca se había llegado a abrir una PR real hasta encontrarlo</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">El reordenamiento real de historias por dependencia (Neo4j) nunca corría con éxito — el modelo de Ollama que usaba no estaba configurado explícitamente, así que alucinaba y degradaba en silencio al orden mecánico de Jira en cada corrida, sin ningún error visible</span><span class="fixed">Resuelto</span></div>
+      <div class="proof-row"><span class="desc">Un directorio de cache mal anclado (relativo al cwd del proceso, no al del módulo) terminó commiteando archivos de cache del propio pipeline dentro de una PR real del repo objetivo</span><span class="fixed">Resuelto</span></div>
     </div>
   </section>
 

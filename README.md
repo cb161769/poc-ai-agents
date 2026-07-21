@@ -81,12 +81,14 @@ output_guard.py                      Guardia de salida: mismas reglas del firewa
 judge_agent.py                       Agente juez independiente (segunda opinión, MCP real)
 epic_planner.py                      Planificador de épicas: orden real por dependencia + conflictos (§6.1)
 graph_writer.py                      Escribe cada corrida como evidencia real en el grafo de Neo4j (§8.1)
-agent_loop.py                        Maquinaria compartida de tool-calling (backend dual, MCP, prompt caching)
+agent_loop.py                        Maquinaria compartida de tool-calling (backend dual, MCP, prompt caching, thinking, structured outputs -- §11.1)
+conversation_memory.py               Compacta conversaciones largas y resume el contexto de una épica antes de sumarlo al prompt (§6.1)
 llm_backends.py                      Registro de backends LLM (orden de preferencia, pricing) -- ver §13.1
 coding_agent.py                      Agente de código local (Camino B1)
+pr_webhook.py                        Servicio FastAPI: dispara el pipeline real desde comentarios de PR de Azure DevOps (§6.7)
 chat.py                              Chat interactivo con el mismo backend dual + todas las tools (§14)
 figma_client.py                      Specs de Figma vía REST cuando el ticket trae un link
-cache_utils.py                       Cache genérico con TTL usado por los clientes reales
+cache_utils.py                       Cache genérico con TTL usado por los clientes reales (CACHE_DIR: dejalo vacío, ver .env.example)
 
 scripts/
   setup.sh                           Un solo comando: .env + infra + SONAR_TOKEN real + modelo Ollama
@@ -100,6 +102,7 @@ scripts/
   review_judge_verdicts.py           Curación humana de veredictos del juez
   promote_reviews_to_evals.py        Promueve revisiones humanas a casos de eval
   check_falco_alerts.py              Correlaciona alertas de Falco con la ventana de cada corrida
+  run_epic_dood.sh                   Corrida real de --epic vía Docker-outside-of-Docker (mounts, red de docker-compose, clonado autenticado -- §6.1.1)
 
 evals/
   judge_eval_cases.jsonl             Dataset etiquetado a mano para benchmarking del juez (con expected_policy_reference)
@@ -269,6 +272,18 @@ Validado en vivo contra `KAN-4`: Rovo detectó el meta-prompt y no lo siguió, e
 
 **Limitación real, a propósito no resuelta todavía**: el reordenamiento de `epic_planner.py` es hoy solo textual — cambia el orden en que el coding agent *lee* las historias en el prompt, pero el coding agent sigue recibiendo un único prompt combinado y decide su propio orden de ejecución interno. No hay enforcement real de secuencia (ej. aplicar la historia A, commitear, recién después empezar la B). Resolverlo bien implicaría partir el modo épica en llamadas secuenciales al coding agent, un cambio de arquitectura más grande que no se hizo todavía.
 
+**`EPIC_PLANNER_OLLAMA_MODEL` importa de verdad**: sin backend de Anthropic, `plan_epic()` cae al Ollama local -- si no seteás este override, usa el `OLLAMA_MODEL` genérico (default `llama3.1`), que en la práctica alucina seguido en esta tarea (ordenar JSON de tickets) y degrada silenciosamente al orden mecánico de Jira, sin ningún error visible. Gap real confirmado: una épica intentó aplicar una historia que agregaba un componente a un framework *antes* que la historia que montaba ese framework, porque el reordenamiento real nunca llegó a correr con éxito. Setealo igual que `CODING_AGENT_OLLAMA_MODEL`/`JUDGE_OLLAMA_MODEL` (§11.1).
+
+**El modo épica corta la corrida COMPLETA ante la primera falla real de una historia hija** -- no es un bug, es la decisión de diseño explícita de `_deliver_epic_sequential()` (`orchestration.py`): si los tests reales fallan, o el juez marca `FLAGGED`, la épica entera se detiene ahí (comentario + transición a `JIRA_BLOCKED_STATUS` en esa historia, las hermanas restantes quedan sin tocar) en vez de seguir aplicando más historias sobre una rama compartida que ya se sabe rota. Es más parecido a un gate estricto de CI que a un sprint real (donde una historia que falla no bloquea el trabajo de las demás) -- ver [PLAN.md](PLAN.md) si necesitás procesar historias independientes entre sí sin este acoplamiento.
+
+##### 6.1.1. Corriendo `--epic` real vía Docker-outside-of-Docker
+
+`scripts/run_epic_dood.sh <EPIC_KEY> [TARGET_REPO_GIT_URL]` encapsula una corrida real de `--epic` dentro de `Dockerfile.testrunner` (con `/var/run/docker.sock` montado, para que el coding agent pueda delegar tests a imágenes reales por stack -- §9): clona/actualiza un clon persistente (`TARGET_REPO_CLONE_DIR`, default `.dood-target-repo/`) con la credencial pasada vía `http.extraheader` (nunca embebida en la URL -- eso `git` la persiste en texto plano en `.git/config`), traduce paths para el daemon del HOST en Windows (`cygpath`), y corre `orchestration.py --epic` con las URLs de servicio reescritas a los nombres de contenedor del `docker-compose.yml` (`poc-neo4j`, `poc-ollama`, etc. -- dentro de ese contenedor, `localhost` es el contenedor mismo, no `docker-compose`).
+
+**Dos gotchas reales de Windows que este script resuelve, y que rompen si los tocás a mano**:
+- **`core.autocrlf`**: el config **SYSTEM** de Git para Windows (invisible a `git config --global`/`--local`, solo aparece con `--show-origin`) suele traer `core.autocrlf=true` -- el host escribe CRLF al hacer checkout, pero los blobs del repo guardan LF. El host ve el árbol limpio (su propio git también espera CRLF ahí), pero un contenedor Linux comparando los mismos bytes contra los blobs reales encuentra cada línea como "modificada" -- un falso "árbol sucio" real que bloqueaba el pipeline antes de tocar una sola historia. El script persiste `core.autocrlf=false` en el config **local** del clon (no alcanza con `-c core.autocrlf=false` en el `clone` inicial -- esa bandera es transitoria, no sobrevive a un `checkout`/`reset --hard` posterior).
+- **Identidad de git para el primer commit**: `git config --get user.name` (sin `--local`) también resuelve contra el config global del HOST -- si tu máquina ya tiene una identidad real seteada ahí, el chequeo de "¿hace falta configurar identidad?" da un falso positivo (encuentra *algo*, aunque el contenedor nunca vea ese config global) y nunca escribe nada en el config local del clon. El contenedor, sin `~/.gitconfig` montado, falla el primer `git commit` real con "Author identity unknown" -- descartando un cambio real que el agente sí había escrito. El script fuerza `--local` en ese chequeo.
+
 #### 6.2. `pipeline_shared.py` — una sola fuente de verdad entre los dos orquestadores
 
 `run_poc_loop.sh` (bash) y `orchestration.py` (Prefect) implementan el mismo pipeline dos veces, en dos lenguajes — un caso real de esto se desincronizó silenciosamente: `RETRYABLE_POLICY_REFERENCES` (qué categorías de veredicto `FLAGGED` del juez ameritan un reintento automático del coding agent) vivía definida tres veces — en `judge_agent.py`, duplicada a mano en `orchestration.py`, y duplicada a mano en un array bash en `run_poc_loop.sh`. La copia de Python tenía un test que la comparaba contra la original; la de bash no tenía ninguno, y nadie lo notó hasta que se auditó explícitamente. `pipeline_shared.py` es la fuente única ahora: `judge_agent.py`/`orchestration.py` la importan directo, `run_poc_loop.sh` la lee vía `python3 pipeline_shared.py retryable-policy-references` en vez de mantener su propia copia.
@@ -290,6 +305,10 @@ Hasta hace poco, el Camino B1 nunca pasaba de un commit local — ni un PR, ni n
 #### 6.6. Detección proactiva de si Copilot coding agent está habilitado de verdad
 
 Antes, la única forma de saber si el Copilot coding agent (Camino A) estaba realmente habilitado en `GITHUB_REPO` era crear un Issue y ver si la asignación fallaba — puro prueba y error. Ahora, tanto `check_prereqs.sh` como el propio pipeline consultan `Repository.suggestedActors` (GraphQL real de GitHub, capability `CAN_BE_ASSIGNED`) **antes** de crear el Issue — si el bot no aparece como asignable, avisa con un diagnóstico claro (revisar Settings → Copilot → Coding agent, plan Business/Enterprise) pero igual intenta crear+asignar (el chequeo puede tener falsos negativos por permisos del token, así que nunca bloquea el intento real).
+
+#### 6.7. `pr_webhook.py` — disparar el pipeline real desde un comentario de PR
+
+Servicio FastAPI standalone (`Dockerfile.webhook`, servicio `pr-webhook` del `docker-compose.yml`, puerto `:8090`) que escucha webhooks reales de Azure DevOps (`/webhooks/azure-devops`, protegido con `X-API-Key` si `PR_WEBHOOK_API_KEY` está seteada) sobre comentarios de Pull Request — permite pedirle una nueva corrida al pipeline sin volver a la terminal, comentando directo en la PR real. Detecta si el ticket referenciado es una Épica (`jira_client.fetch_ticket_live`, best-effort — ante cualquier falla, degrada al comportamiento de ticket individual en vez de bloquear la respuesta del webhook) y arma el comando `docker run` correspondiente (`--epic <KEY>` o `<KEY>` a secas) vía Docker-outside-of-Docker, igual que `scripts/run_epic_dood.sh`. El proceso disparado corre en un hilo demonio separado (`subprocess.Popen` + `.wait()` en background) para que el webhook responda `200` de inmediato sin bloquear, y sin dejar procesos zombie acumulándose en un servicio de larga duración.
 
 ### 7. Romper el flujo a propósito
 
@@ -394,6 +413,16 @@ docker exec poc-ollama ollama pull llama3.1
 ```
 Si cambiás `OLLAMA_MODEL` en `.env`, descargá ese modelo en su lugar. (`./scripts/setup.sh`/el servicio `ollama-pull` del `docker-compose.yml` hacen esto automáticamente.) Sin `ANTHROPIC_API_KEY` ni Ollama alcanzable (o ante cualquier falla de red al llamarlos), el juez se omite y la corrida sigue sin veredicto — nunca frena el pipeline por su ausencia.
 
+#### 11.1. Corriendo solo con Ollama (sin Anthropic) — qué mejora la confiabilidad real
+
+Confirmado en vivo esta sesión, con Anthropic sin crédito: `llama3.1` genérico casi nunca completa el loop de investigación con tools (ni el coding agent ni el juez). Tres mejoras reales, todas en `agent_loop.py`, compartidas por `coding_agent.py`/`judge_agent.py`/`epic_planner.py`:
+
+- **`CODING_AGENT_OLLAMA_MODEL`/`JUDGE_OLLAMA_MODEL`/`EPIC_PLANNER_OLLAMA_MODEL` aceptan una lista coma-separada de candidatos** (orden = prioridad, ej. `qwen3:8b,qwen2.5-coder:7b`) — cuando el modelo activo alucina (JSON inválido incluso tras su reintento de corrección, o reporta `blocked` citando su propia confusión de formato en vez de una razón real sobre el ticket), cada agente cambia UNA vez por corrida al siguiente candidato realmente descargado (`ollama pull`), en vez de rendirse directo. `qwen3` (`ollama pull qwen3:8b`) es el modelo que los propios docs de Ollama usan como ejemplo principal de tool-calling y de razonamiento -- mejor punto de partida que un modelo genérico o uno afinado solo para autocompletar código.
+- **Modo "thinking" real** (`OLLAMA_THINKING_ENABLED`, default `true`): para modelos que lo soportan (detectados por nombre — `qwen3`, `gpt-oss`, `deepseek-r1`, `deepseek-v3`), le da al modelo un espacio de razonamiento explícito (campo `thinking` de la respuesta, separado de `content`/`tool_calls` — no rompe nada del parseo existente) antes de decidir si llama una tool o responde ya. Confirmado en vivo: con esto, `qwen3:8b` pasó de nunca completar una investigación real a escribir y commitear cambios reales por primera vez en esta sesión.
+- **JSON restringido por esquema real, no solo "algo de JSON"**: el reintento de corrección (`_final_text_with_json_retry`) usaba `format: "json"` de Ollama — que solo garantiza JSON sintácticamente válido, no el esquema que cada agente realmente espera. Ahora, cuando el caller conoce su esquema exacto (`CODING_AGENT_RESULT_SCHEMA`/`JUDGE_RESULT_SCHEMA`), se lo pasa a Ollama vía `format` como JSON Schema real (structured outputs) — decodificación restringida al esquema exacto, no solo a "es JSON".
+
+Requiere al menos un modelo con tool-calling real descargado (`ollama pull qwen3:8b`) — `llama3.1` sigue siendo el default si no cambiás nada, pero no es el que se recomienda para investigar código sin Anthropic.
+
 **Sobre una corrida `APPROVED`**, si marca `FLAGGED` tiene poder real de bloqueo:
 - Deja un comentario fuerte en el ticket de Jira.
 - Mueve el ticket a `JIRA_BLOCKED_STATUS` (default `"Blocked"` — ajustalo a tu workflow).
@@ -494,6 +523,12 @@ Es intencional: el pipeline no quiere mezclar tus cambios sin commitear con lo q
 **Falco no arranca o no genera eventos en Windows.**
 Ver §10 — necesita el probe moderno de eBPF, que depende del kernel de la VM WSL2 de Docker Desktop. Si te bloquea, comentá el servicio `falco` en `docker-compose.yml`; el resto del pipeline sigue funcionando sin monitoreo a nivel de sistema.
 
+**El pipeline dice "árbol sucio" contra un repo objetivo que a vos te parece limpio (Windows + Docker-outside-of-Docker).**
+Ver §6.1.1 -- el config `core.autocrlf` a nivel SYSTEM de Git para Windows (invisible a `--global`/`--local`) suele convertir a CRLF al hacer checkout, mientras los blobs guardan LF; un contenedor Linux viendo el mismo bind mount encuentra cada línea como "modificada". `scripts/run_epic_dood.sh` ya lo resuelve solo; si armás tu propio comando `docker run` a mano, corré `git config core.autocrlf false` en el clon ANTES de cualquier `checkout`/`reset --hard`.
+
+**Un archivo `cache/*.json` aparece commiteado en el diff/PR real del repo objetivo.**
+`CACHE_DIR` en `.env` tiene que quedar **vacío** — `cache_utils.py` ancla el default al directorio del propio módulo (`repo/cache`), no al `cwd` del proceso que lo importa. Un valor tipo `./cache` se resuelve contra el `cwd` de quien corra el pipeline; dentro de Docker-outside-of-Docker eso es el repo OBJETIVO, no este repo, y termina commiteando el cache real del pipeline como si fuera parte del cambio. Confirmado real: pasó en una PR real de Azure DevOps.
+
 ## Limitaciones reales
 
 - **No detecta bugs por su cuenta**: la detección del problema sigue siendo humana (alguien escribe el ticket con evidencia real). El pipeline no monitorea microservicios en runtime.
@@ -504,3 +539,5 @@ Ver §10 — necesita el probe moderno de eBPF, que depende del kernel de la VM 
 - **Las épicas solo funcionan si todos los componentes hijos viven en el mismo repo** — el pipeline se niega a trabajar (no intenta "a medias") si detecta o no puede confirmar lo contrario.
 - **El juez puede omitirse sin bloquear la corrida** si no hay backend de modelo disponible — es una segunda opinión, no un gate obligatorio como el testing agent.
 - **No es un framework reusable fuera de este repo**: los building blocks (`jira_client.py`, `sonar_client.py`, `agent_loop.py`, etc.) están escritos para este pipeline específico, no como una librería genérica.
+- **Algunas llamadas de red vía `git`/`gh` en `orchestration.py` (push, `gh pr create`, `git pull`) no tienen timeout explícito todavía** -- si el remoto se cuelga, pueden mantener una task de Prefect abierta indefinidamente sin una señal distinta de "timeout" (a diferencia del subproceso del juez, que sí tiene `JUDGE_SUBPROCESS_TIMEOUT_SECONDS`). Gap real identificado, no bloqueante para uso normal, pendiente de la misma cota que ya tiene el juez.
+- **Ollama solo con modelos chicos (7-9B) tiene un techo real investigando repos desconocidos**, incluso con "thinking" y model-switching (§11.1) -- confirmado en vivo: puede bloquear correctamente (sin inventar) ante código genuinamente ambiguo o ausente, pero no siempre explora tan a fondo como Anthropic antes de rendirse. Modelos más grandes (`qwen3-coder:30b`+) existen pero típicamente superan la memoria default de Docker Desktop (~15-16 GB) -- necesitan subir ese límite a propósito.

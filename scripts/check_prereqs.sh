@@ -222,8 +222,16 @@ if [ -n "${TARGET_REPO_DIR_CHECK}" ] && git -C "${TARGET_REPO_DIR_CHECK}" rev-pa
   # no tener user.name/user.email configurados localmente -- el primer 'git
   # commit' real que intenta el coding agent tira CalledProcessError
   # ("Author identity unknown") recien A MITAD de una corrida real.
-  if [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --get user.name 2>/dev/null)" ] \
-     && [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --get user.email 2>/dev/null)" ]; then
+  #
+  # Segundo bug real confirmado esta sesion (epica KAN-4, qwen3:8b): 'git
+  # config --get' sin --local tambien resuelve contra el config GLOBAL del
+  # HOST (~/.gitconfig) -- este chequeo daba PASS (usando el fallback
+  # global del host) mientras el contenedor real (que no monta
+  # ~/.gitconfig) seguia sin identidad local, y el commit fallaba de
+  # verdad mas adelante pese al check verde. --local hace que el chequeo
+  # refleje lo que el contenedor realmente va a ver.
+  if [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --local --get user.name 2>/dev/null)" ] \
+     && [ -n "$(git -C "${TARGET_REPO_DIR_CHECK}" config --local --get user.email 2>/dev/null)" ]; then
     printf "  %s  %s\n" "${PASS}" "Identidad de git configurada (user.name/user.email)"
   else
     check "Identidad de git configurada (user.name/user.email)" "1" \
