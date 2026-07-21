@@ -625,12 +625,39 @@ check_copilot_assignable() {
 push_and_open_pr() {
   local branch="$1"
 
-  if ! git -C "${TARGET_REPO_DIR}" remote get-url origin >/dev/null 2>&1; then
+  local remote_url
+  remote_url=$(git -C "${TARGET_REPO_DIR}" remote get-url origin 2>/dev/null || echo "")
+  if [ -z "${remote_url}" ]; then
     echo "🔀 El repo objetivo no tiene un remote 'origin' configurado — la rama '${branch}' queda local, pusheala a mano."
     return 0
   fi
 
-  if ! git -C "${TARGET_REPO_DIR}" push -u origin "${branch}" 2>&1; then
+  # Bug real confirmado en vivo (epica KAN-4, sesion completa): "git push"
+  # ANTES no llevaba ninguna credencial -- contra el remote HTTPS real de
+  # Azure DevOps fallaba SIEMPRE en un contexto no interactivo (reproducido
+  # directo: "fatal: could not read Username... No such file or directory").
+  # Mismo fix ya aplicado en orchestration.py::push_and_open_pr -- portado
+  # aca porque run_poc_loop.sh es un segundo orquestador independiente (sin
+  # Prefect), no un wrapper de orchestration.py, y nunca lo habia recibido.
+  # Header inline via -c, NUNCA persistido en .git/config (embeber el PAT en
+  # la URL SI queda en texto plano ahi -- confirmado real esta sesion que el
+  # clasificador de seguridad de este mismo harness bloquea eso como fuga de
+  # credenciales).
+  local azure_org="" azure_project="" azure_repo=""
+  if [[ "${remote_url}" =~ dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+) ]]; then
+    azure_org="${BASH_REMATCH[1]}"
+    azure_project="${BASH_REMATCH[2]}"
+    azure_repo="${BASH_REMATCH[3]}"
+  fi
+
+  local push_git_args=(-C "${TARGET_REPO_DIR}")
+  if [ -n "${azure_org}" ] && [ -n "${AZURE_DEVOPS_PAT:-}" ]; then
+    local auth_header
+    auth_header="Authorization: Basic $(printf ':%s' "${AZURE_DEVOPS_PAT}" | base64 -w0 2>/dev/null || printf ':%s' "${AZURE_DEVOPS_PAT}" | base64)"
+    push_git_args+=(-c "http.extraheader=${auth_header}")
+  fi
+
+  if ! git "${push_git_args[@]}" push -u origin "${branch}" 2>&1; then
     echo "🔀 git push fallo — la rama '${branch}' queda local, pusheala a mano."
     return 0
   fi
@@ -640,6 +667,36 @@ push_and_open_pr() {
 
 ---
 Generado automaticamente por poc-ai-agents (run_poc_loop.sh) para el ticket Jira ${TICKET_ID} -- paso firewall, tests reales, y el agente juez independiente antes de llegar aca."
+
+  # Confirmado real esta sesion: "gh" JAMAS funciona contra Azure DevOps --
+  # sin este chequeo, la rama quedaba pusheada pero SIEMPRE degradaba a
+  # "abrilo a mano" para ese caso, pese a tener AZURE_DEVOPS_PAT real
+  # disponible. Abre la PR de verdad via la REST API real de Azure DevOps
+  # cuando el remote es de ese proveedor -- mismo endpoint que
+  # orchestration.py::push_and_open_pr ya usa.
+  if [ -n "${azure_org}" ]; then
+    if [ -z "${AZURE_DEVOPS_PAT:-}" ]; then
+      echo "🔀 Rama '${branch}' pusheada, pero AZURE_DEVOPS_PAT no esta seteada — abri el PR a mano."
+      post_jira_comment "🔀 Rama '${branch}' pusheada, pero AZURE_DEVOPS_PAT no esta seteada — abri el PR a mano."
+      return 0
+    fi
+    local pr_response pr_id
+    pr_response=$(curl -s -u ":${AZURE_DEVOPS_PAT}" -X POST \
+      "https://dev.azure.com/${azure_org}/${azure_project}/_apis/git/repositories/${azure_repo}/pullrequests?api-version=7.1" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -n --arg src "refs/heads/${branch}" --arg tgt "refs/heads/${base_branch}" --arg title "${SUMMARY}" --arg desc "${pr_body:0:4000}" \
+        '{sourceRefName: $src, targetRefName: $tgt, title: $title, description: $desc}')")
+    pr_id=$(echo "${pr_response}" | jq -r '.pullRequestId // empty')
+    if [ -n "${pr_id}" ]; then
+      pr_url="https://dev.azure.com/${azure_org}/${azure_project}/_git/${azure_repo}/pullrequest/${pr_id}"
+      echo "🔀 PR listo para review: ${pr_url}"
+      post_jira_comment "🔀 PR listo para review: ${pr_url}"
+    else
+      echo "🔀 Rama '${branch}' pusheada, pero Azure DevOps pull request create fallo — abrilo a mano. (${pr_response})"
+      post_jira_comment "🔀 Rama '${branch}' pusheada, pero Azure DevOps pull request create fallo — abrilo a mano."
+    fi
+    return 0
+  fi
 
   # cwd = TARGET_REPO_DIR (sin --repo explicito) para que gh auto-detecte el
   # owner/repo del remote local.
@@ -758,6 +815,26 @@ run_epic_etapas() {
   echo "Hijos encontrados: ${child_count}"
   if [ "${child_count}" -eq 0 ]; then
     fail "la epica ${EPIC_KEY} no tiene hijos segun el JQL configurado (JIRA_EPIC_LINK_JQL). Si tu proyecto Jira es 'company-managed', probablemente necesites el campo custom 'Epic Link' en vez de 'parent' -- ver README. Si la epica todavia no tiene historias hijas creadas, usa prompts/decompose_epic_with_rovo.md (Claude Code + Rovo) para descomponerla en historias reales antes de reintentar."
+  fi
+
+  # Gap real identificado en auditoria ("acordate de portar los fixes de
+  # orchestration.py a run_poc_loop.sh tambien"): este modo epica arma UN
+  # prompt combinado con TODAS las historias hijas adentro -- confirmado
+  # real esta misma sesion (epica KAN-4, 12 hijos) que un prompt combinado
+  # de ese tamano es demasiado para que un modelo local devuelva el JSON
+  # esperado, terminaba en {"status":"blocked","summary":""} sin aplicar
+  # nada. Ese hallazgo fue justamente lo que motivo construir
+  # _deliver_epic_sequential (procesa cada historia en su propio turno) del
+  # lado de orchestration.py -- pero run_poc_loop.sh (un segundo
+  # orquestador independiente, sin Prefect) nunca recibio ese rediseño, y
+  # portarlo tal cual a bash (memoria de conversacion entre historias,
+  # resumen del contexto de la epica, etc.) es un cambio de arquitectura
+  # mucho mas grande que un fix puntual. En vez de fallar en silencio como
+  # antes, esto avisa fuerte y redirige a la alternativa que SI tiene el
+  # rediseño real.
+  if [ "${child_count}" -gt 3 ]; then
+    echo "⚠️  ADVERTENCIA: ${EPIC_KEY} tiene ${child_count} historias hijas y este modo (run_poc_loop.sh --epic) arma UN prompt combinado con todas adentro -- confirmado real esta sesion que esto degrada/falla con modelos locales en epicas de este tamaño (>3 historias). Para una corrida real de una epica grande, usa 'python3 orchestration.py --epic ${EPIC_KEY}' en su lugar (procesa cada historia en su propio turno, con memoria acotada entre ellas). Continuando de todas formas en 10s -- Ctrl+C para cancelar."
+    sleep 10
   fi
 
   CHILD_TICKET_KEYS_JSON=$(echo "${epic_json}" | jq '[.children[].ticket_id]')
@@ -1152,7 +1229,19 @@ EOF
         git -C "${TARGET_REPO_DIR}" branch -D "${branch}" >/dev/null 2>&1
       fi
       echo "No hubo cambios que aplicar (Copilot no ejecuto ningun comando, el comando no modifico archivos, o el commit fallo)."
-      post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida."
+      # Gap real identificado en auditoria ("acordate de portar los fixes de
+      # orchestration.py a run_poc_loop.sh tambien"): coding_agent.py ya
+      # devuelve un "summary" real explicando por que no pudo aplicar nada
+      # (ver su propio schema), pero esto se descartaba -- el comentario
+      # solo decia "no aplico ningun cambio", sin ninguna razon real. Mismo
+      # fix ya aplicado en orchestration.py, portado aca. "${agent_result_json:-}"
+      # queda vacio en el camino B2 (gh copilot suggest no devuelve JSON
+      # estructurado), asi que cae al mensaje generico solo en ESE caso.
+      local no_op_reason="el agente no devolvio una razon"
+      if [ -n "${agent_result_json:-}" ]; then
+        no_op_reason=$(echo "${agent_result_json}" | jq -r '.summary // "el agente no devolvio una razon"')
+      fi
+      post_jira_comment "🤖 Copilot (automatizado, fallback local): AI Firewall aprobo la solicitud (redacciones: ${REDACTIONS}). Copilot no aplico ningun cambio en esta corrida. Razon real del agente: ${no_op_reason}"
       branch=""
       log_contribution "APPROVED" "${REDACTIONS}" true "${applied}" "${branch}" "null"
       run_judge "issue_only" "${SANITIZED}" "sin cambios aplicados"

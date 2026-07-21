@@ -57,6 +57,7 @@ from typing import Optional
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
+import jira_client
 from log_utils import get_logger
 from secrets_provider import get_secret
 
@@ -143,11 +144,35 @@ def _is_debounced(ticket_id: str) -> bool:
         return False
 
 
-def build_docker_run_command(ticket_id: str) -> list:
+def _is_epic_ticket(ticket_id: str) -> bool:
+    """Gap real identificado en auditoria ("acordate de los webhooks
+    tambien"): en modo epica secuencial (_deliver_epic_sequential), TODAS
+    las historias hijas comparten UNA sola rama, nombrada con la clave de
+    la EPICA (copilot/{epic_key}-{ts}), no de ningun hijo puntual. Un
+    comentario de revision real dejado en la PR de esa rama compartida hace
+    que extract_ticket_id_from_branch extraiga la clave de la EPICA -- sin
+    este chequeo, trigger_pipeline_for_ticket armaba SIEMPRE el comando en
+    modo ticket normal (sin --epic), que orchestration.py rechaza de
+    inmediato via _check_not_epic ("es una Epica -- correla con --epic").
+    100% reproducible, no un caso raro: CUALQUIER comentario de review real
+    en esa PR compartida fallaba asi. Best-effort: si la consulta a Jira
+    falla, degrada al comportamiento de siempre (modo ticket normal) en vez
+    de bloquear la respuesta del webhook.
+    """
+    try:
+        ticket = jira_client.fetch_ticket_live(ticket_id)
+        return (ticket.get("issue_type") or "").lower() == "epic"
+    except Exception as exc:
+        logger.warning(f"no se pudo determinar si {ticket_id} es una epica antes de disparar el pipeline: {exc}")
+        return False
+
+
+def build_docker_run_command(ticket_id: str, is_epic: bool = False) -> list:
     """Mismo comando Docker-outside-of-Docker usado manualmente toda esta
     sesion para invocar orchestration.py -- ver el resto de comentarios de
     esta sesion sobre HOST_TARGET_REPO_DIR y el mount de
     /var/run/docker.sock."""
+    ticket_args = ["--epic", ticket_id] if is_epic else [ticket_id]
     return [
         "docker", "run", "-i", "--rm", "--network", "poc-ai-agents_poc-net",
         "-v", f"{WEBHOOK_REPO_ROOT}:/repo",
@@ -157,12 +182,12 @@ def build_docker_run_command(ticket_id: str) -> list:
         "-e", f"HOST_TARGET_REPO_DIR={WEBHOOK_TARGET_REPO_DIR}",
         "-w", "/target-repo",
         "poc-ai-agents-testrunner",
-        "python3", "/repo/orchestration.py", ticket_id,
+        "python3", "/repo/orchestration.py", *ticket_args,
     ]
 
 
 def trigger_pipeline_for_ticket(ticket_id: str) -> None:
-    cmd = build_docker_run_command(ticket_id)
+    cmd = build_docker_run_command(ticket_id, is_epic=_is_epic_ticket(ticket_id))
     subprocess.Popen(cmd)  # no bloqueante -- el webhook ya respondio 200
 
 

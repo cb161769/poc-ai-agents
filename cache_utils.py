@@ -10,7 +10,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache"))
+# Bug real confirmado en vivo (epica KAN-4, PR real #243): "./cache" es
+# relativo al cwd del proceso que lo importa -- cuando orchestration.py
+# corre parado en el repo OBJETIVO (Docker-outside-of-Docker, -w /target-repo),
+# "./cache" resolvia DENTRO del repo objetivo, no de poc-ai-agents. Los
+# archivos de cache (Jira/Sonar/Figma/graph-query) terminaban commiteados
+# en la rama del coding agent junto con el codigo real -- confirmado real:
+# "cache/f05611a....json" aparecio commiteado en un PR real. Ancla siempre
+# al directorio de ESTE modulo, sin importar desde donde se importe.
+CACHE_DIR = Path(os.environ.get("CACHE_DIR") or (Path(__file__).resolve().parent / "cache"))
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "300"))
 
 

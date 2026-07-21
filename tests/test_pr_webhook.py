@@ -117,6 +117,55 @@ def test_build_docker_run_command_uses_real_dood_pattern(monkeypatch):
     assert cmd[-3:-1] == ["python3", "/repo/orchestration.py"]
 
 
+def test_build_docker_run_command_uses_epic_flag_when_is_epic_true(monkeypatch):
+    """Gap real identificado en auditoria ("acordate de los webhooks
+    tambien"): en modo epica secuencial, TODAS las historias hijas
+    comparten UNA sola rama nombrada con la clave de la EPICA, no de
+    ningun hijo puntual -- un comentario de review real en esa PR
+    compartida tiene que disparar 'orchestration.py --epic {epic_key}',
+    no 'orchestration.py {epic_key}' (que _check_not_epic rechaza
+    siempre)."""
+    monkeypatch.setattr(pr_webhook, "WEBHOOK_REPO_ROOT", "/c/real/poc-ai-agents")
+    monkeypatch.setattr(pr_webhook, "WEBHOOK_ENV_FILE", "/c/real/scratch/env")
+    monkeypatch.setattr(pr_webhook, "WEBHOOK_TARGET_REPO_DIR", "/c/real/scratch/ai-agents-code")
+
+    cmd = pr_webhook.build_docker_run_command("KAN-4", is_epic=True)
+
+    assert cmd[-3:] == ["/repo/orchestration.py", "--epic", "KAN-4"]
+
+
+def test_is_epic_ticket_true_for_real_epic(monkeypatch):
+    monkeypatch.setattr(pr_webhook.jira_client, "fetch_ticket_live", lambda ticket_key: {"issue_type": "Epic"})
+    assert pr_webhook._is_epic_ticket("KAN-4") is True
+
+
+def test_is_epic_ticket_false_for_regular_story(monkeypatch):
+    monkeypatch.setattr(pr_webhook.jira_client, "fetch_ticket_live", lambda ticket_key: {"issue_type": "Story"})
+    assert pr_webhook._is_epic_ticket("KAN-5") is False
+
+
+def test_is_epic_ticket_degrades_gracefully_on_jira_lookup_failure(monkeypatch):
+    """Best-effort real: si la consulta a Jira falla (red, credenciales),
+    esto degrada al comportamiento de siempre (modo ticket normal) en vez
+    de bloquear la respuesta del webhook."""
+    def raise_error(ticket_key):
+        raise RuntimeError("Jira no disponible")
+
+    monkeypatch.setattr(pr_webhook.jira_client, "fetch_ticket_live", raise_error)
+    assert pr_webhook._is_epic_ticket("KAN-4") is False
+
+
+def test_trigger_pipeline_for_ticket_uses_epic_command_for_epic_tickets(monkeypatch):
+    monkeypatch.setattr(pr_webhook, "_is_epic_ticket", lambda ticket_id: True)
+    captured = {}
+    monkeypatch.setattr(pr_webhook, "build_docker_run_command", lambda ticket_id, is_epic=False: captured.update(ticket_id=ticket_id, is_epic=is_epic) or ["echo", "noop"])
+    monkeypatch.setattr(pr_webhook.subprocess, "Popen", lambda cmd: None)
+
+    pr_webhook.trigger_pipeline_for_ticket("KAN-4")
+
+    assert captured == {"ticket_id": "KAN-4", "is_epic": True}
+
+
 def test_webhook_requires_header_when_api_key_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("PR_WEBHOOK_API_KEY", "test-secret-key")
     reloaded = importlib.reload(pr_webhook)

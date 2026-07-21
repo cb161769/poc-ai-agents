@@ -356,6 +356,135 @@ def test_build_user_prompt_omits_self_review_section_when_absent():
     assert "Autoevaluacion del coding agent" not in prompt
 
 
+def test_build_user_prompt_includes_epic_context_when_present():
+    """Gap real identificado en auditoria ("el juez necesita evaluar que
+    hay unit tests y que el codigo corresponde al ticket -- HISTORIA O
+    EPICA"): en modo epica secuencial, el juez evaluaba cada historia
+    contra SU PROPIA descripcion puntual -- nunca sabia que la epica
+    completa podia exigir un stack tecnico o requisitos de testing
+    especificos. Confirmado real: una epica que pedia 'Ionic Angular +
+    Capacitor' con tests unitarios obligatorios termino con un veredicto
+    OK sobre un frontend Vite/vitest sin un solo test."""
+    prompt = _build_user_prompt(
+        _base_judge_payload(
+            ticket={
+                "ticket_id": "T-1", "summary": "Fix login", "description": "desc",
+                "repository_origen": "AuthService",
+                "epic_context": "Stack requerido: Ionic Angular + Capacitor. Requiere pruebas unitarias.",
+            },
+        )
+    )
+
+    assert "Contexto general de la épica" in prompt
+    assert "Ionic Angular + Capacitor" in prompt
+
+
+def test_build_user_prompt_omits_epic_context_section_when_absent():
+    prompt = _build_user_prompt(_base_judge_payload())
+
+    assert "Contexto general de la épica" not in prompt
+
+
+def test_diff_changed_files_parses_real_unified_diff_headers():
+    diff_text = (
+        "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\n"
+        "new file mode 100644\n"
+        "diff --git a/frontend/package-lock.json b/frontend/package-lock.json\n"
+        "new file mode 100644\n"
+    )
+
+    files = judge_agent._diff_changed_files(diff_text)
+
+    assert files == ["frontend/src/components/button.ts", "frontend/package-lock.json"]
+
+
+def test_diff_changed_files_empty_for_no_diff():
+    assert judge_agent._diff_changed_files("") == []
+
+
+def test_test_coverage_evidence_flags_missing_tests_deterministically():
+    """Gap real identificado en auditoria ("el juez necesita evaluar que
+    hay unit tests"): 'insufficient-test-coverage' ya existia como
+    policy_reference, pero era PURAMENTE cualitativo -- dependia de que el
+    juez, por su cuenta, notara la ausencia de tests. Confirmado real: un
+    veredicto OK sobre botones/cards reales de una epica sin un solo
+    archivo de test, sin que el juez lo señalara. Esto lo detecta
+    deterministicamente a partir de los paths reales del diff."""
+    diff_text = (
+        "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\n"
+        "new file mode 100644\n"
+    )
+
+    evidence = judge_agent._test_coverage_evidence("local_diff", diff_text)
+
+    assert "NO incluye NINGUN archivo de test" in evidence
+    assert "frontend/src/components/button.ts" in evidence
+
+
+def test_test_coverage_evidence_recognizes_real_test_files():
+    diff_text = (
+        "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\n"
+        "new file mode 100644\n"
+        "diff --git a/frontend/src/components/button.test.ts b/frontend/src/components/button.test.ts\n"
+        "new file mode 100644\n"
+    )
+
+    evidence = judge_agent._test_coverage_evidence("local_diff", diff_text)
+
+    assert "SI incluye archivo(s) de test" in evidence
+    assert "button.test.ts" in evidence
+
+
+def test_test_coverage_evidence_ignores_lockfiles_and_docs_only_diffs():
+    diff_text = (
+        "diff --git a/README.md b/README.md\nindex a..b 100644\n"
+        "diff --git a/frontend/package-lock.json b/frontend/package-lock.json\nnew file mode 100644\n"
+    )
+
+    assert judge_agent._test_coverage_evidence("local_diff", diff_text) == ""
+
+
+def test_test_coverage_evidence_empty_for_issue_only_mode():
+    """Sin diff real (issue_only, el coding agent en la nube todavia no
+    tiene PR), no hay archivos que analizar -- nunca debe inventar
+    evidencia sobre un diff que no existe."""
+    diff_text = "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\n"
+
+    assert judge_agent._test_coverage_evidence("issue_only", diff_text) == ""
+
+
+def test_build_user_prompt_includes_test_coverage_section_when_tests_missing():
+    diff_text = "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\nnew file mode 100644\n"
+
+    prompt = _build_user_prompt(_base_judge_payload(change_source="local_diff", change_description=diff_text))
+
+    assert "Cobertura de tests del diff real" in prompt
+    assert "NO incluye NINGUN archivo de test" in prompt
+    assert "insufficient-test-coverage" in prompt
+
+
+def test_build_user_prompt_shows_positive_test_coverage_when_tests_present():
+    """La seccion tambien se muestra cuando SI hay tests reales -- es
+    evidencia positiva util para el juez, no solo una alerta de ausencia."""
+    diff_text = (
+        "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\nnew file mode 100644\n"
+        "diff --git a/frontend/src/components/button.test.ts b/frontend/src/components/button.test.ts\nnew file mode 100644\n"
+    )
+
+    prompt = _build_user_prompt(_base_judge_payload(change_source="local_diff", change_description=diff_text))
+
+    assert "Cobertura de tests del diff real" in prompt
+    assert "SI incluye archivo(s) de test" in prompt
+
+
+def test_build_user_prompt_omits_test_coverage_section_for_docs_only_diff():
+    diff_text = "diff --git a/README.md b/README.md\nindex a..b 100644\n"
+
+    prompt = _build_user_prompt(_base_judge_payload(change_source="local_diff", change_description=diff_text))
+
+    assert "Cobertura de tests del diff real" not in prompt
+
+
 def test_build_user_prompt_includes_falco_section_when_alerts_present():
     prompt = _build_user_prompt(
         _base_judge_payload(

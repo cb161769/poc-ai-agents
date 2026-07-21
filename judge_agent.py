@@ -405,6 +405,66 @@ JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE = (
 )
 
 
+# Gap real identificado en auditoria ("el juez necesita evaluar que hay
+# unit tests y que el codigo corresponde al ticket"): 'insufficient-test-
+# coverage' ya existe como policy_reference real, pero antes de esto era
+# PURAMENTE cualitativo -- dependia enteramente de que el juez, por su
+# propia cuenta, notara que un diff no tiene tests. Confirmado real: un
+# veredicto OK sobre un diff real (botones/cards/paginas de error de una
+# epica que exigia tests unitarios) sin un solo archivo de test, sin que
+# el juez lo señalara. Esto extrae, de forma DETERMINISTICA (no la
+# palabra del modelo), que archivos reales toco el diff y si alguno es un
+# archivo de test real -- mismo criterio que output_guard ya aplica
+# (un gate deterministico, no una esperanza de que el LLM se de cuenta).
+_TEST_FILE_PATTERN = re.compile(
+    r"(^|/)(test_[^/]*|[^/]*_test\.[^/]*|[^/]*\.test\.[^/]*|[^/]*\.spec\.[^/]*)$"
+    r"|(^|/)(tests?)/",
+    re.IGNORECASE,
+)
+# Archivos que nunca cuentan como "codigo real que ameritaria tests" --
+# lockfiles/artefactos generados, no logica escrita por el coding agent.
+_NON_SOURCE_FILE_PATTERN = re.compile(
+    r"(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Cargo\.lock)$"
+    r"|\.(md|txt|json|lock|log)$"
+    r"|(^|/)(\.last-run\.json)$",
+    re.IGNORECASE,
+)
+
+
+def _diff_changed_files(diff_text: str) -> list:
+    """Parsea los headers 'diff --git a/X b/Y' de un diff unificado real
+    -- devuelve el path del lado 'b/' (estado nuevo) de cada archivo
+    tocado. Best-effort: un diff sin ese header (formato inesperado)
+    devuelve [] en vez de lanzar.
+    """
+    if not diff_text:
+        return []
+    return re.findall(r"^diff --git a/.* b/(.+)$", diff_text, re.MULTILINE)
+
+
+def _test_coverage_evidence(change_source: str, diff_text: str) -> str:
+    if change_source != "local_diff":
+        return ""  # sin diff real (issue_only), no hay nada que analizar
+    changed_files = _diff_changed_files(diff_text)
+    if not changed_files:
+        return ""
+    test_files = [f for f in changed_files if _TEST_FILE_PATTERN.search(f)]
+    source_files = [
+        f for f in changed_files
+        if f not in test_files and not _NON_SOURCE_FILE_PATTERN.search(f)
+    ]
+    if not source_files:
+        return ""  # solo lockfiles/tests/docs tocados -- nada que evaluar aca
+    if test_files:
+        return f"El diff real SI incluye archivo(s) de test: {', '.join(test_files)}."
+    listed = ", ".join(source_files[:10]) + (", ..." if len(source_files) > 10 else "")
+    return (
+        f"El diff real NO incluye NINGUN archivo de test (revisado deterministicamente, "
+        f"no es la opinion del modelo) -- archivos de codigo real tocados sin test "
+        f"correspondiente: {listed}."
+    )
+
+
 def _build_user_prompt(payload: dict) -> str:
     reference_answer = payload.get("reference_answer")
     evaluation_mode = "reference_grounded" if reference_answer else "pointwise"
@@ -455,6 +515,28 @@ de que se haya considerado, marcá FLAGGED citando el policy_reference que \
 mejor aplique (probablemente scope-mismatch o graph-impact-unverified):
 {conflicts_list}"""
 
+    # Gap real identificado en auditoria ("el juez necesita evaluar que hay
+    # unit tests y que el codigo corresponde al ticket -- HISTORIA O
+    # EPICA"): en modo epica secuencial, cada historia hija se evalua
+    # contra SU PROPIA descripcion puntual -- el juez nunca sabia que la
+    # epica completa podia exigir un stack tecnico o requisitos de testing
+    # especificos (confirmado real: una epica que pedia "Ionic Angular +
+    # Capacitor" con tests unitarios obligatorios termino con un veredicto
+    # OK sobre un frontend Vite/vitest sin un solo test, porque nadie -- ni
+    # el coding agent, ni el juez -- vio esos requisitos). epic_context es
+    # un resumen ya generado (conversation_memory.summarize_epic_context),
+    # no el documento completo.
+    epic_context = payload["ticket"].get("epic_context")
+    epic_context_section = ""
+    if epic_context:
+        epic_context_section = f"""
+
+Contexto general de la épica de la que esta historia forma parte (requisitos \
+técnicos/de testing reales de la épica completa -- verificá explícitamente si \
+el cambio real de abajo los respeta, no solo los criterios de la historia \
+puntual):
+{epic_context}"""
+
     new_sonar_issues = payload.get("new_sonar_issues")
     new_sonar_issues_section = ""
     if new_sonar_issues:
@@ -466,6 +548,19 @@ previo usado como contexto -- estos hallazgos NO existían antes del diff, \
 los introdujo el cambio real). Considerálos como evidencia real, no como \
 deuda técnica preexistente del repo:
 {issues_list}"""
+
+    test_coverage_evidence = _test_coverage_evidence(payload.get("change_source"), payload.get("change_description", ""))
+    test_coverage_section = ""
+    if test_coverage_evidence:
+        test_coverage_section = f"""
+
+Cobertura de tests del diff real (chequeo DETERMINISTICO sobre los archivos \
+que el diff realmente toca, no la palabra del coding agent ni la tuya -- si \
+dice que NO hay tests, verificá explícitamente en tu razonamiento si este \
+cambio ameritaba uno, y si no hay evidencia de que sea intencional (ej. un \
+cambio puramente de configuración), marcá FLAGGED citando \
+insufficient-test-coverage):
+{test_coverage_evidence}"""
 
     change_source = payload.get("change_source")
     if change_source == "issue_only":
@@ -492,7 +587,7 @@ deuda técnica preexistente del repo:
 
 Ticket: {payload['ticket'].get('ticket_id')} — {payload['ticket'].get('summary')}
 Descripcion: {payload['ticket'].get('description')}
-Componente: {payload['ticket'].get('repository_origen')}
+Componente: {payload['ticket'].get('repository_origen')}{epic_context_section}
 
 Decision del firewall: {payload['firewall'].get('status')}
 Motivo (si rechazo): {payload['firewall'].get('reason')}
@@ -506,7 +601,7 @@ Resultado del testing agent (build/test real del modulo, ya corrio ANTES que \
 vos — si llego a esta etapa es porque paso, pero fijate si el alcance de los \
 tests es suficiente para el cambio real, no asumas que "paso" significa \
 "esta bien probado"):
-{payload.get('test_summary', 'sin tests corridos para esta corrida')}{self_review_section}{falco_section}{conflicts_section}{new_sonar_issues_section}{reference_section}"""
+{payload.get('test_summary', 'sin tests corridos para esta corrida')}{self_review_section}{falco_section}{conflicts_section}{new_sonar_issues_section}{test_coverage_section}{reference_section}"""
 
 
 async def judge_with_tools(payload: dict) -> dict:

@@ -130,6 +130,73 @@ def test_maybe_compact_conversation_returns_unchanged_when_summary_fails(monkeyp
     assert result == messages
 
 
+def test_summarize_epic_context_returns_short_description_unchanged(monkeypatch):
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_SUMMARY_THRESHOLD_CHARS", 1_000_000)
+    description = "Implementar Ionic Angular + Capacitor, con pruebas unitarias obligatorias."
+
+    assert cm.summarize_epic_context(description) == description
+
+
+def test_summarize_epic_context_empty_returns_empty():
+    assert cm.summarize_epic_context("") == ""
+
+
+def test_summarize_epic_context_disabled_returns_original(monkeypatch):
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_SUMMARY_ENABLED", False)
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_SUMMARY_THRESHOLD_CHARS", 1)  # estaria sobre el umbral si estuviera prendido
+    description = "x" * 100
+
+    assert cm.summarize_epic_context(description) == description
+
+
+def test_summarize_epic_context_calls_llm_when_over_threshold(monkeypatch):
+    """Gap real identificado en auditoria ("orquestacion... el contexto de
+    la epica tiene que ser mas eficiente en memoria"): una epic description
+    real puede ser un documento de miles de palabras (executive summary,
+    roadmap, matriz de riesgos, story points) -- mandarla ENTERA a cada
+    historia seria tan costoso como el problema que ya resuelve
+    maybe_compact_conversation del otro lado. Confirma que dispara un
+    resumen real (no un simple truncado) cuando supera el umbral."""
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_SUMMARY_THRESHOLD_CHARS", 50)
+
+    async def fake_summarize(description):
+        assert "Ionic Angular" in description
+        return "Stack requerido: Ionic Angular + Capacitor. Requiere pruebas unitarias."
+
+    monkeypatch.setattr(cm, "_summarize_epic_context_async", fake_summarize)
+
+    description = "Implementar Ionic Angular + Capacitor. " + "Contexto de negocio irrelevante. " * 10
+
+    result = cm.summarize_epic_context(description)
+
+    assert result == "Stack requerido: Ionic Angular + Capacitor. Requiere pruebas unitarias."
+
+
+def test_summarize_epic_context_falls_back_to_truncation_when_summary_fails(monkeypatch):
+    """Best-effort real: si la generacion del resumen falla (backend caido,
+    rechazo del modelo), esto cae a un truncado simple en vez de mandar el
+    documento entero sin comprimir -- nunca bloquea la corrida."""
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_SUMMARY_THRESHOLD_CHARS", 10)
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_TRUNCATE_CHARS", 20)
+
+    async def failing_summarize(description):
+        return None
+
+    monkeypatch.setattr(cm, "_summarize_epic_context_async", failing_summarize)
+
+    description = "x" * 100
+    result = cm.summarize_epic_context(description)
+
+    assert result.startswith("x" * 20)
+    assert "truncada" in result
+    assert len(result) < len(description)
+
+
+def test_truncate_epic_context_passes_through_short_text(monkeypatch):
+    monkeypatch.setattr(cm, "EPIC_CONTEXT_TRUNCATE_CHARS", 100)
+    assert cm._truncate_epic_context("texto corto") == "texto corto"
+
+
 def test_maybe_compact_conversation_returns_unchanged_when_no_safe_cutoff(monkeypatch):
     """Si TODO el historial son pares tool_use/tool_result (sin ningun
     punto seguro para cortar), mejor no tocar nada que corromper la

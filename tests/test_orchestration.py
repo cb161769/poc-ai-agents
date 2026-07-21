@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+import conversation_memory
 import orchestration
 from orchestration import (
     PipelineBlocked,
@@ -168,7 +169,7 @@ def test_git_add_all_excluding_vendor_skips_nested_node_modules(tmp_path):
     assert "node_modules" not in staged
 
 
-@pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__"])
+@pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__", "cache"])
 def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, vendor_dir):
     _init_real_git_repo(tmp_path)
     nested = tmp_path / vendor_dir / "some-file.txt"
@@ -612,6 +613,44 @@ def test_retry_local_diff_returns_new_verdict_when_retry_applies_changes(monkeyp
     )
 
     assert result == {"verdict": "OK", "reasoning": "corregido"}
+
+
+def test_retry_local_diff_includes_deterministic_test_coverage_evidence_in_feedback(monkeypatch):
+    """Gap real identificado en auditoria ("gaps en el flujo de jira"): el
+    chequeo deterministico de cobertura de tests (judge_agent.py) es
+    evidencia real (que archivo concreto no tiene test), pero antes de
+    esto solo se la dabamos al JUEZ -- el reintento del coding agent solo
+    recibia el "reasoning" libre del juez, que puede parafrasear vagamente
+    sin citar el archivo especifico (modelos locales ya confirmados poco
+    confiables citando evidencia esta sesion). Confirma que el feedback
+    del segundo intento incluye la evidencia deterministica tal cual."""
+    captured_feedback = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+        captured_feedback["text"] = feedback_text
+        return {"applied": True, "backend": "anthropic"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
+
+    diff_without_tests = (
+        "diff --git a/frontend/src/components/button.ts b/frontend/src/components/button.ts\n"
+        "new file mode 100644\n"
+    )
+
+    _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z", diff_text=diff_without_tests,
+    )
+
+    assert "EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS" in captured_feedback["text"]
+    assert "NO incluye NINGUN archivo de test" in captured_feedback["text"]
+    assert "frontend/src/components/button.ts" in captured_feedback["text"]
 
 
 def test_retry_local_diff_returns_none_when_no_new_changes(monkeypatch):
@@ -1421,6 +1460,169 @@ def test_handle_rejected_mirrors_blocked_transition_to_epic_children(monkeypatch
 
 def _fake_child(ticket_id: str, repo: str = "AuthService") -> dict:
     return {"ticket_id": ticket_id, "summary": f"summary {ticket_id}", "description": f"desc {ticket_id}", "repository_origen": repo}
+
+
+def test_deliver_epic_sequential_includes_epic_context_only_in_first_historia(monkeypatch):
+    """Gap real identificado en auditoria ("orquestacion... el contexto de
+    la epica tiene que ser mas eficiente en memoria"): child_prompt nunca
+    incluia epic["description"] -- confirmado real, una epica que pedia
+    'Ionic Angular + Capacitor' con tests unitarios obligatorios termino en
+    un frontend Vite/vitest sin un solo test, porque el coding agent nunca
+    vio esos requisitos. Se resume UNA vez y solo se prepende en la
+    PRIMERA historia que llega al coding agent -- las siguientes continuan
+    la MISMA conversacion (conversation_file), asi que ya lo vieron."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    firewall_prompts = []
+
+    def fake_firewall(prompt, jira_context, sonar_errors):
+        firewall_prompts.append(prompt)
+        return {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None}
+
+    monkeypatch.setattr(orchestration, "evaluate_firewall", fake_firewall)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_test_plan", lambda *a, **k: None)
+    monkeypatch.setattr(
+        conversation_memory, "summarize_epic_context",
+        lambda description: "STACK REQUERIDO: Ionic Angular + Capacitor. Requiere pruebas unitarias.",
+    )
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "checkpointhash\n" if cmd[-2:] == ["rev-parse", "HEAD"] else "diff")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main", "backend": "ollama", "conversation_file": "/tmp/c1.json", "self_review": {}},
+    )
+    monkeypatch.setattr(
+        orchestration, "retry_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}, "conversation_file": "/tmp/c2.json"},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "Ionic Angular + Capacitor requerido..." * 200}, children, "/repo",
+        ["--- AuthService ---\nsin dependencias"], ["--- AuthService ---\n"], [], "", [],
+    )
+
+    assert len(firewall_prompts) == 2
+    assert "STACK REQUERIDO: Ionic Angular + Capacitor" in firewall_prompts[0]
+    assert "Contexto general de la epica" in firewall_prompts[0]
+    assert "STACK REQUERIDO" not in firewall_prompts[1]
+    assert "Contexto general de la epica" not in firewall_prompts[1]
+
+
+def test_deliver_epic_sequential_passes_epic_context_to_judge(monkeypatch):
+    """Gap real identificado en auditoria ("el juez necesita evaluar que
+    hay unit tests y que el codigo corresponde al ticket -- HISTORIA O
+    EPICA"): el juez recibia el MISMO jira_context child-only que
+    child_prompt tenia antes del fix de epic_context_summary -- sin esto,
+    era estructuralmente incapaz de chequear si el cambio real respeta los
+    requisitos tecnicos/de testing de la epica completa (confirmado real:
+    un veredicto OK sobre un frontend sin un solo test, para una epica que
+    exigia 'Ionic Angular + Capacitor' con tests unitarios obligatorios).
+    """
+    children = [_fake_child("C-1")]
+    judge_calls = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_test_plan", lambda *a, **k: None)
+    monkeypatch.setattr(
+        conversation_memory, "summarize_epic_context",
+        lambda description: "STACK REQUERIDO: Ionic Angular + Capacitor. Requiere pruebas unitarias.",
+    )
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "checkpointhash\n" if cmd[-2:] == ["rev-parse", "HEAD"] else "diff")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main", "backend": "ollama", "conversation_file": "/tmp/c1.json", "self_review": {}},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+
+    def fake_judge_safe(jira_context, *a, **k):
+        judge_calls.append(jira_context)
+        return {"verdict": "OK", "reasoning": "todo bien"}
+
+    monkeypatch.setattr(orchestration, "_run_judge_safe", fake_judge_safe)
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "Ionic Angular + Capacitor requerido..." * 200}, children, "/repo",
+        ["--- AuthService ---\nsin dependencias"], ["--- AuthService ---\n"], [], "", [],
+    )
+
+    assert len(judge_calls) == 1
+    assert judge_calls[0]["epic_context"] == "STACK REQUERIDO: Ionic Angular + Capacitor. Requiere pruebas unitarias."
+
+
+def test_deliver_epic_sequential_passes_epic_context_to_test_plan_every_time(monkeypatch):
+    """A diferencia de child_prompt, generate_test_plan es un generador SIN
+    memoria propia (se regenera desde cero en cada historia) -- necesita el
+    contexto de la epica en CADA llamado, no solo en el primero."""
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+    test_plan_evidences = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.jira_client, "test_plan_already_posted", lambda ticket_key: True)  # no hace falta postear para este test
+    monkeypatch.setattr(
+        conversation_memory, "summarize_epic_context",
+        lambda description: "STACK REQUERIDO: Ionic Angular + Capacitor.",
+    )
+
+    def fake_generate_test_plan(evidence):
+        test_plan_evidences.append(evidence)
+        return None
+
+    monkeypatch.setattr(orchestration, "generate_test_plan", fake_generate_test_plan)
+    monkeypatch.setattr(orchestration, "_run", lambda cmd, **k: "checkpointhash\n" if cmd[-2:] == ["rev-parse", "HEAD"] else "diff")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main", "backend": "ollama", "conversation_file": "/tmp/c1.json", "self_review": {}},
+    )
+    monkeypatch.setattr(
+        orchestration, "retry_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}, "conversation_file": "/tmp/c2.json"},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "Ionic Angular + Capacitor requerido..." * 200}, children, "/repo",
+        ["--- AuthService ---\nsin dependencias"], ["--- AuthService ---\n"], [], "", [],
+    )
+
+    assert len(test_plan_evidences) == 2
+    assert all(e["contexto_de_la_epica"] == "STACK REQUERIDO: Ionic Angular + Capacitor." for e in test_plan_evidences)
 
 
 def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch):

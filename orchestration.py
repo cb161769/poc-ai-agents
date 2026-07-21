@@ -73,6 +73,7 @@ import conversation_memory
 import epic_planner
 import graph_writer
 import jira_client
+import judge_agent
 import output_guard
 from cache_utils import cached_call
 from coding_agent import _STACK_MARKERS
@@ -1239,8 +1240,14 @@ def _local_coding_agent_backend_available() -> bool:
 # Directorios reales de dependencias/build que un marcador de proyecto
 # (pom.xml, go.mod, package.json, etc.) puede aparecer DENTRO de, sin ser un
 # proyecto real duplicado (ej. un modulo vendoreado) -- se excluyen ademas
-# de .git/node_modules para no generar falsos positivos.
-_SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__"}
+# de .git/node_modules para no generar falsos positivos. Tambien es la
+# lista que _git_add_all_excluding_vendor() usa para el pathspec de
+# exclusion real -- "cache" se agrego aca tras un bug real confirmado en
+# vivo (PR #243, epica KAN-4): cache_utils.CACHE_DIR resolvia relativo al
+# cwd del proceso (bug YA arreglado ahi), pero esto queda como defensa en
+# profundidad -- si algun cache futuro vuelve a escribir dentro del repo
+# objetivo por cualquier motivo, no termina commiteado igual.
+_SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__", "cache"}
 
 
 def _git_add_all_excluding_vendor(target_repo_dir: str) -> None:
@@ -2188,6 +2195,7 @@ def _retry_local_diff(
     child_ticket_keys: list | None,
     falco_since: str,
     conflicts: list | None = None,
+    diff_text: str = "",
 ) -> dict | None:
     """Le da al coding agent un segundo (y ultimo) intento cuando el primer
     veredicto fue FLAGGED con un policy_reference retryable -- reusa la
@@ -2200,6 +2208,19 @@ def _retry_local_diff(
     """
     reasoning = judge_verdict.get("reasoning", "")
     feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+    # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
+    # chequeo deterministico de cobertura de tests (judge_agent.py) es
+    # evidencia REAL (que archivos concretos no tienen test), pero solo se
+    # la dabamos al JUEZ -- el reintento del coding agent solo recibia el
+    # "reasoning" libre del juez, que puede parafrasear vagamente ("faltan
+    # tests") sin citar los archivos concretos, sobre todo con modelos
+    # locales (ya confirmado poco confiables citando evidencia especifica
+    # esta sesion). Agregar la evidencia deterministica tal cual asegura
+    # que el segundo intento sepa EXACTAMENTE que archivo necesita test,
+    # sin depender de que el juez lo haya parafraseado bien.
+    test_coverage_evidence = judge_agent._test_coverage_evidence("local_diff", diff_text) if diff_text else ""
+    if test_coverage_evidence:
+        feedback_text += f"\n\n--- EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS ---\n{test_coverage_evidence}"
     # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
     # a mandar sanitized + feedback desde cero (compatibilidad con corridas
     # que no lo generaron).
@@ -2526,7 +2547,7 @@ def _deliver(
                 retried_verdict = _retry_local_diff(
                     ticket_id, sanitized, target_repo_dir, agent_result, judge_verdict,
                     jira_context, firewall_result, components, summary,
-                    is_epic, child_ticket_keys, falco_since, conflicts=conflicts,
+                    is_epic, child_ticket_keys, falco_since, conflicts=conflicts, diff_text=diff_text,
                 )
                 if retried_verdict is not None:
                     judge_verdict = retried_verdict
@@ -2721,6 +2742,15 @@ def _deliver_epic_sequential(
     coordination_section = f"\n--- Notas de coordinacion del planificador ---\n{coordination_notes}" if coordination_notes else ""
     graph_text = "\n".join(graph_parts)
     sonar_text = "\n".join(sonar_parts)
+    # Gap real identificado en auditoria ("orquestacion... el contexto de
+    # la epica tiene que ser mas eficiente en memoria"): ninguna historia
+    # hija veia epic["description"] -- confirmado real, una epica que pedia
+    # "Ionic Angular + Capacitor" con tests unitarios obligatorios termino
+    # en un frontend Vite/vitest sin un solo test, porque el coding agent
+    # nunca vio esos requisitos. Se resume UNA sola vez aca (no una vez por
+    # historia -- ver conversation_memory.summarize_epic_context) y se
+    # reusa el mismo resultado para toda la epica.
+    epic_context_summary = conversation_memory.summarize_epic_context(epic.get("description", ""))
 
     branch = None
     base_branch = None
@@ -2740,7 +2770,18 @@ def _deliver_epic_sequential(
         # ESTE hijo, en cada uno de los 3 puntos de corte de abajo.
         siblings_remaining = [c["ticket_id"] for c in ordered_children[child_index + 1:]]
         siblings_remaining_text = ", ".join(siblings_remaining) if siblings_remaining else "ninguna"
+        # El contexto de la epica solo se prepende en la PRIMERA historia
+        # que realmente llega al coding agent (branch todavia None) -- las
+        # siguientes continuan la MISMA conversacion (conversation_file), asi
+        # que ya lo vieron una vez; repetirlo en cada historia inflaria el
+        # transcript exactamente en la forma que maybe_compact_conversation
+        # existe para evitar.
+        epic_context_section = (
+            f"--- Contexto general de la epica (para entender el objetivo completo -- "
+            f"la tarea real es la historia de arriba, no esto) ---\n{epic_context_summary}\n\n"
+        ) if branch is None and epic_context_summary else ""
         child_prompt = (
+            f"{epic_context_section}"
             f"Historia {child_id} de la epica {epic_key} ({child['repository_origen']}): {child['summary']}\n"
             f"{child['description']}\n"
             f"{coordination_section}"
@@ -2755,6 +2796,16 @@ def _deliver_epic_sequential(
             "repository_origen": child["repository_origen"],
             "status": child.get("status"),
             "sprint": child.get("sprint"),
+            # Gap real identificado en auditoria ("el juez necesita evaluar
+            # que hay unit tests y que el codigo corresponde al ticket -- U
+            # HISTORIA O EPICA"): el juez recibia el MISMO jira_context
+            # child-only que child_prompt tenia antes del fix de
+            # epic_context_summary -- sin esto, era ESTRUCTURALMENTE
+            # incapaz de chequear "esto cumple el requisito de Ionic
+            # Angular + Capacitor de la epica" porque nunca se le conto que
+            # ese requisito existia. Reusa el mismo resumen ya computado
+            # UNA vez para toda la epica (ver epic_context_summary arriba).
+            "epic_context": epic_context_summary,
         }
         components = [child["repository_origen"]]
 
@@ -2776,8 +2827,13 @@ def _deliver_epic_sequential(
 
         # Testing Agent liviano -- mismo criterio que _deliver(), por hijo,
         # incluida la deduplicacion cross-corrida (ver comentario en _deliver).
+        # A diferencia de child_prompt (que solo lleva el contexto de la
+        # epica en la PRIMERA historia, reusando la conversacion), esto se
+        # regenera desde cero en CADA historia (sin memoria propia), asi
+        # que necesita el contexto de la epica en cada llamado.
         test_plan = generate_test_plan({
             "ticket": child_id, "resumen": child["summary"], "descripcion": child.get("description", ""),
+            "contexto_de_la_epica": epic_context_summary,
         })
         if test_plan and not jira_client.test_plan_already_posted(child_id):
             comment_jira(f"🧪 Test Plan (Prefect):\n\n{test_plan}", ticket_key=child_id)
@@ -2902,7 +2958,7 @@ def _deliver_epic_sequential(
             retried_verdict = _retry_local_diff(
                 child_id, sanitized, target_repo_dir, agent_result, judge_verdict,
                 jira_context, firewall_result, components, child["summary"],
-                False, None, falco_since, conflicts=conflicts,
+                False, None, falco_since, conflicts=conflicts, diff_text=diff_text,
             )
             if retried_verdict is not None:
                 judge_verdict = retried_verdict
