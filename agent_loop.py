@@ -609,6 +609,18 @@ async def _call_model_turn(
                     f"ollama ({ollama_model}): se ofrecieron {len(offered_tool_names)} tool(s) y no se uso "
                     "ninguna, y la respuesta tampoco es JSON valido -- posible alucinacion sin verificar con tools."
                 )
+                # Gap real confirmado en vivo (epica KAN-4, qwen3:8b): este
+                # patron se repitio 11 veces seguidas en una conversacion
+                # continuada entre historias -- el campo "thinking" (cuando
+                # el modelo lo soporta) llega en la respuesta pero antes
+                # nunca se inspeccionaba ni se logueaba, asi que no habia
+                # forma de saber QUE estaba "pensando" el modelo en el
+                # momento de fabricar la respuesta sin reproducirlo a
+                # ciegas. Se trunca (no es para auditoria estructurada,
+                # solo diagnostico puntual de un incidente real).
+                thinking = (data.get("message", {}) or {}).get("thinking")
+                if thinking:
+                    logger.warning(f"ollama ({ollama_model}): contenido de 'thinking' en ese turno: {thinking[:500]!r}")
 
         return blocks, stop_reason, usage
 
@@ -770,7 +782,17 @@ def compact_old_tool_results(messages: list, read_only_tool_names: set, keep_las
 _CONTEXT_SIZE_WARNING_CHARS_OVERRIDE = os.environ.get("CONTEXT_SIZE_WARNING_CHARS")
 
 
-def _context_warning_threshold_chars(backend: str) -> int:
+def context_warning_threshold_chars(backend: str) -> int:
+    """Estimacion honesta por caracteres (~4/token) de cuanto entra en la
+    ventana de contexto REAL del backend dado -- reusada por
+    conversation_memory.py para alinear su umbral de compactacion a esto
+    mismo (antes tenia un umbral fijo propio, mas alto que lo que realmente
+    entra en OLLAMA_NUM_CTX, asi que la compactacion nunca llegaba a
+    activarse antes de que el contexto real ya se hubiera desbordado --
+    bug real confirmado en vivo, epica KAN-4: 11 historias seguidas
+    devolvieron "done" fabricado, sin una sola tool call, una vez que la
+    conversacion continuada acumulo mas texto del que el modelo realmente
+    podia ver)."""
     if _CONTEXT_SIZE_WARNING_CHARS_OVERRIDE:
         return int(_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE)
     context_tokens = MODEL_LIMITS.get(backend, {}).get("context_window_tokens") or OLLAMA_NUM_CTX
@@ -791,7 +813,7 @@ def warn_if_context_large(messages: list, logger, label: str, backend: str = "ol
     de compact_old_tool_results() para medir lo que efectivamente se va a
     reenviar en el proximo turno.
     """
-    threshold = _context_warning_threshold_chars(backend)
+    threshold = context_warning_threshold_chars(backend)
     estimated_chars = _estimate_message_chars(messages) + len(system_prompt)
     if estimated_chars > threshold:
         logger.warning(

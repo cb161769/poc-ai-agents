@@ -1586,7 +1586,8 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
 
 @task(retries=0, name="coding-agent-local-real-retry")
 def retry_coding_agent_local_real(
-    ticket_id: str, feedback_text: str, target_repo_dir: str, conversation_file: str | None = None
+    ticket_id: str, feedback_text: str, target_repo_dir: str, conversation_file: str | None = None,
+    reset_investigation_state: bool = False,
 ) -> dict:
     """Segundo pase de Camino B1 tras un veredicto FLAGGED retryable --
     reusa la rama que el primer intento ya dejo checked out (NO crea una
@@ -1596,6 +1597,18 @@ def retry_coding_agent_local_real(
     nuevo -- evita repagar la investigacion ya hecha. Sin conversation_file
     (corrida vieja o el primer intento no la genero), cae al comportamiento
     anterior: manda el prompt original + feedback desde cero.
+
+    reset_investigation_state: True SOLO cuando este llamado mueve la
+    conversacion a una historia NUEVA (no un reintento por feedback del
+    juez/tests sobre el MISMO ticket) -- _deliver_epic_sequential() lo pasa
+    asi. Bug real confirmado en vivo (epica KAN-4, qwen3:8b): haber
+    investigado los archivos del ticket A no significa haber investigado
+    los del ticket B, pero has_investigated/listed_dirs viajaban intactos
+    de una historia a la siguiente igual, dejando que el modelo se salte el
+    gate real de "investiga antes de escribir" para una historia que nunca
+    miro. read_file_hashes/consulted_risk_graph SI siguen siendo validos
+    entre historias (son sobre contenido real del repo, no sobre "ya mire
+    lo que hace falta para ESTE ticket puntual") -- no se tocan.
     """
     payload = {"ticket_id": ticket_id, "target_repo_dir": target_repo_dir}
     if conversation_file and Path(conversation_file).exists():
@@ -1610,7 +1623,7 @@ def retry_coding_agent_local_real(
         # la generacion del resumen falla, devuelve los mensajes tal cual.
         payload["resume_messages"] = conversation_memory.maybe_compact_conversation(conversation_state.get("messages", []))
         payload["resume_state"] = {
-            "has_investigated": conversation_state.get("has_investigated", False),
+            "has_investigated": False if reset_investigation_state else conversation_state.get("has_investigated", False),
             "has_run_verification": conversation_state.get("has_run_verification", False),
             "initial_plan": conversation_state.get("initial_plan"),
             # Gap real (usuario, "hay gaps en el coding agent"): antes se
@@ -1624,7 +1637,10 @@ def retry_coding_agent_local_real(
             # listaron -- el gate anti-duplicacion de scaffolding
             # (coding_agent.py) volvia a exigir list_directory de cero en
             # cada turno nuevo, aunque el turno anterior ya lo hubiera hecho.
-            "listed_dirs": conversation_state.get("listed_dirs", []),
+            # (reset_investigation_state=True lo vacia por el mismo motivo
+            # que has_investigated: son directorios investigados para OTRO
+            # ticket.)
+            "listed_dirs": [] if reset_investigation_state else conversation_state.get("listed_dirs", []),
             # Gap real identificado en auditoria ("orquestacion... necesita
             # cache"): sin esto, cada reintento/historia releia archivos ya
             # leidos en un turno anterior de la MISMA conversacion, inflando
@@ -2229,6 +2245,8 @@ def _retry_local_diff(
     falco_since: str,
     conflicts: list | None = None,
     diff_text: str = "",
+    branch: str | None = None,
+    base_branch: str | None = None,
 ) -> dict | None:
     """Le da al coding agent un segundo (y ultimo) intento cuando el primer
     veredicto fue FLAGGED con un policy_reference retryable -- reusa la
@@ -2238,7 +2256,23 @@ def _retry_local_diff(
     hubo cambios nuevos (el llamador se queda con el veredicto original).
     Si los tests fallan en el reintento, bloquea directo (mismo criterio
     que el primer intento) en vez de devolver un veredicto.
+
+    branch/base_branch: opcionales -- si no se pasan, se leen de
+    agent_result (comportamiento historico, valido en _deliver() porque ahi
+    agent_result SIEMPRE viene de run_coding_agent_local_real(), que si los
+    incluye). Bug real confirmado en vivo (epica KAN-4): en
+    _deliver_epic_sequential(), agent_result se REASIGNA en cada historia a
+    lo que devuelve retry_coding_agent_local_real() (historias 2+), que por
+    diseño NUNCA incluye "branch"/"base_branch" (reusa la rama que la
+    PRIMERA historia dejo checked out, nunca crea una nueva) -- leerlos de
+    agent_result ahi crasheaba con KeyError('branch') apenas el juez
+    marcaba FLAGGED retryable en cualquier historia despues de la primera.
+    _deliver_epic_sequential() los pasa explicitos (los tiene en sus propias
+    variables de loop, que SI persisten bien entre historias) en vez de
+    confiar en que agent_result los tenga.
     """
+    branch = branch if branch is not None else agent_result["branch"]
+    base_branch = base_branch if base_branch is not None else agent_result["base_branch"]
     reasoning = judge_verdict.get("reasoning", "")
     feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
     # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
@@ -2272,9 +2306,8 @@ def _retry_local_diff(
         print("El segundo intento no produjo cambios nuevos -- se mantiene el veredicto FLAGGED original.")
         return None
 
-    branch = agent_result["branch"]
     return _evaluate_new_diff_after_retry(
-        ticket_id, branch, agent_result["base_branch"], retry_result.get("backend"), retry_result.get("self_review"),
+        ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
         target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
         "segundo intento", conflicts=conflicts,
     )
@@ -2888,8 +2921,13 @@ def _deliver_epic_sequential(
             branch = agent_result.get("branch")
             base_branch = agent_result.get("base_branch")
         else:
+            # reset_investigation_state=True: esto mueve la conversacion a
+            # la SIGUIENTE historia de la epica (no es un reintento por
+            # feedback sobre el ticket anterior) -- haber investigado los
+            # archivos de la historia previa no dice nada sobre esta.
             agent_result = retry_coding_agent_local_real(
-                epic_key, sanitized, target_repo_dir, conversation_file=conversation_file
+                epic_key, sanitized, target_repo_dir, conversation_file=conversation_file,
+                reset_investigation_state=True,
             )
         conversation_file = agent_result.get("conversation_file")
         backend = agent_result.get("backend") or backend
@@ -2990,10 +3028,16 @@ def _deliver_epic_sequential(
             and judge_verdict.get("policy_reference") in RETRYABLE_POLICY_REFERENCES
         ):
             print(f"🔁 {child_id}: el juez marco {judge_verdict.get('policy_reference')} -- segundo intento.")
+            # branch/base_branch explicitos (variables de loop de esta
+            # funcion, no de agent_result -- ver docstring de
+            # _retry_local_diff): agent_result puede venir de
+            # retry_coding_agent_local_real() en historias 2+, que nunca
+            # incluye esas claves.
             retried_verdict = _retry_local_diff(
                 child_id, sanitized, target_repo_dir, agent_result, judge_verdict,
                 jira_context, firewall_result, components, child["summary"],
                 False, None, falco_since, conflicts=conflicts, diff_text=diff_text,
+                branch=branch, base_branch=base_branch,
             )
             if retried_verdict is not None:
                 judge_verdict = retried_verdict

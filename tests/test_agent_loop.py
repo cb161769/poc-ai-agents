@@ -448,6 +448,59 @@ def test_call_model_turn_ollama_warns_when_tools_offered_but_ignored_and_not_jso
     assert any("posible alucinacion" in w for w in warnings)
 
 
+def test_call_model_turn_ollama_logs_thinking_content_on_hallucination(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): este patron de
+    alucinacion se repitio 11 veces seguidas en una conversacion continuada
+    entre historias, sin ninguna forma de saber que estaba "pensando" el
+    modelo en el momento real -- el campo "thinking" (cuando el modelo lo
+    soporta) llegaba en la respuesta pero nunca se inspeccionaba ni se
+    logueaba. Confirma que ahora se loguea (truncado) junto al warning de
+    alucinacion que ya existe.
+    """
+    async def fake_post(url, **kwargs):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "message": {"content": "che, dejame pensarlo un toque", "thinking": "Estoy pensando en como resolver esto..."},
+            "prompt_eval_count": 1, "eval_count": 1,
+        }
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert any("Estoy pensando en como resolver esto" in w for w in warnings)
+
+
+def test_call_model_turn_ollama_no_thinking_log_when_field_absent(monkeypatch):
+    """Sin campo 'thinking' en la respuesta (modelo que no lo soporta), no
+    debe intentar loguearlo -- solo el warning de alucinacion de siempre.
+    """
+    async def fake_post(url, **kwargs):
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"message": {"content": "che, dejame pensarlo un toque"}, "prompt_eval_count": 1, "eval_count": 1}
+        return resp
+
+    client = MagicMock()
+    client.post = fake_post
+    warnings = []
+    monkeypatch.setattr(agent_loop.logger, "warning", lambda msg: warnings.append(msg))
+
+    tools = [{"name": "read_file", "description": "lee un archivo", "input_schema": {"type": "object"}}]
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], tools, "sys"))
+
+    assert len(warnings) == 1
+    assert "posible alucinacion" in warnings[0]
+
+
 def test_call_model_turn_ollama_no_warning_when_final_answer_is_valid_json(monkeypatch):
     captured = {}
 
@@ -1133,8 +1186,8 @@ def test_context_warning_threshold_uses_anthropic_context_window(monkeypatch):
     monkeypatch.delenv("CONTEXT_SIZE_WARNING_CHARS", raising=False)
     monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", None)
 
-    anthropic_threshold = agent_loop._context_warning_threshold_chars("anthropic")
-    ollama_threshold = agent_loop._context_warning_threshold_chars("ollama")
+    anthropic_threshold = agent_loop.context_warning_threshold_chars("anthropic")
+    ollama_threshold = agent_loop.context_warning_threshold_chars("ollama")
 
     assert anthropic_threshold == 200_000 * 4
     assert ollama_threshold == agent_loop.OLLAMA_NUM_CTX * 4
@@ -1144,8 +1197,8 @@ def test_context_warning_threshold_uses_anthropic_context_window(monkeypatch):
 def test_context_warning_threshold_respects_env_override_for_any_backend(monkeypatch):
     monkeypatch.setattr(agent_loop, "_CONTEXT_SIZE_WARNING_CHARS_OVERRIDE", "500")
 
-    assert agent_loop._context_warning_threshold_chars("anthropic") == 500
-    assert agent_loop._context_warning_threshold_chars("ollama") == 500
+    assert agent_loop.context_warning_threshold_chars("anthropic") == 500
+    assert agent_loop.context_warning_threshold_chars("ollama") == 500
 
 
 def test_final_text_with_json_retry_appends_messages_and_returns_new_text(monkeypatch):

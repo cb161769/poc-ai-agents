@@ -144,6 +144,22 @@ SELF_REVIEW_NUDGE_MESSAGE = (
     "contestando cada campo con honestidad segun tu propio cambio."
 )
 
+# Gap real confirmado en vivo (epica KAN-4, qwen3:8b, conversacion continuada
+# entre historias de una epica): el modelo reporto "done" con files_changed
+# listando archivos especificos y una narrativa detallada de lo que "creo",
+# sin llamar write_file/edit_file NI UNA VEZ en todo el turno -- una
+# fabricacion, no una escritura fallida. La red de seguridad de
+# orchestration.py (confia en git, nunca en este status autoreportado) evito
+# que se mergeara, pero el turno se desperdicio y el comentario de Jira que
+# SI se postea repite la narrativa fabricada, pudiendo confundir a un humano
+# que no revisa el diff real.
+NO_REAL_WRITE_NUDGE_MESSAGE = (
+    "Dijiste que creaste o modificaste archivos (campo files_changed), pero no llamaste a write_file ni "
+    "edit_file en este turno -- ni una sola vez. Si el cambio ya esta hecho de verdad, llama a la tool "
+    "correspondiente AHORA MISMO con el contenido real. Si en realidad no pudiste hacerlo, respondé de "
+    'nuevo con {"status": "blocked", ...} explicando honestamente por que, en vez de reportar "done".'
+)
+
 # Confirmado real esta sesion: algunos modelos locales anuncian en texto
 # narrativo que van a crear/editar un archivo o correr un comando, pero
 # nunca llegan a emitir la tool-call real -- en vez de eso explican que
@@ -812,6 +828,16 @@ _STACK_RUNTIME_IMAGES = {
     "node": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
     "yarn": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
     "pnpm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    # Bug real confirmado en vivo (epica KAN-4, historia de bootstrap Ionic):
+    # "ionic" no estaba en este mapeo -- _resolve_stack_image_if_needed
+    # nunca lo reconocia como un comando de stack (ni siquiera intentaba
+    # containerizarlo), asi que corria NATIVO en el contenedor minimo del
+    # propio agente (sin Node/npm) y fallaba con "ionic: command not
+    # found", indistinguible para el modelo de un fallo real del codigo.
+    # La imagen trae Node pero NO el CLI de Ionic (no es parte de Node) --
+    # _run_command_in_stack_container lo instala antes de correr el
+    # comando real (ver ese comentario).
+    "ionic": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
 }
 
 
@@ -860,9 +886,23 @@ def _run_command_in_stack_container(image: str, command: str, target_repo_dir: s
         f"delegando a la imagen real '{image}' via Docker-outside-of-Docker)",
         file=sys.stderr,
     )
+    # Bug real confirmado en vivo (epica KAN-4): la imagen trae Node pero
+    # NO el CLI de Ionic -- no es parte de Node/npm base, hay que instalarlo
+    # aparte. Se instala solo cuando el comando REAL lo necesita (no en
+    # cada corrida de npm/npx genericos), en el mismo contenedor efimero
+    # antes de correr el comando pedido -- ninguna instalacion persiste
+    # entre corridas (contenedor --rm), asi que esto tiene que repetirse
+    # cada vez que se necesita, no es un costo unico.
+    try:
+        first_token = shlex.split(command)[0]
+    except (ValueError, IndexError):
+        first_token = ""
+    effective_command = (
+        f"npm install -g @ionic/cli >/dev/null 2>&1; {command}" if first_token == "ionic" else command
+    )
     try:
         result = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{host_work_dir}:/work", "-w", "/work", image, "sh", "-c", command],
+            ["docker", "run", "--rm", "-v", f"{host_work_dir}:/work", "-w", "/work", image, "sh", "-c", effective_command],
             capture_output=True, text=True, timeout=600,
         )
         stdout = _truncate(result.stdout, _MAX_SHELL_OUTPUT_CHARS)
@@ -1080,6 +1120,30 @@ async def run_coding_agent(
     self_review_nudge_given = False
     tool_call_nudge_given = False
     consecutive_eof_errors = 0
+    # Gap real confirmado en vivo (epica KAN-4, qwen3:8b): has_run_verification
+    # es un booleano que, una vez True, se queda True para el resto de la
+    # conversacion -- pero verificar ANTES de escribir un archivo nuevo no
+    # dice nada sobre ESE archivo. Confirmado real: el turno anterior corrio
+    # "npm test" de verdad (has_run_verification=True, correctamente), el
+    # turno siguiente escribio un test NUEVO (ionic-version.test.ts, con un
+    # error real: "expect is not defined", import faltante) y declaro "done"
+    # sin volver a correr nada -- has_run_verification seguia en True de
+    # ANTES, asi que el gate de verificacion no se disparaba. El testing
+    # agent real lo atrapo despues, pero el coding agent nunca se entero.
+    # dirty_since_verification: True apenas una escritura exitosa invalida
+    # la ultima verificacion real -- se limpia solo cuando corre un comando
+    # de verificacion de verdad DESPUES de esa escritura.
+    dirty_since_verification = False
+    # Gap real confirmado en vivo (epica KAN-4, qwen3:8b): 11 historias
+    # seguidas devolvieron status="done" con files_changed listando
+    # archivos especificos y narrativas detalladas de lo que "crearon" --
+    # sin llamar write_file/edit_file NI UNA VEZ (cero prompts de
+    # confirmacion reales en el log). No es un problema de escritura
+    # fallida: el modelo nunca lo intento. wrote_any_file trackea si en
+    # ALGUN turno de esta corrida realmente corrio una escritura exitosa,
+    # para poder atrapar esta inconsistencia antes de aceptar "done".
+    wrote_any_file = False
+    no_write_nudge_given = False
 
     def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
@@ -1211,7 +1275,30 @@ async def run_coding_agent(
                     ):
                         continue
 
-                    if result.get("status") == "done" and not has_run_verification and not verification_nudge_given:
+                    if (
+                        result.get("status") == "done"
+                        and result.get("files_changed")
+                        and not wrote_any_file
+                        and not no_write_nudge_given
+                    ):
+                        # Un solo empujon, mismo criterio que los demas --
+                        # si tampoco escribe nada real la segunda vez, se
+                        # acepta igual (files_changed queda trazado tal
+                        # cual, sin verificar), no se bloquea infinito. La
+                        # red de seguridad real (git status/commits_ahead en
+                        # orchestration.py) sigue siendo quien decide si
+                        # "applied" es verdad, esto solo evita desperdiciar
+                        # el turno entero en una fabricacion sin intentar
+                        # corregirla.
+                        no_write_nudge_given = True
+                        messages.append({"role": "user", "content": NO_REAL_WRITE_NUDGE_MESSAGE})
+                        continue
+
+                    if (
+                        result.get("status") == "done"
+                        and (not has_run_verification or dirty_since_verification)
+                        and not verification_nudge_given
+                    ):
                         # Un solo empujon -- si en el turno extra tampoco
                         # verifica, se acepta igual (self_verified queda en
                         # false, trazado en el log), no se bloquea infinito.
@@ -1263,10 +1350,21 @@ async def run_coding_agent(
                             output = LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input)
                             if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
                                 has_investigated = True
+                            if name in ("write_file", "edit_file") and not str(output).startswith("error:"):
+                                wrote_any_file = True
+                                # Una escritura NUEVA invalida cualquier
+                                # verificacion anterior -- si ya se habia
+                                # gastado el empujon de verificacion en una
+                                # vuelta previa, esta escritura merece su
+                                # propia oportunidad real, no queda tapada
+                                # por un empujon ya usado para otro archivo.
+                                dirty_since_verification = True
+                                verification_nudge_given = False
                             if name == "list_directory":
                                 listed_dirs.add(_normalize_listed_dir(tool_input.get("path", ".")))
                             if name == "run_shell_command" and _VERIFICATION_COMMAND_PATTERN.search(str(tool_input.get("command", ""))):
                                 has_run_verification = True
+                                dirty_since_verification = False
                         else:
                             if name.startswith("neo4j-cypher__"):
                                 consulted_risk_graph = True

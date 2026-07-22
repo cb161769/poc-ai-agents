@@ -22,16 +22,35 @@ import os
 
 import httpx
 
-from agent_loop import OLLAMA_MODEL, call_with_fallback, parse_ollama_model_candidates, resolve_ollama_model
+from agent_loop import (
+    OLLAMA_MODEL,
+    call_with_fallback,
+    context_warning_threshold_chars,
+    parse_ollama_model_candidates,
+    resolve_ollama_model,
+)
 
 logger = logging.getLogger("conversation_memory")
 
 CONVERSATION_SUMMARY_ENABLED = os.environ.get("CONVERSATION_SUMMARY_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
-# Umbral en caracteres del JSON serializado de los mensajes -- deliberadamente
-# generoso (bien por debajo de un context window real, incluso el mas chico
-# de Ollama) para no comprimir conversaciones cortas/normales, solo las que
-# genuinamente crecieron mucho a traves de varias historias.
-CONVERSATION_SUMMARY_THRESHOLD_CHARS = int(os.environ.get("CONVERSATION_SUMMARY_THRESHOLD_CHARS", "40000"))
+# Bug real confirmado en vivo (epica KAN-4, qwen3:8b): esto era un umbral
+# FIJO de 40000 caracteres -- mas alto que lo que realmente entra en la
+# ventana de contexto real de Ollama (OLLAMA_NUM_CTX=8192 tokens ~ 32768
+# caracteres). La compactacion (pensada EXACTAMENTE para una conversacion
+# que crece historia tras historia en una epica secuencial) nunca llegaba a
+# activarse antes de que el contexto real ya se hubiera desbordado --
+# momento en el que Ollama pierde/trunca el turno mas reciente (el ticket
+# nuevo), y el modelo, sin verlo con claridad, fabrica un "done" plausible
+# en vez de investigar (confirmado real: 11 historias seguidas, "done" con
+# narrativas detalladas, CERO tool calls reales). Ahora se deriva del mismo
+# calculo real que ya usa agent_loop.warn_if_context_large (por backend,
+# con fallback a OLLAMA_NUM_CTX) en vez de un numero propio desalineado --
+# una fraccion conservadora (50%) para dejar margen real al system prompt +
+# la respuesta del turno actual, no solo al historial. El override manual
+# via env var sigue funcionando si esta seteada explicitamente.
+CONVERSATION_SUMMARY_THRESHOLD_CHARS = int(
+    os.environ.get("CONVERSATION_SUMMARY_THRESHOLD_CHARS") or (context_warning_threshold_chars("ollama") // 2)
+)
 # Cuantos mensajes RECIENTES se preservan sin tocar (nunca resumidos) -- el
 # turno actual necesita el detalle exacto de lo ultimo que paso, no un resumen.
 CONVERSATION_SUMMARY_KEEP_RECENT = int(os.environ.get("CONVERSATION_SUMMARY_KEEP_RECENT", "10"))

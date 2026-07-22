@@ -367,6 +367,19 @@ def test_resolve_stack_image_if_needed_dotnet_uses_glob_marker(tmp_path, monkeyp
     assert ca._resolve_stack_image_if_needed("dotnet test", tmp_path) == "mcr.microsoft.com/dotnet/sdk:8.0"
 
 
+def test_resolve_stack_image_if_needed_recognizes_ionic(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, historia de bootstrap
+    Ionic): "ionic" no estaba en _STACK_RUNTIME_IMAGES -- 'ionic build'
+    nunca se reconocia como un comando de stack, corria NATIVO en el
+    contenedor minimo del agente (sin Node) y fallaba con "ionic: command
+    not found", indistinguible para el modelo de un fallo real del codigo.
+    """
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    assert ca._resolve_stack_image_if_needed("ionic build", tmp_path) == "mcr.microsoft.com/playwright:v1.61.1-noble"
+
+
 def test_run_command_in_stack_container_builds_correct_docker_invocation(tmp_path, monkeypatch):
     captured = {}
 
@@ -385,6 +398,43 @@ def test_run_command_in_stack_container_builds_correct_docker_invocation(tmp_pat
     ]
     assert "exit_code=0" in result
     assert "tests pasaron" in result
+
+
+def test_run_command_in_stack_container_installs_ionic_cli_before_ionic_commands(tmp_path, monkeypatch):
+    """La imagen trae Node pero NO el CLI de Ionic -- no es parte de
+    Node/npm base. Para un comando cuyo primer token es "ionic", tiene que
+    instalarse antes de correr el comando real pedido, en el mismo
+    contenedor efimero (--rm, asi que no persiste entre corridas).
+    """
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "ionic build", str(tmp_path), tmp_path)
+
+    shell_command = captured["cmd"][-1]
+    assert "npm install -g @ionic/cli" in shell_command
+    assert shell_command.endswith("ionic build")
+
+
+def test_run_command_in_stack_container_does_not_install_ionic_cli_for_plain_npm(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npm test", str(tmp_path), tmp_path)
+
+    assert captured["cmd"][-1] == "npm test"
 
 
 def test_run_command_in_stack_container_uses_host_target_repo_dir_for_subdir(tmp_path, monkeypatch):
@@ -1064,6 +1114,180 @@ def test_run_coding_agent_does_not_switch_model_on_legitimate_ticket_ambiguity_b
 
     assert result["status"] == "blocked"
     assert call_count["n"] == 1
+
+
+def test_run_coding_agent_nudges_when_done_claims_files_changed_but_never_wrote(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b, conversacion
+    continuada entre historias): el modelo devolvio status="done" con
+    files_changed listando archivos especificos y una narrativa detallada,
+    sin llamar write_file/edit_file NI UNA VEZ -- una fabricacion, no una
+    escritura fallida (cero prompts de confirmacion reales en el log de la
+    corrida real). No debe aceptarse en el primer intento -- tiene que
+    disparar el mismo empujon acotado que ya usan verificacion/self_review.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    call_count = {"n": 0}
+    fabricated = {
+        "status": "done",
+        "summary": "Se creo el componente Header con diseño responsive.",
+        "files_changed": ["header.component.ts", "header.component.html"],
+        "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+    }
+
+    seen_messages_by_call = []
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        seen_messages_by_call.append(list(messages))
+        # Nunca llama a ninguna tool -- siempre el mismo "done" fabricado,
+        # incluso despues del nudge.
+        return [{"type": "text", "text": json.dumps(fabricated)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert call_count["n"] > 1, "tiene que haber pedido al menos un reintento antes de aceptar"
+    # El segundo turno tiene que incluir el nudge exacto en su historial.
+    assert any(
+        m.get("role") == "user" and m.get("content") == ca.NO_REAL_WRITE_NUDGE_MESSAGE
+        for m in seen_messages_by_call[1]
+    )
+    # Con un solo empujon acotado (mismo criterio que verificacion/self_review),
+    # eventualmente se acepta igual -- files_changed queda trazado tal cual,
+    # sin verificar, la red de seguridad real (git status en orchestration.py)
+    # es quien decide si "applied" es verdad.
+    assert result["status"] == "done"
+
+
+def test_run_coding_agent_accepts_done_immediately_when_write_file_really_ran(monkeypatch, tmp_path):
+    """Contraparte del test anterior: si write_file SI corrio de verdad
+    antes del "done", no debe pedir el nudge de escritura (aunque
+    files_changed no este vacio).
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{
+                "type": "tool_use", "id": "call_1", "name": "write_file",
+                "input": {"path": "header.component.ts", "content": "export class Header {}"},
+            }]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        if call_count["n"] == 2:
+            # Una escritura real invalida cualquier verificacion previa
+            # (ver test dedicado mas abajo) -- este test corre una
+            # verificacion real DESPUES de escribir, para aislar el gate de
+            # escritura del gate de verificacion (no relacionado aca).
+            content = [{"type": "tool_use", "id": "call_2", "name": "run_shell_command", "input": {"command": "npm test"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        final = {
+            "status": "done",
+            "summary": "Se creo el componente Header.",
+            "files_changed": ["header.component.ts"],
+            "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+        }
+        return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    # has_investigated=True (seed) para que write_file corra de verdad en
+    # vez de chocar con el gate de "investiga antes de escribir" -- eso no
+    # es lo que este test quiere ejercitar.
+    result = asyncio.run(ca.run_coding_agent(
+        "T-1", "hace algo", str(tmp_path),
+        resume_state={"has_investigated": True},
+    ))
+
+    assert call_count["n"] == 3, "no deberia haber recibido el nudge de escritura real (solo el de verificacion, legitimo)"
+    assert result["status"] == "done"
+
+
+def test_run_coding_agent_forces_reverification_after_writing_a_new_file(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): un turno anterior
+    corrio "npm test" de verdad (has_run_verification=True, sembrado via
+    resume_state), pero ESTE turno escribio un archivo NUEVO despues y
+    declaro "done" sin volver a verificar -- has_run_verification seguia en
+    True de ANTES, asi que el gate no se disparaba. El testing agent real
+    (fuera de este proceso) encontro un error real en el archivo nuevo
+    ("expect is not defined", import faltante) que el coding agent nunca
+    llego a ver. Una escritura nueva tiene que invalidar la verificacion
+    anterior y forzar el empujon de "corre un comando de verificacion" de
+    nuevo, aunque el resume_state ya trajera has_run_verification=True.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{
+                "type": "tool_use", "id": "call_1", "name": "write_file",
+                "input": {"path": "ionic-version.test.ts", "content": "expect(1).toBe(1);"},
+            }]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        final = {
+            "status": "done",
+            "summary": "Se creo el test de version.",
+            "files_changed": ["ionic-version.test.ts"],
+            "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+        }
+        return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    # Semilla realista de un reintento: ya investigo Y ya verifico en un
+    # turno ANTERIOR (misma conversacion continuada) -- pero esta corrida
+    # puntual escribe un archivo nuevo despues de eso.
+    result = asyncio.run(ca.run_coding_agent(
+        "T-1", "hace algo", str(tmp_path),
+        resume_state={"has_investigated": True, "has_run_verification": True},
+    ))
+
+    assert call_count["n"] > 1, "tiene que haber pedido re-verificacion antes de aceptar 'done'"
+    assert result["status"] == "done"
+
+
+def test_run_coding_agent_does_not_force_reverification_when_nothing_new_was_written(monkeypatch, tmp_path):
+    """Contraparte: si esta corrida no escribio nada nuevo (ej. concluyo que
+    el codigo existente ya cumple), la verificacion previa sigue siendo
+    valida -- no debe pedir un nudge extra solo porque resume_state trae
+    has_run_verification=True de una corrida anterior.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        final = {
+            "status": "done",
+            "summary": "El codigo existente ya cumple el ticket, no hizo falta cambiar nada.",
+            "files_changed": [],
+            "self_review": {"scope_matches_ticket": True, "no_secrets_introduced": True, "tests_adequate": True},
+        }
+        return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent(
+        "T-1", "hace algo", str(tmp_path),
+        resume_state={"has_investigated": True, "has_run_verification": True},
+    ))
+
+    assert call_count["n"] == 1
+    assert result["status"] == "done"
 
 
 def test_run_coding_agent_switches_ollama_model_when_tool_refusal_persists_after_nudge(monkeypatch, tmp_path):

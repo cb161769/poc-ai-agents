@@ -626,7 +626,7 @@ def test_retry_local_diff_includes_deterministic_test_coverage_evidence_in_feedb
     del segundo intento incluye la evidencia deterministica tal cual."""
     captured_feedback = {}
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         captured_feedback["text"] = feedback_text
         return {"applied": True, "backend": "anthropic"}
 
@@ -711,7 +711,7 @@ def test_retry_local_diff_passes_conversation_file_when_present(monkeypatch):
     """
     captured = {}
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         captured["feedback_text"] = feedback_text
         captured["conversation_file"] = conversation_file
         return {"applied": True, "backend": "anthropic"}
@@ -741,7 +741,7 @@ def test_retry_local_diff_passes_conversation_file_when_present(monkeypatch):
 def test_retry_local_diff_falls_back_to_full_prompt_without_conversation_file(monkeypatch):
     captured = {}
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         captured["feedback_text"] = feedback_text
         captured["conversation_file"] = conversation_file
         return {"applied": True, "backend": "anthropic"}
@@ -987,7 +987,7 @@ def test_retry_for_inadequate_tests_preserves_branch_when_retry_omits_it(monkeyp
     """
     captured = {}
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         captured["ticket_id"] = ticket_id
         captured["feedback_text"] = feedback_text
         captured["conversation_file"] = conversation_file
@@ -1042,7 +1042,7 @@ def test_deliver_retries_coding_agent_when_self_review_flags_inadequate_tests(mo
         },
     )
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         retry_calls.append((ticket_id, conversation_file))
         return {
             "applied": True, "backend": "ollama",
@@ -1656,7 +1656,7 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
             "backend": "anthropic", "conversation_file": "/tmp/conv1.json", "self_review": {},
         }
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         coding_calls.append(("retry", feedback_text, conversation_file))
         return {"applied": True, "backend": "anthropic", "self_review": {}, "conversation_file": "/tmp/conv2.json"}
 
@@ -1980,7 +1980,7 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
         },
     )
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         retry_calls.append((ticket_id, conversation_file))
         return {
             "applied": True, "backend": "anthropic",
@@ -2008,6 +2008,79 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
     # para este modo), no el child_id.
     assert retry_calls == [("EPIC-1", "/tmp/conv1.json")]
     assert result["completed"] == [{"ticket_id": "C-1", "outcome": "ok"}]
+
+
+def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_historia(monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-4, qwen3:8b): a partir de la
+    SEGUNDA historia de una epica, agent_result viene de
+    retry_coding_agent_local_real() (continua la misma conversacion), que
+    por diseño nunca incluye "branch"/"base_branch" en su dict de retorno
+    -- si el juez marcaba FLAGGED con un policy_reference retryable en esa
+    historia (o cualquiera despues de la primera), _retry_local_diff()
+    intentaba leer agent_result["branch"] y crasheaba la epica ENTERA con
+    KeyError('branch'), tirando abajo el resto de historias sin tocar.
+    Confirma que ahora usa branch/base_branch de las variables de loop de
+    _deliver_epic_sequential(), no de agent_result.
+    """
+    children = [_fake_child("C-1"), _fake_child("C-2")]
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic",
+            "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": True},
+        },
+    )
+
+    # Mismo criterio que retry_coding_agent_local_real() real: NUNCA
+    # incluye "branch"/"base_branch" en su dict de retorno -- reusa la rama
+    # que la primera historia ya dejo checked out.
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        return {
+            "applied": True, "backend": "anthropic",
+            "self_review": {"tests_adequate": True}, "conversation_file": "/tmp/conv2.json",
+        }
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+
+    judge_calls = {"n": 0}
+
+    def fake_judge(*a, **k):
+        judge_calls["n"] += 1
+        # Llamado 1: primera historia, OK. Llamado 2: segunda historia
+        # (agent_result sin "branch") -- FLAGGED retryable, dispara
+        # _retry_local_diff() y reproducia el KeyError real. Llamado 3: el
+        # re-veredicto DESPUES del segundo intento -- OK (el reintento
+        # arreglo lo que el juez pidio).
+        if judge_calls["n"] == 2:
+            return {"verdict": "FLAGGED", "reasoning": "falta cobertura de tests", "policy_reference": "insufficient-test-coverage"}
+        return {"verdict": "OK", "reasoning": "todo bien"}
+
+    monkeypatch.setattr(orchestration, "_run_judge_safe", fake_judge)
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": "https://x/pr/1", "pushed": True, "reason": None})
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+
+    # No debe tirar KeyError('branch') -- confirma que la epica completa
+    # las dos historias sin crashear.
+    result = orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert [c["ticket_id"] for c in result["completed"]] == ["C-1", "C-2"]
 
 
 def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_child(monkeypatch):
@@ -2084,7 +2157,7 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
             "backend": "anthropic", "conversation_file": "/tmp/conv1.json", "self_review": {},
         }
 
-    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None):
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
         captured_prompts.append(("retry", feedback_text))
         return {"applied": True, "backend": "anthropic", "self_review": {}, "conversation_file": "/tmp/conv2.json"}
 
@@ -2768,6 +2841,101 @@ def test_retry_coding_agent_local_real_threads_read_file_hashes_across_turns(mon
     )
 
     assert captured_payload["resume_state"]["read_file_hashes"] == {"/repo/src/app.py": "abc123"}
+
+
+def test_retry_coding_agent_local_real_resets_investigation_state_for_new_historia(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): has_investigated/
+    listed_dirs viajaban intactos de una historia a la siguiente dentro de
+    una conversacion continuada -- haber investigado los archivos del
+    ticket A no dice nada sobre el ticket B, pero el modelo podia saltarse
+    el gate real de "investiga antes de escribir" para una historia que
+    nunca miro. reset_investigation_state=True (pasado por
+    _deliver_epic_sequential SOLO al mover a la historia siguiente) tiene
+    que forzar has_investigated=False/listed_dirs=[] en el payload, aunque
+    la conversacion guardada traiga True/una lista no vacia -- sin tocar
+    read_file_hashes/consulted_risk_graph (esos SI siguen siendo validos:
+    son sobre contenido real del repo, no sobre este ticket puntual).
+    """
+    conversation_file = tmp_path / "conv.json"
+    conversation_file.write_text(json.dumps({
+        "messages": [], "has_investigated": True, "has_run_verification": True,
+        "initial_plan": "plan", "consulted_risk_graph": True,
+        "listed_dirs": ["src", "src/app"],
+        "read_file_hashes": {"/repo/src/app.py": "abc123"},
+    }), encoding="utf-8")
+
+    captured_payload = {}
+    heads = iter(["checkpoint\n", "checkpoint\n"])
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "blocked", "summary": "no pude", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = cmd[2]
+            captured_payload.update(json.loads(Path(payload_path).read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-1:] == ["HEAD"] and "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=next(heads))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    orchestration.retry_coding_agent_local_real(
+        "T-2", "descripcion de la historia siguiente", str(tmp_path), conversation_file=str(conversation_file),
+        reset_investigation_state=True,
+    )
+
+    assert captured_payload["resume_state"]["has_investigated"] is False
+    assert captured_payload["resume_state"]["listed_dirs"] == []
+    # Estos dos NO se resetean -- siguen siendo validos entre historias.
+    assert captured_payload["resume_state"]["consulted_risk_graph"] is True
+    assert captured_payload["resume_state"]["read_file_hashes"] == {"/repo/src/app.py": "abc123"}
+
+
+def test_retry_coding_agent_local_real_preserves_investigation_state_by_default(monkeypatch, tmp_path):
+    """Contraparte: sin reset_investigation_state (el default, usado por los
+    reintentos por feedback del juez/tests sobre el MISMO ticket), el
+    estado de investigacion real ya alcanzado tiene que preservarse tal
+    cual -- este NO es el caso que motivo el fix.
+    """
+    conversation_file = tmp_path / "conv.json"
+    conversation_file.write_text(json.dumps({
+        "messages": [], "has_investigated": True, "has_run_verification": True,
+        "initial_plan": "plan", "consulted_risk_graph": False,
+        "listed_dirs": ["src"],
+        "read_file_hashes": {},
+    }), encoding="utf-8")
+
+    captured_payload = {}
+    heads = iter(["checkpoint\n", "checkpoint\n"])
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "blocked", "summary": "no pude", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = cmd[2]
+            captured_payload.update(json.loads(Path(payload_path).read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-1:] == ["HEAD"] and "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout=next(heads))
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    orchestration.retry_coding_agent_local_real(
+        "T-1", "feedback del juez", str(tmp_path), conversation_file=str(conversation_file),
+    )
+
+    assert captured_payload["resume_state"]["has_investigated"] is True
+    assert captured_payload["resume_state"]["listed_dirs"] == ["src"]
 
 
 def test_retry_coding_agent_local_real_detects_commits_made_by_the_model_itself(monkeypatch, tmp_path):

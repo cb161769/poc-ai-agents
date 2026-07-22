@@ -3,9 +3,39 @@ del coding agent para que no crezcan sin limite a traves de una epica
 secuencial completa. Best-effort total: nunca debe bloquear ni corromper
 una corrida real, incluso si la generacion del resumen falla.
 """
+import importlib
 from unittest.mock import patch
 
+import agent_loop
 import conversation_memory as cm
+
+
+def test_compaction_threshold_derives_from_real_ollama_context_window(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): el umbral de
+    compactacion era un numero fijo (40000 caracteres) sin relacion con
+    OLLAMA_NUM_CTX -- mas alto que lo que realmente entra en el contexto
+    real de Ollama (8192 tokens ~ 32768 caracteres), asi que la
+    compactacion nunca llegaba a activarse antes de que el contexto real ya
+    se hubiera desbordado. Ahora tiene que derivarse del mismo calculo real
+    que agent_loop.context_warning_threshold_chars("ollama") -- confirmado
+    recargando ambos modulos con OLLAMA_NUM_CTX chico y viendo que el
+    umbral de conversation_memory baja proporcionalmente (mitad, con margen
+    para el system prompt + la respuesta del turno actual).
+    """
+    monkeypatch.delenv("CONVERSATION_SUMMARY_THRESHOLD_CHARS", raising=False)
+    monkeypatch.delenv("CONTEXT_SIZE_WARNING_CHARS", raising=False)
+    monkeypatch.setenv("OLLAMA_NUM_CTX", "1000")
+    try:
+        reloaded_agent_loop = importlib.reload(agent_loop)
+        reloaded_cm = importlib.reload(cm)
+        # 1000 tokens * 4 chars/token = 4000; conversation_memory se queda
+        # con la mitad de eso, no con el fijo de 40000 de antes.
+        assert reloaded_cm.CONVERSATION_SUMMARY_THRESHOLD_CHARS == 2000
+        assert reloaded_cm.CONVERSATION_SUMMARY_THRESHOLD_CHARS == reloaded_agent_loop.context_warning_threshold_chars("ollama") // 2
+        assert reloaded_cm.CONVERSATION_SUMMARY_THRESHOLD_CHARS < 40000
+    finally:
+        importlib.reload(agent_loop)
+        importlib.reload(cm)
 
 
 def test_messages_to_text_formats_different_block_types():
