@@ -1699,6 +1699,57 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
     assert any(tk == "EPIC-1" for tk, _ in comments)  # resumen final en la epica
 
 
+def test_deliver_epic_sequential_surfaces_push_failure_reason_in_epic_summary(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): una historia con
+    veredicto OK real, pero push_and_open_pr() fallo (push_and_open_pr
+    devuelve pushed=False/pr_url=None) -- el comentario resumen de la epica
+    ANTES solo agregaba la linea "PR: ..." cuando SI habia pr_url, sin
+    ningun fallback -- el trabajo real (rama con commits reales, judge OK)
+    quedaba sin ninguna senal de por que no hay PR, ni en Jira ni en el log
+    de Prefect. Ahora el resumen tiene que incluir la razon real.
+    """
+    children = [_fake_child("C-1")]
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt saneado", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff\n")
+
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda ticket_id, sanitized, target_repo_dir: {
+            "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
+            "backend": "anthropic", "conversation_file": None, "self_review": {},
+        },
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
+    monkeypatch.setattr(
+        orchestration, "push_and_open_pr",
+        lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "git push fallo: fatal: no se pudo conectar"},
+    )
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.Path, "unlink", lambda self, missing_ok=True: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc epica"}, children, "/repo",
+        ["--- AuthService ---\nsin dependencias"], ["--- AuthService ---\n"], [], "", [],
+    )
+
+    epic_summary_texts = [text for tk, text in comments if tk == "EPIC-1"]
+    assert any("git push fallo" in text for text in epic_summary_texts)
+    assert any("pusheala y abri el PR a mano" in text for text in epic_summary_texts)
+
+
 def test_deliver_epic_sequential_skips_rejected_child_and_continues(monkeypatch):
     children = [_fake_child("C-1"), _fake_child("C-2"), _fake_child("C-3")]
     comments = []

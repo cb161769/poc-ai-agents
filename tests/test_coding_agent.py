@@ -340,7 +340,7 @@ def test_resolve_stack_image_if_needed_returns_image_when_marker_present_and_bin
 
     image = ca._resolve_stack_image_if_needed("npm install && npm test", tmp_path)
 
-    assert image == "mcr.microsoft.com/playwright:v1.44.1-jammy"
+    assert image == "mcr.microsoft.com/playwright:v1.61.1-noble"
 
 
 @pytest.mark.parametrize("marker_file,binary,expected_image", [
@@ -377,11 +377,11 @@ def test_run_command_in_stack_container_builds_correct_docker_invocation(tmp_pat
     monkeypatch.setattr(ca.subprocess, "run", fake_run)
     monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
 
-    result = ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.44.1-jammy", "npm test", str(tmp_path), tmp_path)
+    result = ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npm test", str(tmp_path), tmp_path)
 
     assert captured["cmd"] == [
         "docker", "run", "--rm", "-v", f"{tmp_path}:/work", "-w", "/work",
-        "mcr.microsoft.com/playwright:v1.44.1-jammy", "sh", "-c", "npm test",
+        "mcr.microsoft.com/playwright:v1.61.1-noble", "sh", "-c", "npm test",
     ]
     assert "exit_code=0" in result
     assert "tests pasaron" in result
@@ -404,7 +404,7 @@ def test_run_command_in_stack_container_uses_host_target_repo_dir_for_subdir(tmp
     monkeypatch.setattr(ca.subprocess, "run", fake_run)
     monkeypatch.setenv("HOST_TARGET_REPO_DIR", "/host/real/path")
 
-    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.44.1-jammy", "npm test", str(tmp_path), frontend)
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npm test", str(tmp_path), frontend)
 
     assert "-v" in captured["cmd"]
     v_index = captured["cmd"].index("-v")

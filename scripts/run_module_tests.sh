@@ -112,7 +112,9 @@ detect_stack() {
     # dependencias de sistema completas (glibc) — cubre tanto tests unitarios
     # (Jest/Vitest/Karma, sea NestJS, Angular, Ionic, Expo o React Native)
     # como tests de UI real si el repo trae tests/*.spec.ts de Playwright.
-    IMAGE="mcr.microsoft.com/playwright:v1.44.1-jammy"
+    # v1.61.1-noble trae Node 24 (v1.44.1-jammy solo traia Node 20, insuficiente
+    # para @capacitor/cli/@angular/cli modernos -- bug real confirmado en vivo).
+    IMAGE="mcr.microsoft.com/playwright:v1.61.1-noble"
     if grep -q '"test"' "${dir}/package.json" 2>/dev/null; then
       TEST_CMD="npm install --silent && npm test"
     else

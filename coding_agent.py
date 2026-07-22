@@ -800,11 +800,18 @@ _STACK_RUNTIME_IMAGES = {
     "rspec": (lambda d: (d / "Gemfile").exists(), "ruby:3.3"),
     "cargo": (lambda d: (d / "Cargo.toml").exists(), "rust:1.78"),
     "pipenv": (lambda d: (d / "Pipfile").exists(), "python:3.10-slim"),
-    "npm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
-    "npx": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
-    "node": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
-    "yarn": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
-    "pnpm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.44.1-jammy"),
+    # Bug real confirmado en vivo (epica KAN-4, historia de bootstrap Ionic/
+    # Angular/Capacitor): v1.44.1-jammy trae Node 20.13.1 -- @capacitor/cli
+    # y @angular/cli modernos ya piden Node >=22, asi que cualquier scaffold
+    # nuevo de esos frameworks fallaba ANTES de poder escribir nada.
+    # v1.61.1-noble (confirmado real: `docker run ... node --version` ->
+    # v24.17.0) sigue siendo una tag versionada/pinneada, mismo criterio de
+    # reproducibilidad que la anterior.
+    "npm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    "npx": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    "node": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    "yarn": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    "pnpm": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
 }
 
 

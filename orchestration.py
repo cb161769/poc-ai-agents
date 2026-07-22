@@ -635,6 +635,22 @@ def _transition_all(status: str, ticket_id: str, is_epic: bool, child_ticket_key
             transition_jira(status, ticket_key=child_key, blocked=blocked)
 
 
+def _log_best_effort(level: str, message: str) -> None:
+    """get_run_logger() exige un contexto de corrida real de Prefect activo
+    -- _deliver()/_deliver_epic_sequential() son funciones planas (las llama
+    run_epic_pipeline, que si es @flow), asi que en produccion siempre hay
+    contexto, pero un test que las llama directo (el patron que ya usan
+    todos los tests de este archivo) no tiene ninguno, y get_run_logger()
+    tira MissingContextError. El comentario real de Jira (mismo mensaje)
+    nunca depende de esto -- perder este log puntual fuera de un flow real
+    no pierde la señal, solo la copia en el log de Prefect.
+    """
+    try:
+        getattr(get_run_logger(), level)(message)
+    except Exception:
+        pass
+
+
 @task(retries=0, name="push-and-open-pr")
 def push_and_open_pr(target_repo_dir: str, branch: str, base_branch: str, ticket_id: str, summary: str, body_text: str) -> dict:
     """Camino B1 (coding agent local) nunca pasaba de un commit local -- code
@@ -2641,12 +2657,14 @@ def _deliver(
             if pr_result["pr_url"]:
                 _comment_all(f"🔀 PR listo para review: {pr_result['pr_url']}", ticket_id, is_epic, child_ticket_keys)
             elif pr_result["pushed"]:
+                _log_best_effort("warning", f"{ticket_id}: push OK pero no se pudo abrir el PR -- {pr_result['reason']}")
                 _comment_all(
                     f"🔀 Rama '{branch}' pusheada, pero no se pudo abrir el PR automaticamente "
                     f"({pr_result['reason']}) — abrilo a mano.",
                     ticket_id, is_epic, child_ticket_keys,
                 )
             else:
+                _log_best_effort("warning", f"{ticket_id}: push_and_open_pr no pudo pushear -- {pr_result['reason']}")
                 _comment_all(
                     f"🔀 El cambio quedo en la rama local '{branch}' — pusheala y abri el PR a mano "
                     f"({pr_result['reason']}).",
@@ -3049,6 +3067,16 @@ def _deliver_epic_sequential(
             pr_body_lines.append(f"- {c['ticket_id']}{title} ({c['outcome']})")
         pr_body = "\n".join(pr_body_lines)
         pr_result = push_and_open_pr(target_repo_dir, branch, base_branch, epic_key, epic["summary"], pr_body)
+        # Gap real confirmado en vivo (epica KAN-4, qwen3:8b -- historia con
+        # veredicto OK real, push_and_open_pr() fallo en silencio): a
+        # diferencia de _deliver() (camino combinado), este camino secuencial
+        # solo agregaba la linea "PR: ..." cuando SI habia pr_url -- un push
+        # fallido (o una PR que no pudo abrirse) desaparecia sin dejar
+        # rastro, ni en el log de Prefect ni en el comentario de Jira. El
+        # trabajo real (rama con commits reales, judge OK) quedaba huerfano
+        # sin ninguna senal de por que no hay PR.
+        if not pr_result.get("pr_url"):
+            _log_best_effort("warning", f"{epic_key}: push_and_open_pr no genero un PR real -- {pr_result.get('reason')}")
 
     processed_ids = {c["ticket_id"] for c in completed} | ({blocked_at} if blocked_at else set())
     remaining = [c["ticket_id"] for c in ordered_children if c["ticket_id"] not in processed_ids]
@@ -3087,6 +3115,10 @@ def _deliver_epic_sequential(
         summary_lines.append(f"Se corto en {blocked_at} -- sin tocar: {', '.join(remaining) if remaining else 'ninguna'}.")
     if pr_result and pr_result.get("pr_url"):
         summary_lines.append(f"PR: {pr_result['pr_url']}")
+    elif pr_result and pr_result.get("pushed"):
+        summary_lines.append(f"⚠️ Rama '{branch}' pusheada, pero no se pudo abrir el PR automaticamente ({pr_result.get('reason')}) — abrilo a mano.")
+    elif pr_result:
+        summary_lines.append(f"⚠️ El cambio quedo en la rama local '{branch}' — pusheala y abri el PR a mano ({pr_result.get('reason')}).")
     summary_text = " ".join(summary_lines)
     comment_jira(summary_text, ticket_key=epic_key)
     # Confirmado real (usuario): la linea "PR: ..." solo se posteaba a la
