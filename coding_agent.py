@@ -838,6 +838,12 @@ _STACK_RUNTIME_IMAGES = {
     # _run_command_in_stack_container lo instala antes de correr el
     # comando real (ver ese comentario).
     "ionic": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    # Mismo gap real, misma causa (epica KAN-4, historia siguiente): "ng"
+    # (Angular CLI) tampoco estaba reconocido -- "ng test"/"ng build"
+    # fallaban con "ng: command not found" en el contenedor minimo del
+    # agente. Mismo tratamiento que "ionic": _run_command_in_stack_container
+    # instala el CLI global antes de correr el comando real.
+    "ng": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
 }
 
 
@@ -886,20 +892,45 @@ def _run_command_in_stack_container(image: str, command: str, target_repo_dir: s
         f"delegando a la imagen real '{image}' via Docker-outside-of-Docker)",
         file=sys.stderr,
     )
-    # Bug real confirmado en vivo (epica KAN-4): la imagen trae Node pero
-    # NO el CLI de Ionic -- no es parte de Node/npm base, hay que instalarlo
-    # aparte. Se instala solo cuando el comando REAL lo necesita (no en
-    # cada corrida de npm/npx genericos), en el mismo contenedor efimero
-    # antes de correr el comando pedido -- ninguna instalacion persiste
-    # entre corridas (contenedor --rm), asi que esto tiene que repetirse
-    # cada vez que se necesita, no es un costo unico.
+    # Bug real confirmado en vivo (epica KAN-4): la imagen trae Node pero NO
+    # los CLI globales de Ionic/Angular -- no son parte de Node/npm base,
+    # hay que instalarlos aparte. Se instalan solo cuando el comando REAL
+    # los necesita (no en cada corrida de npm/npx genericos), en el mismo
+    # contenedor efimero antes de correr el comando pedido -- ninguna
+    # instalacion persiste entre corridas (contenedor --rm), asi que esto
+    # tiene que repetirse cada vez que se necesita, no es un costo unico.
     try:
         first_token = shlex.split(command)[0]
     except (ValueError, IndexError):
         first_token = ""
-    effective_command = (
-        f"npm install -g @ionic/cli >/dev/null 2>&1; {command}" if first_token == "ionic" else command
-    )
+    global_cli_installs = {"ionic": "@ionic/cli", "ng": "@angular/cli"}
+    setup_steps = []
+    if first_token in global_cli_installs:
+        setup_steps.append(f"npm install -g {global_cli_installs[first_token]} >/dev/null 2>&1")
+    # Segundo bug real confirmado en vivo, mismo patron (historia siguiente
+    # de la misma epica): "vitest"/"npx vitest" fallaba con "no esta
+    # instalado como devDependency" -- a diferencia del CLI global de
+    # arriba, esto es una dependencia LOCAL real (package.json/package-lock.json
+    # ya la declaran), pero cada `docker run --rm` es un contenedor nuevo, y
+    # el modelo no siempre se acuerda de correr "npm install" ANTES del
+    # comando real en la misma llamada. work_dir esta bind-mounteado (no es
+    # estado efimero del contenedor), asi que node_modules generado por un
+    # "npm install" real SI persiste entre llamadas -- pero solo si alguna
+    # llamada lo corrio. Si el marcador real (node_modules/) todavia no
+    # existe y el comando no es ya un "npm install" en si mismo, se antepone
+    # uno real antes de intentar el comando pedido.
+    try:
+        second_token = shlex.split(command)[1] if first_token == "npm" else ""
+    except (ValueError, IndexError):
+        second_token = ""
+    is_already_an_install_command = first_token == "npm" and second_token in ("install", "ci")
+    if (
+        not is_already_an_install_command
+        and not (work_dir / "node_modules").is_dir()
+        and (work_dir / "package.json").is_file()
+    ):
+        setup_steps.append("npm install --silent >/dev/null 2>&1")
+    effective_command = "; ".join(setup_steps + [command]) if setup_steps else command
     try:
         result = subprocess.run(
             ["docker", "run", "--rm", "-v", f"{host_work_dir}:/work", "-w", "/work", image, "sh", "-c", effective_command],

@@ -380,6 +380,17 @@ def test_resolve_stack_image_if_needed_recognizes_ionic(tmp_path, monkeypatch):
     assert ca._resolve_stack_image_if_needed("ionic build", tmp_path) == "mcr.microsoft.com/playwright:v1.61.1-noble"
 
 
+def test_resolve_stack_image_if_needed_recognizes_ng(tmp_path, monkeypatch):
+    """Mismo gap real, misma causa (epica KAN-4, historia siguiente): "ng"
+    (Angular CLI) tampoco estaba reconocido -- "ng test" fallaba con "ng:
+    command not found" en el contenedor minimo del agente.
+    """
+    (tmp_path / "package.json").write_text("{}")
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    assert ca._resolve_stack_image_if_needed("ng test", tmp_path) == "mcr.microsoft.com/playwright:v1.61.1-noble"
+
+
 def test_run_command_in_stack_container_builds_correct_docker_invocation(tmp_path, monkeypatch):
     captured = {}
 
@@ -435,6 +446,74 @@ def test_run_command_in_stack_container_does_not_install_ionic_cli_for_plain_npm
     ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npm test", str(tmp_path), tmp_path)
 
     assert captured["cmd"][-1] == "npm test"
+
+
+def test_run_command_in_stack_container_installs_local_deps_when_node_modules_missing(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, historia siguiente): a
+    diferencia del CLI global de Ionic/Angular, "vitest" es una dependencia
+    LOCAL real (declarada en package.json/package-lock.json) -- pero cada
+    'docker run --rm' es un contenedor nuevo, y el modelo no siempre corre
+    "npm install" antes en la misma llamada. Confirmado real: "npx vitest"
+    fallaba con "no esta instalado como devDependency" pese a que SI estaba
+    declarado. Si el package.json real existe pero node_modules todavia no
+    (marcador real, no un booleano inventado), tiene que anteponerse un
+    "npm install" real antes del comando pedido.
+    """
+    (tmp_path / "package.json").write_text('{"devDependencies": {"vitest": "^1.6.0"}}')
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npx vitest run", str(tmp_path), tmp_path)
+
+    shell_command = captured["cmd"][-1]
+    assert "npm install --silent" in shell_command
+    assert shell_command.endswith("npx vitest run")
+
+
+def test_run_command_in_stack_container_skips_local_install_when_node_modules_present(tmp_path, monkeypatch):
+    """Contraparte: si node_modules YA existe (bind-mounteado, persiste
+    entre llamadas de una misma corrida real), no debe reinstalar de
+    nuevo -- costo real evitable, no solo redundancia cosmetica.
+    """
+    (tmp_path / "package.json").write_text('{"devDependencies": {"vitest": "^1.6.0"}}')
+    (tmp_path / "node_modules").mkdir()
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npx vitest run", str(tmp_path), tmp_path)
+
+    assert captured["cmd"][-1] == "npx vitest run"
+
+
+def test_run_command_in_stack_container_does_not_double_install_for_npm_install_command(tmp_path, monkeypatch):
+    """El comando pedido puede ya SER "npm install" -- no tiene sentido
+    anteponerle otro "npm install" identico.
+    """
+    (tmp_path / "package.json").write_text('{"devDependencies": {"vitest": "^1.6.0"}}')
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(ca.subprocess, "run", fake_run)
+    monkeypatch.delenv("HOST_TARGET_REPO_DIR", raising=False)
+
+    ca._run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", "npm install", str(tmp_path), tmp_path)
+
+    assert captured["cmd"][-1] == "npm install"
 
 
 def test_run_command_in_stack_container_uses_host_target_repo_dir_for_subdir(tmp_path, monkeypatch):

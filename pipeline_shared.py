@@ -92,6 +92,45 @@ POLICY_REGISTRY: dict = {
 # no necesitan cambiar nada.
 RETRYABLE_POLICY_REFERENCES = {ref for ref, rule in POLICY_REGISTRY.items() if rule.retryable}
 
+# Gap real confirmado en vivo (epica KAN-4, KAN-5 con qwen3:8b): el
+# reintento le pasaba al coding agent el "reasoning" libre del juez mas la
+# evidencia deterministica de que archivos no tienen test -- pero cuando el
+# problema NO es "falta el archivo de test" sino "el test que ya existe es
+# de baja calidad" (mocks ausentes, solo valida un valor fijo, no verifica
+# comportamiento asincronico), esa evidencia deterministica dice "el diff SI
+# incluye test(s)" y no aporta nada accionable. Confirmado real: el segundo
+# intento de KAN-5 agrego codigo real pero NO corrigio los mocks, y el juez
+# volvio a marcar FLAGGED por la misma razon exacta. Estos hints dan
+# instrucciones concretas y especificas por policy_reference -- no
+# reemplazan el reasoning real del juez (que sigue yendo primero en el
+# feedback), lo complementan con una guia accionable que no depende de que
+# el juez la haya redactado bien esa vez.
+REMEDIATION_HINTS: dict = {
+    "insufficient-test-coverage": (
+        "Guia concreta: si el archivo de test YA EXISTE pero te marcaron esto de nuevo, "
+        "el problema no es ausencia de test sino calidad -- revisa en particular: (1) "
+        "toda dependencia externa/inyectada (servicios, HTTP, storage) tiene que estar "
+        "mockeada explicitamente (jest.fn(), spyOn, o el equivalente del framework real "
+        "del stack), nunca invocada de verdad en un test unitario; (2) todo metodo "
+        "async/Promise tiene que verificarse con await/resolves/rejects (o fakeAsync/tick "
+        "si es Angular), no asumido sincronico; (3) el assert tiene que validar un "
+        "comportamiento real (una rama condicional, un error, un cambio de estado), no "
+        "solo que la funcion devuelva un valor fijo sin importar el input."
+    ),
+    "scope-mismatch": (
+        "Guia concreta: releé el alcance exacto del ticket y elimina o revierte cualquier "
+        "archivo tocado que no corresponda a lo que el ticket pide -- si tocaste un "
+        "archivo compartido por necesidad real, dejalo pero explicalo en el mensaje de "
+        "commit/self_review, no lo quites en silencio."
+    ),
+    "graph-impact-unverified": (
+        "Guia concreta: antes de este intento no se registro evidencia de haber revisado "
+        "el grafo de dependencias -- consulta el impacto real del componente que tocaste "
+        "(quien depende de el) y deja esa consulta reflejada en tu self_review antes de "
+        "terminar."
+    ),
+}
+
 
 class TicketState(str, Enum):
     """Maquina de estados explicita por ticket -- gap real identificado en

@@ -81,6 +81,7 @@ from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
 from pipeline_shared import (
+    REMEDIATION_HINTS,
     RETRYABLE_POLICY_REFERENCES,
     TicketState,
     acquire_ticket_lock,
@@ -102,6 +103,15 @@ FIREWALL_URL = os.environ.get("FIREWALL_URL", "http://localhost:8080")
 # largo que el default de cache_utils (300s) es correcto aca -- 1 hora por
 # default, configurable por si hace falta ajustarlo.
 GRAPH_CACHE_TTL_SECONDS = int(os.environ.get("GRAPH_CACHE_TTL_SECONDS", "3600"))
+# Gap real confirmado en vivo (epica KAN-4, KAN-5): _retry_local_diff() daba
+# un unico reintento tras un veredicto FLAGGED retryable -- si ese segundo
+# intento tambien quedaba FLAGGED por el MISMO policy_reference (confirmado
+# real: insufficient-test-coverage dos veces seguidas en KAN-5), la epica
+# entera se cortaba ahi sin darle al modelo otra chance con guia mas
+# especifica (REMEDIATION_HINTS). Configurable porque mas intentos = mas
+# tiempo real de corrida por historia -- 2 reintentos adicionales (3
+# evaluaciones del juez en total) es el default, no un limite tecnico.
+LOCAL_DIFF_MAX_RETRY_ATTEMPTS = int(os.environ.get("LOCAL_DIFF_MAX_RETRY_ATTEMPTS", "2"))
 # Cota de seguridad externa para el subproceso de judge_agent.py: las cotas
 # internas (MAX_TOOL_TURNS=6 * OLLAMA_TIMEOUT_SECONDS=300 por turno) ya
 # acotan el peor caso a decenas de minutos, pero sin esto un backend LLM
@@ -1268,7 +1278,16 @@ def _local_coding_agent_backend_available() -> bool:
 # cwd del proceso (bug YA arreglado ahi), pero esto queda como defensa en
 # profundidad -- si algun cache futuro vuelve a escribir dentro del repo
 # objetivo por cualquier motivo, no termina commiteado igual.
-_SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__", "cache"}
+# Bug real confirmado en vivo (epica KAN-4): "test-results/" es el directorio
+# de estado interno de Vitest (ej. test-results/.last-run.json, para su
+# feature de re-correr solo los tests que fallaron) -- efimero, generado por
+# CUALQUIER "npm test" real, nunca deberia commitearse. Sin esto, un
+# reintento que ni siquiera aplico un cambio real (el modelo reporto
+# "blocked", correcto y honesto) igual quedaba marcado como "applied=True"
+# solo porque `npm test` habia corrido y dejado ese archivo atras -- la
+# epica avanzaba (o el juez volvia a evaluar) sobre un diff que en realidad
+# no tenia ningun cambio de codigo real adentro.
+_SCAFFOLD_SCAN_SKIP_DIRS = {".git", "node_modules", "target", "vendor", "dist", "build", "bin", "obj", ".venv", "venv", "__pycache__", "cache", "test-results", "coverage"}
 
 
 def _git_add_all_excluding_vendor(target_repo_dir: str) -> None:
@@ -2248,14 +2267,27 @@ def _retry_local_diff(
     branch: str | None = None,
     base_branch: str | None = None,
 ) -> dict | None:
-    """Le da al coding agent un segundo (y ultimo) intento cuando el primer
-    veredicto fue FLAGGED con un policy_reference retryable -- reusa la
-    misma rama, le agrega el feedback del juez al prompt, y si produce
-    cambios nuevos vuelve a correr tests + juez. Devuelve el veredicto
-    nuevo (final) si hubo un segundo intento con resultado, o None si no
-    hubo cambios nuevos (el llamador se queda con el veredicto original).
-    Si los tests fallan en el reintento, bloquea directo (mismo criterio
-    que el primer intento) en vez de devolver un veredicto.
+    """Le da al coding agent hasta LOCAL_DIFF_MAX_RETRY_ATTEMPTS intentos
+    adicionales cuando el veredicto fue FLAGGED con un policy_reference
+    retryable -- reusa la misma rama/conversacion, le agrega el feedback del
+    juez (mas una guia concreta por policy_reference, REMEDIATION_HINTS) al
+    prompt, y si produce cambios nuevos vuelve a correr tests + juez. Sigue
+    reintentando mientras el nuevo veredicto siga FLAGGED con un
+    policy_reference retryable y queden intentos. Devuelve el veredicto mas
+    reciente que un reintento SI llego a evaluar, o None si el primer
+    intento no produjo ningun cambio nuevo (el llamador se queda con el
+    veredicto original). Si los tests fallan en cualquier reintento, bloquea
+    directo (mismo criterio que el primer intento) en vez de devolver un
+    veredicto.
+
+    Gap real confirmado en vivo (epica KAN-4, KAN-5, qwen3:8b): con un solo
+    reintento, el segundo intento agrego codigo real (AuthGuard async,
+    SharedService.getData()) pero no corrigio los mocks -- el juez volvio a
+    marcar FLAGGED por el MISMO policy_reference (insufficient-test-coverage)
+    y la epica se cortaba ahi sin darle al modelo otra chance con guia mas
+    especifica. Ahora, mientras el veredicto siga siendo el mismo tipo de
+    problema retryable, se le da guia mas concreta (REMEDIATION_HINTS) en
+    cada vuelta -- no solo el reasoning libre del juez.
 
     branch/base_branch: opcionales -- si no se pasan, se leen de
     agent_result (comportamiento historico, valido en _deliver() porque ahi
@@ -2273,44 +2305,72 @@ def _retry_local_diff(
     """
     branch = branch if branch is not None else agent_result["branch"]
     base_branch = base_branch if base_branch is not None else agent_result["base_branch"]
-    reasoning = judge_verdict.get("reasoning", "")
-    feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
-    # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
-    # chequeo deterministico de cobertura de tests (judge_agent.py) es
-    # evidencia REAL (que archivos concretos no tienen test), pero solo se
-    # la dabamos al JUEZ -- el reintento del coding agent solo recibia el
-    # "reasoning" libre del juez, que puede parafrasear vagamente ("faltan
-    # tests") sin citar los archivos concretos, sobre todo con modelos
-    # locales (ya confirmado poco confiables citando evidencia especifica
-    # esta sesion). Agregar la evidencia deterministica tal cual asegura
-    # que el segundo intento sepa EXACTAMENTE que archivo necesita test,
-    # sin depender de que el juez lo haya parafraseado bien.
-    test_coverage_evidence = judge_agent._test_coverage_evidence("local_diff", diff_text) if diff_text else ""
-    if test_coverage_evidence:
-        feedback_text += f"\n\n--- EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS ---\n{test_coverage_evidence}"
-    # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
-    # a mandar sanitized + feedback desde cero (compatibilidad con corridas
-    # que no lo generaron).
-    if not agent_result.get("conversation_file"):
-        feedback_text = f"{sanitized}\n\n{feedback_text}"
 
-    retry_result = retry_coding_agent_local_real(
-        ticket_id, feedback_text, target_repo_dir, conversation_file=agent_result.get("conversation_file")
-    )
-    # _retry_local_diff es siempre el ultimo intento de esta cadena (no hay
-    # un tercero) -- a diferencia del modo epica secuencial, nadie mas va a
-    # continuar esta conversacion, se limpia apenas se consume.
-    if retry_result.get("conversation_file"):
-        Path(retry_result["conversation_file"]).unlink(missing_ok=True)
-    if not retry_result["applied"]:
-        print("El segundo intento no produjo cambios nuevos -- se mantiene el veredicto FLAGGED original.")
-        return None
+    conversation_file = agent_result.get("conversation_file")
+    current_diff_text = diff_text
+    current_verdict = judge_verdict
+    any_retry_applied = False
+    attempt_labels = ["segundo intento", "tercer intento", "cuarto intento", "quinto intento"]
 
-    return _evaluate_new_diff_after_retry(
-        ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
-        target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
-        "segundo intento", conflicts=conflicts,
-    )
+    for attempt_index in range(LOCAL_DIFF_MAX_RETRY_ATTEMPTS):
+        label = attempt_labels[attempt_index] if attempt_index < len(attempt_labels) else f"intento #{attempt_index + 2}"
+        reasoning = current_verdict.get("reasoning", "")
+        feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+        # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
+        # chequeo deterministico de cobertura de tests (judge_agent.py) es
+        # evidencia REAL (que archivos concretos no tienen test), pero solo se
+        # la dabamos al JUEZ -- el reintento del coding agent solo recibia el
+        # "reasoning" libre del juez, que puede parafrasear vagamente ("faltan
+        # tests") sin citar los archivos concretos, sobre todo con modelos
+        # locales (ya confirmado poco confiables citando evidencia especifica
+        # esta sesion). Agregar la evidencia deterministica tal cual asegura
+        # que el reintento sepa EXACTAMENTE que archivo necesita test, sin
+        # depender de que el juez lo haya parafraseado bien.
+        test_coverage_evidence = judge_agent._test_coverage_evidence("local_diff", current_diff_text) if current_diff_text else ""
+        if test_coverage_evidence:
+            feedback_text += f"\n\n--- EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS ---\n{test_coverage_evidence}"
+        remediation_hint = REMEDIATION_HINTS.get(current_verdict.get("policy_reference"))
+        if remediation_hint:
+            feedback_text += f"\n\n--- COMO CORREGIRLO ---\n{remediation_hint}"
+        # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
+        # a mandar sanitized + feedback desde cero (compatibilidad con corridas
+        # que no lo generaron).
+        if not conversation_file:
+            feedback_text = f"{sanitized}\n\n{feedback_text}"
+
+        retry_result = retry_coding_agent_local_real(
+            ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
+        )
+        conversation_file = retry_result.get("conversation_file") or conversation_file
+        if not retry_result["applied"]:
+            print(f"El {label} no produjo cambios nuevos -- se mantiene el ultimo veredicto conocido.")
+            break
+
+        any_retry_applied = True
+        current_verdict = _evaluate_new_diff_after_retry(
+            ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
+            target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
+            label, conflicts=conflicts,
+        )
+        keeps_retrying = (
+            current_verdict is not None
+            and current_verdict.get("verdict") == "FLAGGED"
+            and current_verdict.get("policy_reference") in RETRYABLE_POLICY_REFERENCES
+            and attempt_index + 1 < LOCAL_DIFF_MAX_RETRY_ATTEMPTS
+        )
+        if not keeps_retrying:
+            break
+        current_diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..{branch}"])
+        print(f"🔁 {ticket_id}: el {label} sigue con {current_verdict.get('policy_reference')} -- otro intento mas.")
+
+    # A diferencia del modo epica secuencial, nadie mas va a continuar esta
+    # conversacion una vez agotados los intentos -- se limpia apenas se
+    # termina de consumir (no en cada vuelta, para poder seguir pasandosela
+    # al siguiente intento dentro de este mismo loop).
+    if conversation_file:
+        Path(conversation_file).unlink(missing_ok=True)
+
+    return current_verdict if any_retry_applied else None
 
 
 def _retry_after_no_changes(

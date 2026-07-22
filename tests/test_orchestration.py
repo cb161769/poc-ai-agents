@@ -169,7 +169,7 @@ def test_git_add_all_excluding_vendor_skips_nested_node_modules(tmp_path):
     assert "node_modules" not in staged
 
 
-@pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__", "cache"])
+@pytest.mark.parametrize("vendor_dir", ["node_modules", "vendor", "target", "dist", "build", ".venv", "__pycache__", "cache", "test-results", "coverage"])
 def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, vendor_dir):
     _init_real_git_repo(tmp_path)
     nested = tmp_path / vendor_dir / "some-file.txt"
@@ -181,6 +181,30 @@ def test_git_add_all_excluding_vendor_skips_every_known_vendor_dir(tmp_path, ven
     import subprocess as sp
     staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
     assert staged.strip() == ""
+
+
+def test_git_add_all_excluding_vendor_skips_vitest_last_run_state(tmp_path):
+    """Bug real confirmado en vivo (epica KAN-4): "test-results/.last-run.json"
+    es el estado interno de Vitest (para su feature de re-correr solo los
+    tests que fallaron), generado por CUALQUIER "npm test" real -- efimero,
+    nunca deberia commitearse. Sin esto, un reintento donde el modelo
+    reporto honestamente "blocked" (sin ningun cambio de codigo real)
+    quedaba igual marcado como "applied=True" solo porque el archivo de
+    estado de Vitest quedo atras -- la epica avanzaba sobre un diff sin
+    ningun cambio de codigo real adentro.
+    """
+    _init_real_git_repo(tmp_path)
+    (tmp_path / "app.py").write_text("codigo real")
+    nested = tmp_path / "frontend" / "test-results" / ".last-run.json"
+    nested.parent.mkdir(parents=True)
+    nested.write_text('{"files": {}}')
+
+    _git_add_all_excluding_vendor(str(tmp_path))
+
+    import subprocess as sp
+    staged = sp.run(["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"], capture_output=True, text=True).stdout
+    assert "app.py" in staged
+    assert "test-results" not in staged
 
 
 def test_branch_diff_has_vendor_pollution_detects_committed_node_modules(tmp_path):
@@ -792,6 +816,136 @@ def test_retry_local_diff_mirrors_blocked_transition_to_epic_children(monkeypatc
         (orchestration.JIRA_BLOCKED_STATUS, "CHILD-1"),
         (orchestration.JIRA_BLOCKED_STATUS, "CHILD-2"),
     ]
+
+
+def test_retry_local_diff_includes_remediation_hint_for_known_policy_reference(monkeypatch):
+    """Gap real confirmado en vivo (KAN-5, qwen3:8b): el reasoning libre del
+    juez y la evidencia deterministica de "falta archivo de test" no
+    alcanzan cuando el problema real es calidad de mocks (el test YA existe).
+    El feedback ahora tiene que incluir la guia concreta de
+    REMEDIATION_HINTS para ese policy_reference.
+    """
+    captured_feedback = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        captured_feedback["text"] = feedback_text
+        return {"applied": True, "backend": "anthropic"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
+
+    flagged_insufficient_coverage = {
+        "verdict": "FLAGGED", "reasoning": "los mocks no cubren AuthService", "policy_reference": "insufficient-test-coverage",
+    }
+
+    _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_insufficient_coverage,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert "COMO CORREGIRLO" in captured_feedback["text"]
+    assert "mockeada explicitamente" in captured_feedback["text"]
+
+
+def test_retry_local_diff_keeps_retrying_while_still_flagged_with_retryable_reference(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5): con un solo
+    reintento, un segundo veredicto FLAGGED con el MISMO policy_reference
+    cortaba la epica entera de inmediato. Ahora, mientras queden intentos
+    (LOCAL_DIFF_MAX_RETRY_ATTEMPTS) y el veredicto siga siendo
+    FLAGGED+retryable, se le da otra vuelta al coding agent -- este test
+    simula exactamente ese caso: intento 2 sigue FLAGGED, intento 3 (ultimo,
+    default=2 reintentos) recien ahi corrige.
+    """
+    retry_calls = []
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        retry_calls.append(feedback_text)
+        return {"applied": True, "backend": "anthropic"}
+
+    verdicts = iter([
+        {"verdict": "FLAGGED", "reasoning": "todavia sin mocks", "policy_reference": "insufficient-test-coverage"},
+        {"verdict": "OK", "reasoning": "ahora si mockea AuthService"},
+    ])
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: next(verdicts))
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert result == {"verdict": "OK", "reasoning": "ahora si mockea AuthService"}
+    assert len(retry_calls) == 2
+
+
+def test_retry_local_diff_stops_after_max_attempts_still_flagged(monkeypatch):
+    """Si el veredicto sigue FLAGGED+retryable incluso despues de agotar
+    LOCAL_DIFF_MAX_RETRY_ATTEMPTS, se corta -- no reintenta para siempre.
+    """
+    retry_calls = []
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        retry_calls.append(feedback_text)
+        return {"applied": True, "backend": "anthropic"}
+
+    always_flagged = {"verdict": "FLAGGED", "reasoning": "sigue sin mocks", "policy_reference": "insufficient-test-coverage"}
+
+    monkeypatch.setattr(orchestration, "LOCAL_DIFF_MAX_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: always_flagged)
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert result == always_flagged
+    assert len(retry_calls) == 2  # LOCAL_DIFF_MAX_RETRY_ATTEMPTS, nunca un tercero
+
+
+def test_retry_local_diff_stops_retrying_for_a_nonretryable_policy_reference(monkeypatch):
+    """Si el reintento produce un veredicto FLAGGED con un policy_reference
+    NO retryable (ej. seguridad real), se corta ahi -- no sigue insistiendo.
+    """
+    retry_calls = []
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        retry_calls.append(feedback_text)
+        return {"applied": True, "backend": "anthropic"}
+
+    security_flagged = {"verdict": "FLAGGED", "reasoning": "fuga real", "policy_reference": "data-leak-evidence"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: security_flagged)
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+        False, None, "2026-01-01T00:00:00Z",
+    )
+
+    assert result == security_flagged
+    assert len(retry_calls) == 1
 
 
 _NOT_APPLIED_AGENT_RESULT = {
