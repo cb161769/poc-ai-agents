@@ -21,6 +21,7 @@ from orchestration import (
     _comment_all,
     _deliver,
     _branch_diff_has_vendor_pollution,
+    _branch_diff_deletes_existing_subproject,
     _branch_has_recorded_judge_ok,
     _check_pr_rejected_for_branch,
     _fetch_unresolved_pr_comments,
@@ -241,6 +242,69 @@ def test_branch_diff_has_vendor_pollution_none_for_clean_diff(tmp_path):
     sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "real change"], check=True)
 
     assert _branch_diff_has_vendor_pollution(str(tmp_path), "copilot/T-1-123", "main") is None
+
+
+def test_branch_diff_deletes_existing_subproject_detects_destructive_rm(tmp_path):
+    """Bug real confirmado en vivo (epica KAN-4, qwen3:8b): 'ionic start'
+    rechazo scaffoldear dentro de frontend/ (ya tenia archivos reales) --
+    tras varios intentos fallidos, el modelo corrio 'rm -rf frontend &&
+    ionic start frontend ...', un comando destructivo que NO_AUTO_CONFIRM=1
+    aprobo sin un humano mirando. Solo la mitad 'rm -rf' corrio de verdad
+    (la otra mitad fallo, "ionic" no disponible fuera del contenedor de
+    stack real) -- el commit resultante borra package.json (y todo lo
+    demas) sin volver a crearlo. La rama quedaba "abierta" (nunca mergeada)
+    y se seguia resumiendo, repitiendo el mismo callejon sin salida en cada
+    corrida siguiente.
+    """
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name": "frontend"}')
+    (frontend / "src").mkdir()
+    (frontend / "src" / "app.ts").write_text("export const x = 1;")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "real frontend work"], check=True)
+
+    sp.run(["git", "-C", str(tmp_path), "checkout", "-b", "copilot/T-1-123"], check=True, capture_output=True)
+    sp.run(["git", "-C", str(tmp_path), "rm", "-rf", "frontend"], check=True, capture_output=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "destructive rm -rf"], check=True)
+
+    reason = _branch_diff_deletes_existing_subproject(str(tmp_path), "copilot/T-1-123", "main")
+
+    assert reason is not None
+    assert "package.json" in reason
+
+
+def test_branch_diff_deletes_existing_subproject_none_when_marker_recreated(tmp_path):
+    """Si el marcador borrado (package.json) se vuelve a crear en algun lado
+    de la rama (ej. el sub-proyecto genuinamente se movio/reestructuro), no
+    es una regresion destructiva -- no deberia dispararse el abandono.
+    """
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text('{"name": "frontend"}')
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "real frontend work"], check=True)
+
+    sp.run(["git", "-C", str(tmp_path), "checkout", "-b", "copilot/T-1-123"], check=True, capture_output=True)
+    sp.run(["git", "-C", str(tmp_path), "mv", "frontend/package.json", "package.json"], check=True, capture_output=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "moved to root"], check=True)
+
+    assert _branch_diff_deletes_existing_subproject(str(tmp_path), "copilot/T-1-123", "main") is None
+
+
+def test_branch_diff_deletes_existing_subproject_none_for_clean_diff(tmp_path):
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    sp.run(["git", "-C", str(tmp_path), "checkout", "-b", "copilot/T-1-123"], check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print('hi')")
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "real change"], check=True)
+
+    assert _branch_diff_deletes_existing_subproject(str(tmp_path), "copilot/T-1-123", "main") is None
 
 
 def test_ensure_on_trunk_branch_checks_out_main_and_pulls(monkeypatch):

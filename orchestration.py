@@ -1399,6 +1399,56 @@ def _branch_diff_has_vendor_pollution(target_repo_dir: str, branch: str, base_br
     return None
 
 
+_STACK_MARKER_NAMES = {marker for marker, _stack, _cmd in _STACK_MARKERS}
+
+
+def _branch_diff_deletes_existing_subproject(target_repo_dir: str, branch: str, base_branch: str) -> str | None:
+    """Bug real confirmado en vivo (epica KAN-4, qwen3:8b): "ionic start"
+    corrido DENTRO de un sub-proyecto que ya tenia archivos reales (rechaza
+    scaffoldear un directorio no vacio, comportamiento normal del CLI) llevo
+    al modelo, tras varios intentos fallidos, a ejecutar "rm -rf frontend && \
+    ionic start frontend blank ...' -- un comando destructivo que
+    NO_AUTO_CONFIRM=1 (modo Docker-outside-of-Docker, sin humano mirando en
+    vivo) aprobo automaticamente. El "&&" hizo que solo la mitad destructiva
+    corriera de verdad (el "rm -rf" nativo funciono, "ionic start" fallo por
+    no estar disponible fuera del contenedor de stack real) -- el resultado
+    fue un commit real que BORRA un sub-proyecto entero (frontend/package.json,
+    tests, config) sin volver a crear nada en su lugar. La rama quedo
+    "abierta" (nunca mergeada) y por eso se seguia resumiendo en cada corrida
+    siguiente, repitiendo el mismo callejon sin salida. Mismo criterio que
+    _has_duplicate_project_scaffolding/_branch_diff_has_vendor_pollution
+    (señal de salud SEPARADA para el gate de resumir una rama existente):
+    si el diff borra el archivo marcador de un sub-proyecto (package.json,
+    pom.xml, etc.) sin que ese mismo marcador exista de nuevo en la rama
+    actual, es evidencia real de una regresion destructiva -- se abandona y
+    arranca de cero en vez de construir sobre un repo con menos código real
+    que antes.
+    """
+    diff_status = subprocess.run(
+        ["git", "-C", target_repo_dir, "diff", "--name-status", f"{base_branch}..{branch}"],
+        capture_output=True, text=True,
+    ).stdout.splitlines()
+    deleted_markers = []
+    for line in diff_status:
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[0].startswith("D"):
+            continue
+        deleted_path = Path(parts[-1])
+        if deleted_path.name in _STACK_MARKER_NAMES or deleted_path.suffix in (".csproj", ".sln"):
+            deleted_markers.append(deleted_path)
+
+    still_missing = [
+        str(marker) for marker in deleted_markers
+        if not (Path(target_repo_dir) / marker).exists()
+    ]
+    if still_missing:
+        return (
+            f"el diff contra '{base_branch}' borra {', '.join(sorted(still_missing))} (marcador de un "
+            "sub-proyecto real) sin volver a crearlo -- probablemente un 'rm -rf' destructivo de una corrida anterior"
+        )
+    return None
+
+
 @task(retries=0, name="coding-agent-local-real")
 def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
     """Camino B1: the real local coding agent (coding_agent.py) -- reasons
@@ -1438,8 +1488,11 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
             # gastar tiempo corriendo tests sobre algo que se va a abandonar
             # de todas formas.
             vendor_pollution = _branch_diff_has_vendor_pollution(target_repo_dir, existing_branch, base_branch)
+            destructive_deletion = _branch_diff_deletes_existing_subproject(target_repo_dir, existing_branch, base_branch)
             if vendor_pollution:
                 abandon_reason = vendor_pollution
+            elif destructive_deletion:
+                abandon_reason = destructive_deletion
             else:
                 health_check = run_tests(target_repo_dir)
                 if not health_check["passed"]:

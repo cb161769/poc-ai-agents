@@ -359,6 +359,20 @@ scaffoldear un proyecto/estructura nueva, o de crear un archivo cuyo nombre ya e
 el mismo directorio (ej. Header.tsx cuando ya existe Header.ts), list_directory ESE directorio puntual \
 primero -- si ya hay estructura real ahi, extendela/edita lo existente, no dupliques creando algo paralelo.
 
+Bug real confirmado en vivo (epica KAN-4, qwen3:8b): un comando de scaffolding ("ionic start", "ng new", \
+"create-react-app", etc.) rechaza correr dentro de un directorio que ya tiene archivos -- eso es intencional \
+del CLI, NO un problema a resolver borrando esos archivos. Confirmado real: tras varios rechazos asi, el \
+modelo corrio "rm -rf frontend && ionic start frontend ..." -- un comando destructivo que se auto-aprobo (sin \
+un humano mirando en vivo) y borro un sub-proyecto real entero (tests, config, codigo ya commiteado) sin \
+volver a crear nada en su lugar cuando la segunda mitad del comando fallo. NUNCA uses "rm -rf" (ni ningun \
+comando destructivo) sobre un directorio con codigo real existente para "resolver" que un scaffolder se niegue \
+a correr ahi -- si el directorio ya tiene estructura real, esa es la señal de que NO hace falta (o no se puede) \
+scaffoldear de cero: investigá con list_directory/read_file qué hay, y agregá/editá lo que falta a mano \
+(package.json, tsconfig.json, capacitor.config.json, los archivos de Angular/Ionic que necesites) en vez de \
+borrar para volver a empezar. Si genuinamente creés que hace falta borrar algo real, marcá "blocked" y \
+explicá por qué en el summary -- nunca lo ejecutes vos mismo sin que quede como una decisión explícita y \
+revisable, no como un intento mas de una cadena de comandos que fueron fallando.
+
 Bug real confirmado en vivo (epica KAN-4, scaffold Angular/Ionic): un archivo con decoradores de Angular \
 (@NgModule, @Component, @Injectable) sin un tsconfig.json real en ese sub-proyecto con \
 "experimentalDecorators": true (y "emitDecoratorMetadata": true) rompe el test runner con un error de \
@@ -383,6 +397,15 @@ permiso denegado, lo que corresponda al cambio real) cuando el cambio lo amerite
 feliz tampoco cuenta como "tests_adequate": true. Si genuinamente no hay forma de agregar un test (herramienta \
 no disponible, cambio no testeable en este contexto), explicalo en el summary y marca "tests_adequate": false \
 con honestidad -- no te declares "done" dandole al ticket por resuelto sin dejar constancia explicita de ese gap.
+
+Bug real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas con el mismo veredicto): un test que \
+EXISTE pero no cumple estos dos puntos igual cuenta como "tests_adequate": false -- (1) toda dependencia \
+externa/inyectada (servicios, HTTP, storage, guards) que tu codigo nuevo usa tiene que estar mockeada \
+explicitamente en el test (jest.fn(), spyOn, o el equivalente real del framework), nunca invocada de verdad; \
+(2) todo metodo async/Promise que tu codigo nuevo introduce tiene que verificarse con await/resolves/rejects \
+(o fakeAsync/tick si es Angular), nunca asumido sincronico ni dejado sin awaitear en el test. Un test que solo \
+llama la funcion y chequea que no tira error, sin mockear sus dependencias ni esperar su resultado async, NO \
+alcanza aunque pase en verde.
 
 Cuando termines (con exito o porque no podes seguir), respondé con texto plano que sea UNICAMENTE un \
 objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "done" o "blocked", \

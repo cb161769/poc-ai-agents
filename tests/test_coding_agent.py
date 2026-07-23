@@ -2005,3 +2005,30 @@ def test_system_prompt_requires_at_least_one_negative_test_case():
     incluir al menos un caso negativo/de error cuando el cambio lo amerite."""
     assert "al menos UN caso negativo/de error" in ca.CODING_AGENT_SYSTEM_PROMPT
     assert "cubrir solo el camino feliz tampoco cuenta" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_forbids_destructive_rm_to_work_around_scaffolder_refusal():
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): 'ionic start'
+    rechazo un directorio no vacio, y el modelo termino corriendo
+    'rm -rf frontend && ionic start frontend ...' -- NO_AUTO_CONFIRM=1
+    aprobo el comando destructivo sin un humano mirando, borrando un
+    sub-proyecto real (con historia de commits reales) sin volver a crear
+    nada en su lugar. El prompt tiene que prohibir explicitamente este
+    patron.
+    """
+    assert "NUNCA uses \"rm -rf\"" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "se auto-aprobo" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_mocking_dependencies_and_async_verification():
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas
+    con el mismo veredicto insufficient-test-coverage): el prompt ya exigia
+    UN test nuevo con un caso negativo, pero nunca mencionaba mockear
+    dependencias externas ni verificar comportamiento async -- exactamente
+    lo que el juez marco FLAGGED las dos veces. Antes, esta guia solo llegaba
+    DESPUES de fallar, via REMEDIATION_HINTS en un reintento (pipeline_shared.py)
+    -- ahora tiene que estar en el prompt base, para el primer intento.
+    """
+    assert "mockeada explicitamente" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "await/resolves/rejects" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "fakeAsync/tick" in ca.CODING_AGENT_SYSTEM_PROMPT
