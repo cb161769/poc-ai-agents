@@ -708,6 +708,41 @@ def test_retry_local_diff_blocks_when_retry_tests_fail(monkeypatch):
         )
 
 
+def test_retry_local_diff_cleans_up_conversation_file_even_when_retry_tests_fail(tmp_path, monkeypatch):
+    """Gap real encontrado en auditoria del multi-intento (910b850): la
+    version de un solo reintento limpiaba conversation_file ANTES de la
+    evaluacion que puede levantar PipelineBlocked (guardia de salida/tests
+    reales) -- al convertirlo en loop, la limpieza se movio a DESPUES del
+    loop sin try/finally, salteandose en cualquier salida por excepcion y
+    dejando el archivo temporal huerfano. Confirma que sigue limpiandose
+    incluso cuando el reintento rompe los tests reales.
+    """
+    leaked_file = tmp_path / "conversation.json"
+    leaked_file.write_text("{}")
+
+    monkeypatch.setattr(
+        orchestration, "retry_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "backend": "anthropic", "conversation_file": str(leaked_file)},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text del segundo intento")
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+
+    with pytest.raises(PipelineBlocked):
+        _retry_local_diff(
+            "T-1", "prompt original", "/repo", _AGENT_RESULT, _FLAGGED_RETRYABLE,
+            {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
+            False, None, "2026-01-01T00:00:00Z",
+        )
+
+    assert not leaked_file.exists()
+
+
 def test_retry_local_diff_blocks_when_output_guard_finds_a_leak(monkeypatch):
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": True, "backend": "anthropic"})
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text con un secreto")

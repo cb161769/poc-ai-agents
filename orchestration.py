@@ -2312,63 +2312,73 @@ def _retry_local_diff(
     any_retry_applied = False
     attempt_labels = ["segundo intento", "tercer intento", "cuarto intento", "quinto intento"]
 
-    for attempt_index in range(LOCAL_DIFF_MAX_RETRY_ATTEMPTS):
-        label = attempt_labels[attempt_index] if attempt_index < len(attempt_labels) else f"intento #{attempt_index + 2}"
-        reasoning = current_verdict.get("reasoning", "")
-        feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
-        # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
-        # chequeo deterministico de cobertura de tests (judge_agent.py) es
-        # evidencia REAL (que archivos concretos no tienen test), pero solo se
-        # la dabamos al JUEZ -- el reintento del coding agent solo recibia el
-        # "reasoning" libre del juez, que puede parafrasear vagamente ("faltan
-        # tests") sin citar los archivos concretos, sobre todo con modelos
-        # locales (ya confirmado poco confiables citando evidencia especifica
-        # esta sesion). Agregar la evidencia deterministica tal cual asegura
-        # que el reintento sepa EXACTAMENTE que archivo necesita test, sin
-        # depender de que el juez lo haya parafraseado bien.
-        test_coverage_evidence = judge_agent._test_coverage_evidence("local_diff", current_diff_text) if current_diff_text else ""
-        if test_coverage_evidence:
-            feedback_text += f"\n\n--- EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS ---\n{test_coverage_evidence}"
-        remediation_hint = REMEDIATION_HINTS.get(current_verdict.get("policy_reference"))
-        if remediation_hint:
-            feedback_text += f"\n\n--- COMO CORREGIRLO ---\n{remediation_hint}"
-        # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
-        # a mandar sanitized + feedback desde cero (compatibilidad con corridas
-        # que no lo generaron).
-        if not conversation_file:
-            feedback_text = f"{sanitized}\n\n{feedback_text}"
+    # Bug real encontrado en auditoria de este mismo cambio: la version de
+    # un solo intento limpiaba conversation_file INMEDIATAMENTE despues de
+    # retry_coding_agent_local_real() (antes de _evaluate_new_diff_after_retry,
+    # que puede levantar PipelineBlocked si el reintento rompe tests/guardia
+    # de salida) -- al convertir esto en loop, mover la limpieza a DESPUES
+    # del loop (sin try/finally) la salteaba en cualquier salida por
+    # excepcion, dejando el archivo temporal huerfano. try/finally garantiza
+    # la misma limpieza incondicional de antes, sin importar por donde se
+    # salga del loop (return, break, o excepcion).
+    try:
+        for attempt_index in range(LOCAL_DIFF_MAX_RETRY_ATTEMPTS):
+            label = attempt_labels[attempt_index] if attempt_index < len(attempt_labels) else f"intento #{attempt_index + 2}"
+            reasoning = current_verdict.get("reasoning", "")
+            feedback_text = f"--- FEEDBACK DEL JUEZ (corregir antes de continuar) ---\n{reasoning}"
+            # Gap real identificado en auditoria ("gaps en el flujo de jira"): el
+            # chequeo deterministico de cobertura de tests (judge_agent.py) es
+            # evidencia REAL (que archivos concretos no tienen test), pero solo se
+            # la dabamos al JUEZ -- el reintento del coding agent solo recibia el
+            # "reasoning" libre del juez, que puede parafrasear vagamente ("faltan
+            # tests") sin citar los archivos concretos, sobre todo con modelos
+            # locales (ya confirmado poco confiables citando evidencia especifica
+            # esta sesion). Agregar la evidencia deterministica tal cual asegura
+            # que el reintento sepa EXACTAMENTE que archivo necesita test, sin
+            # depender de que el juez lo haya parafraseado bien.
+            test_coverage_evidence = judge_agent._test_coverage_evidence("local_diff", current_diff_text) if current_diff_text else ""
+            if test_coverage_evidence:
+                feedback_text += f"\n\n--- EVIDENCIA DETERMINISTICA DE COBERTURA DE TESTS ---\n{test_coverage_evidence}"
+            remediation_hint = REMEDIATION_HINTS.get(current_verdict.get("policy_reference"))
+            if remediation_hint:
+                feedback_text += f"\n\n--- COMO CORREGIRLO ---\n{remediation_hint}"
+            # Si no hay conversation_file, retry_coding_agent_local_real() cae sola
+            # a mandar sanitized + feedback desde cero (compatibilidad con corridas
+            # que no lo generaron).
+            if not conversation_file:
+                feedback_text = f"{sanitized}\n\n{feedback_text}"
 
-        retry_result = retry_coding_agent_local_real(
-            ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
-        )
-        conversation_file = retry_result.get("conversation_file") or conversation_file
-        if not retry_result["applied"]:
-            print(f"El {label} no produjo cambios nuevos -- se mantiene el ultimo veredicto conocido.")
-            break
+            retry_result = retry_coding_agent_local_real(
+                ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
+            )
+            conversation_file = retry_result.get("conversation_file") or conversation_file
+            if not retry_result["applied"]:
+                print(f"El {label} no produjo cambios nuevos -- se mantiene el ultimo veredicto conocido.")
+                break
 
-        any_retry_applied = True
-        current_verdict = _evaluate_new_diff_after_retry(
-            ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
-            target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
-            label, conflicts=conflicts,
-        )
-        keeps_retrying = (
-            current_verdict is not None
-            and current_verdict.get("verdict") == "FLAGGED"
-            and current_verdict.get("policy_reference") in RETRYABLE_POLICY_REFERENCES
-            and attempt_index + 1 < LOCAL_DIFF_MAX_RETRY_ATTEMPTS
-        )
-        if not keeps_retrying:
-            break
-        current_diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..{branch}"])
-        print(f"🔁 {ticket_id}: el {label} sigue con {current_verdict.get('policy_reference')} -- otro intento mas.")
-
-    # A diferencia del modo epica secuencial, nadie mas va a continuar esta
-    # conversacion una vez agotados los intentos -- se limpia apenas se
-    # termina de consumir (no en cada vuelta, para poder seguir pasandosela
-    # al siguiente intento dentro de este mismo loop).
-    if conversation_file:
-        Path(conversation_file).unlink(missing_ok=True)
+            any_retry_applied = True
+            current_verdict = _evaluate_new_diff_after_retry(
+                ticket_id, branch, base_branch, retry_result.get("backend"), retry_result.get("self_review"),
+                target_repo_dir, jira_context, firewall_result, components, summary, is_epic, child_ticket_keys, falco_since,
+                label, conflicts=conflicts,
+            )
+            keeps_retrying = (
+                current_verdict is not None
+                and current_verdict.get("verdict") == "FLAGGED"
+                and current_verdict.get("policy_reference") in RETRYABLE_POLICY_REFERENCES
+                and attempt_index + 1 < LOCAL_DIFF_MAX_RETRY_ATTEMPTS
+            )
+            if not keeps_retrying:
+                break
+            current_diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..{branch}"])
+            print(f"🔁 {ticket_id}: el {label} sigue con {current_verdict.get('policy_reference')} -- otro intento mas.")
+    finally:
+        # A diferencia del modo epica secuencial, nadie mas va a continuar esta
+        # conversacion una vez agotados los intentos -- se limpia apenas se
+        # termina de consumir (no en cada vuelta, para poder seguir pasandosela
+        # al siguiente intento dentro de este mismo loop).
+        if conversation_file:
+            Path(conversation_file).unlink(missing_ok=True)
 
     return current_verdict if any_retry_applied else None
 
