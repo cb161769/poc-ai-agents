@@ -1736,6 +1736,35 @@ def test_tool_edit_file_rejects_zero_matches(tmp_path, monkeypatch):
     assert (tmp_path / "f.py").read_text() == "def foo():\n    return 1\n"
 
 
+def test_tool_edit_file_zero_matches_includes_real_current_content(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-7, qwen3:8b): un
+    old_string desactualizado (contenido real ya cambio en un intento
+    anterior de la misma conversacion) forzaba al modelo a un read_file
+    aparte que, en conversaciones largas, no siempre hacia antes de
+    reintentar ("sin acceso directo al contenido del archivo"). El error
+    ahora tiene que traer el contenido REAL actual, para que el proximo
+    intento no dependa de que el modelo se acuerde de pedirlo.
+    """
+    (tmp_path / "f.py").write_text("def foo():\n    return 1\n")
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "return 999", "return 2")
+
+    assert "def foo():" in result
+    assert "return 1" in result
+
+
+def test_tool_edit_file_zero_matches_truncates_huge_files(tmp_path, monkeypatch):
+    huge_content = "x = 1\n" * 5000  # bien por encima de _EDIT_ERROR_CONTEXT_CHARS
+    (tmp_path / "f.py").write_text(huge_content)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(str(tmp_path), "f.py", "does not exist", "x")
+
+    assert "truncado" in result
+    assert len(result) < len(huge_content)
+
+
 def test_tool_edit_file_rejects_multiple_matches(tmp_path, monkeypatch):
     (tmp_path / "f.py").write_text("x = 1\nx = 1\n")
     monkeypatch.setattr("builtins.input", lambda: "s")

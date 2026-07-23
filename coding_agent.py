@@ -95,6 +95,10 @@ CODING_AGENT_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("CODIN
 _MAX_READ_BYTES = int(os.environ.get("CODING_AGENT_MAX_READ_BYTES", "60000"))
 _MAX_GREP_FILE_BYTES = 2_000_000
 _MAX_GREP_FILES_SCANNED = 5_000
+# Mucho mas chico que _MAX_READ_BYTES a proposito -- esto se repite en CADA
+# intento fallido de edit_file (no es un read_file explicito), asi que tiene
+# que ser barato en contexto, no una copia completa del archivo.
+_EDIT_ERROR_CONTEXT_CHARS = 4000
 _MAX_LIST_ENTRIES = 500
 _MAX_SHELL_OUTPUT_CHARS = 10_000
 
@@ -354,6 +358,14 @@ reales) sin revisarlo antes -- el resultado fueron DOS arboles src/ desconectado
 scaffoldear un proyecto/estructura nueva, o de crear un archivo cuyo nombre ya existe con otra extension en \
 el mismo directorio (ej. Header.tsx cuando ya existe Header.ts), list_directory ESE directorio puntual \
 primero -- si ya hay estructura real ahi, extendela/edita lo existente, no dupliques creando algo paralelo.
+
+Bug real confirmado en vivo (epica KAN-4, scaffold Angular/Ionic): un archivo con decoradores de Angular \
+(@NgModule, @Component, @Injectable) sin un tsconfig.json real en ese sub-proyecto con \
+"experimentalDecorators": true (y "emitDecoratorMetadata": true) rompe el test runner con un error de \
+sintaxis al importar ese archivo ("Invalid or unexpected token") -- el decorador no es JS/TS valido sin esa \
+config. Si vos mismo creaste/escribiste el primer archivo con un decorador de Angular en un sub-proyecto \
+nuevo, asegurate de que exista un tsconfig.json con esas dos opciones ANTES de darte por "done", no asumas \
+que el scaffold de Ionic/Angular ya lo dejo armado -- verificalo con list_directory/read_file.
 
 Antes de declararte "done", corré algo que verifique tu cambio de verdad con run_shell_command (los tests \
 del proyecto si existen, o al menos una compilacion/lint) -- terminar sin haber corrido nada es aceptable \
@@ -640,7 +652,24 @@ def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string:
 
     count = current.count(old_string)
     if count == 0:
-        return f"error: old_string no se encontro en {path} -- verifica que coincida exactamente (incluido whitespace)"
+        # Gap real confirmado en vivo (epica KAN-4, KAN-7, qwen3:8b): en
+        # conversaciones largas (varios reintentos con feedback del juez
+        # sobre el MISMO archivo, cada uno editandolo), el modelo pierde de
+        # vista el contenido real actual y old_string deja de coincidir --
+        # el error anterior solo decia "verifica que coincida", empujando al
+        # modelo a un read_file aparte que, bajo presion de contexto, no
+        # siempre hacia antes de reintentar (confirmado: "sin acceso directo
+        # al contenido del archivo, no puedo realizar la edicion"). Devolver
+        # el contenido actual (truncado) directo en el error ahorra ese
+        # round-trip y le da la unica fuente de verdad que necesita para el
+        # proximo intento, sin esperar a que decida pedirlo por su cuenta.
+        preview = current if len(current) <= _EDIT_ERROR_CONTEXT_CHARS else (
+            current[:_EDIT_ERROR_CONTEXT_CHARS] + f"\n... (truncado, {len(current)} chars en total -- usa read_file para verlo entero)"
+        )
+        return (
+            f"error: old_string no se encontro en {path} -- verifica que coincida exactamente (incluido whitespace). "
+            f"Contenido REAL actual de {path}:\n---\n{preview}\n---"
+        )
     if count > 1:
         return f"error: old_string aparece {count} veces en {path} -- agrega mas contexto para que sea unico"
 
