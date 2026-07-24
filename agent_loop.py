@@ -824,16 +824,35 @@ def warn_if_context_large(messages: list, logger, label: str, backend: str = "ol
         )
 
 
+# Gap real confirmado en vivo (epica KAN-4): un blip transitorio de red
+# (PyPI timeout) al buscar un paquete MCP via uvx dejo al proceso 'uv' hijo
+# en estado <defunct> -- pero stdio_client(params)/session.initialize()
+# nunca devolvian ni una excepcion ni un resultado, colgando esta funcion
+# (y con ella, TODO el coding agent, y la epica entera) indefinidamente.
+# El try/except de abajo ya existia para el caso "el servidor no esta
+# disponible" (falla rapido), pero nunca cubria "el servidor se cuelga sin
+# fallar ni responder" -- confirmado real con 'docker top' mostrando el
+# proceso hijo zombie mientras el padre seguia esperando.
+MCP_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("MCP_CONNECT_TIMEOUT_SECONDS", "90"))
+
+
 async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: str = "agente") -> dict:
     """Best-effort: a server that's unreachable (uvx missing, Neo4j/Qdrant
     down) is skipped, not fatal — the caller just has fewer tools that run.
+    Cada conexion tiene un timeout real (MCP_CONNECT_TIMEOUT_SECONDS) -- sin
+    esto, un servidor que se cuelga (no falla, no responde) bloquea toda la
+    corrida sin limite.
     """
     sessions = {}
     for name, params in mcp_servers.items():
         try:
-            read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            read, write = await asyncio.wait_for(
+                stack.enter_async_context(stdio_client(params)), timeout=MCP_CONNECT_TIMEOUT_SECONDS
+            )
+            session = await asyncio.wait_for(
+                stack.enter_async_context(ClientSession(read, write)), timeout=MCP_CONNECT_TIMEOUT_SECONDS
+            )
+            await asyncio.wait_for(session.initialize(), timeout=MCP_CONNECT_TIMEOUT_SECONDS)
             sessions[name] = session
         except Exception as exc:
             logger.warning(f"{label}: no se pudo conectar al MCP '{name}', se omite: {exc}")

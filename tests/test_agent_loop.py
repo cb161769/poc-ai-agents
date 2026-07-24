@@ -13,6 +13,7 @@ import pytest
 import agent_loop
 from agent_loop import (
     JSON_CORRECTION_MESSAGE,
+    _connect_mcp_servers,
     _estimate_message_chars,
     _final_text_with_json_retry,
     _ollama_model_available,
@@ -1244,3 +1245,57 @@ def test_normalize_tool_schema_does_not_exclude_unrelated_tools():
     tools = agent_loop._normalize_tool_schema("qdrant-rag", [_FakeMcpTool("qdrant-find")])
 
     assert [t["name"] for t in tools] == ["qdrant-rag__qdrant-find"]
+
+
+def test_connect_mcp_servers_times_out_instead_of_hanging_forever(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4): un blip transitorio de red
+    (PyPI timeout) al buscar un paquete MCP via uvx dejo al proceso hijo en
+    estado <defunct> ('docker top' lo confirmo real) -- pero
+    stdio_client(params)/session.initialize() nunca devolvian ni una
+    excepcion ni un resultado, colgando el coding agent (y la epica entera)
+    indefinidamente. Con timeout, se degrada a 'servidor omitido' -- mismo
+    comportamiento que cualquier otro servidor no disponible."""
+    monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+
+    class HangingStack:
+        async def enter_async_context(self, cm):
+            await asyncio.sleep(999)  # nunca vuelve -- simula el proceso colgado real
+
+    result = asyncio.run(_connect_mcp_servers(HangingStack(), {"qdrant-rag": object()}, label="test"))
+
+    assert result == {}
+
+
+def test_connect_mcp_servers_still_connects_when_fast(monkeypatch):
+    """El timeout no deberia romper el camino feliz -- una conexion real y
+    rapida sigue funcionando igual que antes."""
+    monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+    fake_session = MagicMock()
+    fake_session.initialize = AsyncMock(return_value=None)
+
+    class FastStack:
+        async def enter_async_context(self, cm):
+            if cm is fake_session:
+                return fake_session
+            return ("read", "write")
+
+    monkeypatch.setattr(agent_loop, "ClientSession", lambda read, write: fake_session)
+
+    result = asyncio.run(_connect_mcp_servers(FastStack(), {"qdrant-rag": object()}, label="test"))
+
+    assert result == {"qdrant-rag": fake_session}
+
+
+def test_connect_mcp_servers_skips_server_that_fails_immediately(monkeypatch):
+    monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+
+    class FailingStack:
+        async def enter_async_context(self, cm):
+            raise ConnectionError("no se pudo conectar")
+
+    result = asyncio.run(_connect_mcp_servers(FailingStack(), {"qdrant-rag": object()}, label="test"))
+
+    assert result == {}
