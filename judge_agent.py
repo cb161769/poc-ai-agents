@@ -73,6 +73,7 @@ from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_t
     warn_if_context_large,
 )
 from firewall_proxy import _redact
+from grounding_check import verify_claim_grounded
 from log_utils import get_logger
 from pipeline_shared import RETRYABLE_POLICY_REFERENCES
 
@@ -652,6 +653,25 @@ async def judge_with_tools(payload: dict) -> dict:
             "output_tokens": total_output_tokens,
             "estimated_cost_usd": round(_estimate_cost_usd(backend, ANTHROPIC_MODEL, total_input_tokens, total_output_tokens), 6),
         }
+        # Gap real confirmado en vivo esta sesion (gap_classifier.py, mismo
+        # riesgo estructural aca): un veredicto puede citar una evidencia
+        # ESPECIFICA que suena concreta pero es falsa -- _reasoning_ignores_real_diff_files
+        # ya atrapa "el reasoning no menciona NINGUN archivo real" (alucinacion
+        # burda), pero no "el reasoning menciona el archivo correcto pero
+        # afirma algo falso sobre el". Solo para FLAGGED (la direccion cara:
+        # un FLAGGED con evidencia inventada corta una epica entera por un
+        # motivo que nunca paso) -- NUNCA revierte el veredicto solo, marca
+        # la incertidumbre para que un humano la vea en vez de confiar
+        # ciegamente en una cita que no se pudo confirmar.
+        if verdict.get("verdict") == "FLAGGED":
+            document = f"{payload.get('change_description', '')}\n\n{payload.get('test_summary', '')}"
+            grounded = verify_claim_grounded(document, verdict.get("reasoning", ""))
+            verdict["reasoning_grounded"] = grounded
+            if grounded is False:
+                verdict["reasoning"] = (
+                    "⚠️ Esta justificacion NO se pudo confirmar contra el diff/tests reales (posible cita "
+                    f"inventada) -- tratala con escepticismo: {verdict.get('reasoning', '')}"
+                )
         return verdict
 
     async with AsyncExitStack() as stack:

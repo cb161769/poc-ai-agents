@@ -76,7 +76,17 @@ logger = get_logger(__name__)
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 RUN_LOG = LOG_DIR / "coding_agent_runs.jsonl"
 
-MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "15"))
+MAX_TOOL_TURNS = int(os.environ.get("CODING_AGENT_MAX_TURNS", "20"))
+# Gap real confirmado en vivo (epica KAN-4, esta sesion): un cambio de
+# modelo (maybe_switch_ollama_model) pasa a un backend distinto
+# PRECISAMENTE porque el actual esta fallando -- pero el loop de turnos
+# seguia contando desde el MISMO contador compartido, asi que si el cambio
+# pasaba tarde (ej. turno 10 de 15), el modelo nuevo solo tenia 5 turnos
+# para investigar y resolver un ticket entero desde cero. Este piso
+# garantiza que un cambio de modelo real siempre deja un numero razonable
+# de turnos utilizables, sin importar cuantos ya se gastaron antes del
+# cambio.
+MIN_TURNS_AFTER_MODEL_SWITCH = int(os.environ.get("CODING_AGENT_MIN_TURNS_AFTER_SWITCH", "8"))
 
 # Modelo(s) Ollama propios para este agente -- escribir codigo/usar tools
 # correctamente es mas exigente que solo evaluar texto (judge_agent.py), asi
@@ -344,6 +354,17 @@ Compara tu cambio explicitamente contra los requisitos CONCRETOS del ticket (si 
 Given/When/Then o una lista de requisitos, cubrilos uno por uno) antes de declararte "done" -- "hice algo \
 plausible relacionado con el ticket" no alcanza, tiene que resolver especificamente lo que el ticket pide.
 
+Bug real confirmado en vivo (epica KAN-4, qwen3:8b): un ticket pedia un componente de boton reutilizable con \
+CINCO estados nombrados (Primary, Secondary, Outline, Disabled, Loading) -- implementaste (y testeaste) SOLO \
+Primary, y te declaraste "done" igual. El juez lo marco scope-mismatch por incompleto, y ni el reintento lo \
+corrigio (misma omision, otra vez). Si el ticket enumera VARIOS items nombrados (estados, variantes, casos, \
+endpoints, campos, tipos de error) que tu cambio tiene que cubrir, tu "Plan:" inicial tiene que listarlos TODOS \
+explicitamente como una checklist -- y antes de declararte "done", releé esa checklist contra tu diff real \
+(git_diff) y confirma UNO POR UNO que cada item tiene codigo Y test real, no solo el primero de la lista. Si \
+genuinamente no llegas a cubrir todos por falta de tiempo/turnos, marcá "blocked" (o "done" con "tests_adequate": \
+false) explicando EXACTAMENTE que items faltan -- nunca te declares "done" sin resolver dejando items de la \
+lista sin tocar y sin decirlo.
+
 No hagas MAS de lo que el ticket pide -- si en el camino ves algo que tocarias en otro contexto (refactor, \
 limpieza, otra funcionalidad), NO lo toques: cerra el cambio apenas cubras lo que el ticket pide, y \
 mencionalo en el summary como fuera de alcance si te parece relevante, no lo implementes vos.
@@ -373,13 +394,32 @@ borrar para volver a empezar. Si genuinamente creés que hace falta borrar algo 
 explicá por qué en el summary -- nunca lo ejecutes vos mismo sin que quede como una decisión explícita y \
 revisable, no como un intento mas de una cadena de comandos que fueron fallando.
 
+Bug real confirmado en vivo (epica KAN-4, qwen3:8b): editaste package.json para agregar una dependencia nueva \
+("@capacitor/firebase-auth") que en realidad no existe en npm con ese nombre exacto -- el nombre real de un \
+paquete (sobre todo plugins de nicho de Capacitor/Ionic) no es algo que puedas confiar de memoria, y un nombre \
+inventado rompe "npm install" para TODO el sub-proyecto, no solo tu cambio puntual. Antes de agregar CUALQUIER \
+dependencia nueva a package.json (no antes de editar una version YA presente), usa la tool verify_npm_package \
+para confirmar que existe de verdad ANTES de escribir la edicion -- para otros manejadores de paquetes \
+(requirements.txt/pom.xml/etc.) corré `pip index versions <paquete>` (o el equivalente real del stack) con \
+run_shell_command. Si la verificacion dice que no existe o no encontras el nombre exacto, no adivines una \
+alternativa parecida: marcá "blocked" y explicá que dependencia necesitabas y por que no pudiste confirmarla.
+
+Segundo bug real confirmado en vivo, mismo mecanismo (epica KAN-4, corrida siguiente): agregaste \
+"@ionic/cli": "^6.30.0" -- el PAQUETE existe (verify_npm_package hubiera dicho que si), pero esa VERSION \
+especifica nunca se publico (las versiones reales de @ionic/cli saltan de 6.20.9 a 7.0.0 directo) -- "npm \
+install" rompe igual de fuerte con un rango de version inventado que con un nombre inventado. verify_npm_package \
+te devuelve la lista REAL de versiones publicadas -- antes de escribir CUALQUIER numero de version en \
+package.json (no solo el nombre del paquete), confirma que ese numero exacto (o un rango que genuinamente \
+cubra una version real de la lista) aparece ahi. No asumas que una version "suena razonable" solo porque el \
+formato es correcto.
+
 Bug real confirmado en vivo (epica KAN-4, scaffold Angular/Ionic): un archivo con decoradores de Angular \
 (@NgModule, @Component, @Injectable) sin un tsconfig.json real en ese sub-proyecto con \
 "experimentalDecorators": true (y "emitDecoratorMetadata": true) rompe el test runner con un error de \
 sintaxis al importar ese archivo ("Invalid or unexpected token") -- el decorador no es JS/TS valido sin esa \
 config. Si vos mismo creaste/escribiste el primer archivo con un decorador de Angular en un sub-proyecto \
-nuevo, asegurate de que exista un tsconfig.json con esas dos opciones ANTES de darte por "done", no asumas \
-que el scaffold de Ionic/Angular ya lo dejo armado -- verificalo con list_directory/read_file.
+nuevo, usa la tool check_tsconfig_decorators sobre el tsconfig.json de ESE sub-proyecto ANTES de darte por \
+"done" -- no asumas que el scaffold de Ionic/Angular ya lo dejo armado.
 
 Antes de declararte "done", corré algo que verifique tu cambio de verdad con run_shell_command (los tests \
 del proyecto si existen, o al menos una compilacion/lint) -- terminar sin haber corrido nada es aceptable \
@@ -415,6 +455,52 @@ objeto JSON, sin texto antes ni despues, con este esquema exacto: {"status": "do
 contestala con honestidad, no la completes con true por defecto: "scope_matches_ticket" es false si tu \
 diff toca algo que el ticket no pidio, "no_secrets_introduced" es false si escribiste algo que se parezca \
 a un secreto real, "tests_adequate" es false si lo que corriste no cubre genuinamente el cambio."""
+
+# Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas con
+# el mismo veredicto insufficient-test-coverage): el reintento del coding
+# agent CONTINUA la misma conversacion larga (investigacion + implementacion
+# + intentos previos de test) -- para cuando llega a escribir el test, viene
+# arrastrando el peso de esa conversacion. Este prompt es para una
+# conversacion NUEVA, sin esa carga, cuyo UNICO trabajo es escribir/mejorar
+# tests para un diff que YA existe -- mismo mecanismo de tools/gates que
+# CODING_AGENT_SYSTEM_PROMPT (investigar antes de escribir, confirmacion
+# humana, JSON final), pero enfocado en un objetivo mucho mas chico. Ver
+# run_test_writer_subagent().
+TEST_WRITER_SYSTEM_PROMPT = """Sos un especialista en testing, trabajando sobre un repositorio git real que ya \
+tiene un cambio de codigo REAL aplicado (ver el diff en el prompt de abajo) -- ese cambio ya fue implementado \
+por otro agente, tu UNICO trabajo es escribir o mejorar los tests que lo cubran. NO toques el codigo de \
+produccion (el diff ya aplicado) salvo que sea estrictamente necesario para poder testearlo (ej. exportar algo \
+que no estaba exportado) -- tu cambio deberia ser casi enteramente en archivos de test.
+
+Tenes las mismas herramientas reales que un coding agent: leer/listar/buscar archivos, editar/escribir, correr \
+comandos de shell (con confirmacion humana), ver tu propio diff, detectar el stack, verificar si un paquete \
+npm existe de verdad (verify_npm_package), y confirmar que un tsconfig.json soporta decoradores de Angular si \
+hace falta (check_tsconfig_decorators).
+
+Antes de escribir nada, usa read_file/git_diff para ver EXACTAMENTE que cambio de codigo real tenes que \
+cubrir -- no asumas el contenido de memoria del prompt.
+
+Reglas concretas para que un test cuente como adecuado (la misma vara que usa el juez que evalua esto despues, \
+no una formalidad): (1) toda dependencia externa/inyectada (servicios, HTTP, storage, guards, cualquier cosa \
+que el codigo nuevo importe e invoque) tiene que estar mockeada explicitamente (jest.fn(), spyOn, o el \
+equivalente real del framework) -- nunca invocada de verdad en un test unitario; (2) todo metodo async/Promise \
+que el codigo nuevo introduce tiene que verificarse con await/resolves/rejects (o fakeAsync/tick si es \
+Angular), nunca asumido sincronico; (3) al menos UN caso negativo/de error (entrada invalida, recurso \
+inexistente, permiso denegado, lo que corresponda) ademas del camino feliz; (4) el assert tiene que validar un \
+comportamiento real (una rama condicional, un error, un cambio de estado) -- nunca solo "no tira excepcion".
+
+REGLA OBLIGATORIA: no podes usar write_file, edit_file, ni run_shell_command hasta haber usado al menos una \
+vez read_file, list_directory, o grep_search en esta corrida.
+
+Antes de declararte "done", corré los tests reales con run_shell_command (el comando del sub-proyecto real, \
+con el `cwd` correspondiente) y confirma que pasan -- un test que no corriste no cuenta como agregado.
+
+Cuando termines, respondé con texto plano que sea UNICAMENTE un objeto JSON, sin texto antes ni despues, con \
+este esquema exacto: {"status": "done" o "blocked", "summary": "que tests agregaste/mejoraste, que verificaste, \
+o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...], "self_review": {"scope_matches_ticket": true, \
+"no_secrets_introduced": true o false, "tests_adequate": true o false}}. "scope_matches_ticket" queda fijo en \
+true (tu alcance ES escribir tests, no hay otro alcance que evaluar) -- "tests_adequate" es tu propia \
+autocritica honesta contra las 4 reglas de arriba, no la completes con true por defecto."""
 
 MCP_SERVERS = {
     "neo4j-cypher": StdioServerParameters(
@@ -612,6 +698,64 @@ def _sibling_duplicate_warning(full_path: Path) -> str:
     return ""
 
 
+def _json_validation_error(path: str, content: str) -> str | None:
+    """Si 'path' termina en .json, confirma que 'content' parsea como JSON \
+    valido -- None si esta bien (o si 'path' no es .json, nada que validar).
+
+    Gap real confirmado en vivo (epica KAN-4, qwen3:8b): un edit_file sobre \
+    package.json dejo JSON invalido (una llave de cierre "}" en el medio del \
+    objeto, seguida de mas propiedades sueltas) -- recien se detecto varios \
+    turnos despues, cuando el testing agent real corrio "npm install" y \
+    rompio con EJSONPARSE. Para ese momento el turno donde se corrompio el \
+    archivo ya habia quedado atras, sin feedback inmediato -- el reintento \
+    con el feedback del juez volvio a fallar porque nunca vio el error real \
+    de sintaxis, solo "los tests fallaron". Rechazar la escritura ACA (antes \
+    de aplicarla) le da al modelo la chance de corregirlo en el MISMO turno.
+    """
+    if not path.endswith(".json"):
+        return None
+
+    def _reject_duplicates(pairs):
+        seen = {}
+        for key, value in pairs:
+            if key in seen:
+                raise ValueError(f"clave duplicada '{key}' dentro del mismo objeto")
+            seen[key] = value
+        return seen
+
+    try:
+        # object_pairs_hook (no el default object_hook) ve CADA par
+        # key/value en el orden real en que aparecen en el texto, antes de
+        # que el dict final descarte duplicados en silencio -- necesario
+        # para detectar el segundo gap real de abajo.
+        json.loads(content, object_pairs_hook=_reject_duplicates)
+    except json.JSONDecodeError as exc:
+        return (
+            f"error: ese contenido para '{path}' NO es JSON valido ({exc}) -- no se escribio nada. "
+            "Revisa llaves/comas/corchetes con cuidado (un error comun: dejar una '}' de cierre vieja en el "
+            "medio del objeto al insertar propiedades nuevas) y reintenta con el JSON completo bien formado."
+        )
+    except ValueError as exc:
+        # Gap real confirmado en vivo (epica KAN-4, qwen3:8b, MISMO ticket,
+        # reintentos sucesivos sobre package.json): cada intento de
+        # edit_file re-insertaba el bloque "devDependencies" ENTERO en vez
+        # de reemplazar el existente -- el resultado (5 copias del mismo
+        # bloque, una por reintento) es JSON TECNICAMENTE VALIDO (json.loads
+        # normal lo acepta sin quejarse -- claves duplicadas son legales en
+        # JSON, la ultima gana) asi que el chequeo de sintaxis de arriba no
+        # lo atrapaba -- recien se notaba al leer el archivo a simple vista.
+        # object_pairs_hook detecta la clave repetida en el momento, antes
+        # de escribir nada.
+        return (
+            f"error: ese contenido para '{path}' tiene una {exc} -- es JSON tecnicamente valido (las claves "
+            "duplicadas no rompen el parseo, la ultima gana) pero es evidencia real de que reinsertaste un "
+            "bloque que ya existia en vez de editar el existente. No se escribio nada -- usa read_file para ver "
+            "el contenido REAL actual antes de reintentar, y edita/reemplaza el bloque existente en vez de "
+            "agregar uno nuevo al lado."
+        )
+    return None
+
+
 def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     try:
         full_path = _safe_path(target_repo_dir, path)
@@ -619,6 +763,9 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
         return f"error: {exc}"
     if _is_inside_git_dir(full_path, target_repo_dir):
         return f"error: no se puede escribir dentro de .git/ ({path})"
+    json_error = _json_validation_error(path, content)
+    if json_error:
+        return json_error
 
     is_new_file = not full_path.exists()
     if full_path.exists() and full_path.is_file():
@@ -697,6 +844,9 @@ def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string:
         return f"error: old_string aparece {count} veces en {path} -- agrega mas contexto para que sea unico"
 
     new_content = current.replace(old_string, new_string, 1)
+    json_error = _json_validation_error(path, new_content)
+    if json_error:
+        return json_error
     diff_lines = list(
         difflib.unified_diff(
             current.splitlines(keepends=True),
@@ -838,6 +988,81 @@ def tool_query_sonar(target_repo_dir: str, component: str) -> str:
     return "\n".join(lines)
 
 
+# Gap real confirmado en vivo (epica KAN-4, qwen3:8b): el modelo edito
+# package.json agregando "@capacitor/firebase-auth" -- un nombre de paquete
+# que no existe en npm -- rompiendo "npm install" para todo el sub-proyecto.
+# Antes de esto, la unica defensa era una linea en el prompt pidiendole que
+# corriera "npm view" el mismo con run_shell_command -- funciona, pero
+# depende de que se acuerde de hacerlo (y de armar el comando bien). Un tool
+# dedicado, de solo lectura, sin necesitar confirmacion humana (no escribe
+# nada), es una verificacion determinista que no depende de que el modelo
+# la recuerde en el momento justo -- se puede ademas nudgear directamente
+# desde el prompt como el paso obligatorio antes de tocar package.json.
+def tool_verify_npm_package(target_repo_dir: str, package_name: str) -> str:
+    """Verifica si un paquete existe de verdad en el registro real de npm
+    (npm view, sin instalar nada) -- solo lectura, no requiere confirmacion
+    humana. Corre nativo si npm esta disponible en este contenedor, o
+    delega a la imagen real de Node (Docker-outside-of-Docker, mismo patron
+    que run_shell_command) si no lo esta.
+    """
+    npm_available = shutil.which("npm") is not None
+    cmd = ["npm", "view", package_name, "versions", "--json"]
+    try:
+        if npm_available:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        elif shutil.which("docker") is not None:
+            image = "mcr.microsoft.com/playwright:v1.61.1-noble"
+            result = subprocess.run(
+                ["docker", "run", "--rm", image, *cmd],
+                capture_output=True, text=True, timeout=60,
+            )
+        else:
+            return "error: ni npm ni docker estan disponibles para verificar este paquete -- no se puede confirmar, no asumas que existe"
+    except subprocess.TimeoutExpired:
+        return f"error: timeout verificando '{package_name}' -- no se pudo confirmar, no asumas que existe"
+
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0 or "404" in stderr or "E404" in stderr:
+        return f"'{package_name}' NO existe en el registro de npm (verificado con npm view) -- no lo agregues a package.json con este nombre. Detalle: {stderr[:300]}"
+    stdout = (result.stdout or "").strip()
+    return f"'{package_name}' SI existe en npm. Versiones reales disponibles:\n{stdout[:1000]}"
+
+
+def tool_check_tsconfig_decorators(target_repo_dir: str, path: str) -> str:
+    """Confirma si un tsconfig.json real tiene experimentalDecorators +
+    emitDecoratorMetadata en true -- gap real confirmado en vivo (epica
+    KAN-4): un archivo con @NgModule/@Component/@Injectable sin esto en el
+    tsconfig.json de ese sub-proyecto rompe el test runner con un error de
+    sintaxis, indistinguible a simple vista de un error real de codigo.
+    Solo lectura -- 'path' es la ruta al tsconfig.json (ej.
+    'frontend/tsconfig.json'), no al sub-proyecto.
+    """
+    try:
+        full_path = _safe_path(target_repo_dir, path)
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not full_path.exists():
+        return f"'{path}' no existe -- si vas a escribir codigo con decoradores de Angular (@NgModule/@Component/@Injectable), creá este archivo con \"compilerOptions\": {{\"experimentalDecorators\": true, \"emitDecoratorMetadata\": true, ...}} ANTES de terminar."
+    try:
+        raw = full_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"error leyendo {path}: {exc}"
+    # tsconfig.json real permite comentarios (JSONC) -- json.loads estricto
+    # rompe con archivos reales de Angular CLI que los incluyen. Chequeo por
+    # regex tolerante a comentarios/formato en vez de un parser JSONC
+    # completo (no vale la pena la dependencia nueva para esto).
+    has_experimental = bool(re.search(r'"experimentalDecorators"\s*:\s*true', raw))
+    has_metadata = bool(re.search(r'"emitDecoratorMetadata"\s*:\s*true', raw))
+    if has_experimental and has_metadata:
+        return f"'{path}': experimentalDecorators y emitDecoratorMetadata estan en true -- OK para usar decoradores de Angular."
+    missing = []
+    if not has_experimental:
+        missing.append('"experimentalDecorators": true')
+    if not has_metadata:
+        missing.append('"emitDecoratorMetadata": true')
+    return f"'{path}' existe pero le falta {', '.join(missing)} en compilerOptions -- agregalo antes de declararte done si este sub-proyecto usa decoradores de Angular."
+
+
 def _has_dotnet_project_file(work_dir: Path) -> bool:
     return bool(list(work_dir.glob("*.csproj")) or list(work_dir.glob("*.sln")))
 
@@ -896,6 +1121,13 @@ _STACK_RUNTIME_IMAGES = {
     # agente. Mismo tratamiento que "ionic": _run_command_in_stack_container
     # instala el CLI global antes de correr el comando real.
     "ng": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    # Mismo gap real, misma causa (epica KAN-4, corrida de esta noche): el
+    # CLI de Capacitor ("capacitor"/su alias corto "cap") tampoco estaba
+    # reconocido -- "capacitor sync"/"cap add" fallaban con "command not
+    # found" en el contenedor minimo del agente, indistinguible de un fallo
+    # real. Mismo tratamiento que "ionic"/"ng".
+    "capacitor": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
+    "cap": (lambda d: (d / "package.json").exists(), "mcr.microsoft.com/playwright:v1.61.1-noble"),
 }
 
 
@@ -955,7 +1187,7 @@ def _run_command_in_stack_container(image: str, command: str, target_repo_dir: s
         first_token = shlex.split(command)[0]
     except (ValueError, IndexError):
         first_token = ""
-    global_cli_installs = {"ionic": "@ionic/cli", "ng": "@angular/cli"}
+    global_cli_installs = {"ionic": "@ionic/cli", "ng": "@angular/cli", "capacitor": "@capacitor/cli", "cap": "@capacitor/cli"}
     setup_steps = []
     if first_token in global_cli_installs:
         setup_steps.append(f"npm install -g {global_cli_installs[first_token]} >/dev/null 2>&1")
@@ -1129,6 +1361,25 @@ LOCAL_TOOLS = {
         "input_schema": {"type": "object", "properties": {"component": {"type": "string"}}, "required": ["component"]},
         "fn": tool_query_sonar,
     },
+    "verify_npm_package": {
+        "description": (
+            "Confirma si un paquete existe DE VERDAD en el registro real de npm (npm view, sin instalar "
+            "nada) -- usalo SIEMPRE antes de agregar una dependencia nueva a package.json, el nombre exacto "
+            "de un paquete (sobre todo plugins de nicho) no es algo que puedas confiar de memoria. Solo lectura."
+        ),
+        "input_schema": {"type": "object", "properties": {"package_name": {"type": "string"}}, "required": ["package_name"]},
+        "fn": tool_verify_npm_package,
+    },
+    "check_tsconfig_decorators": {
+        "description": (
+            "Confirma si un tsconfig.json real tiene experimentalDecorators+emitDecoratorMetadata en true -- "
+            "usalo antes de declararte done si escribiste un archivo con decoradores de Angular "
+            "(@NgModule/@Component/@Injectable), sin esto el test runner rompe con un error de sintaxis. "
+            "'path' es la ruta al tsconfig.json (ej. 'frontend/tsconfig.json'). Solo lectura."
+        ),
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        "fn": tool_check_tsconfig_decorators,
+    },
 }
 
 
@@ -1156,6 +1407,7 @@ async def run_coding_agent(
     target_repo_dir: str,
     resume_messages: list = None,
     resume_state: dict = None,
+    system_prompt: str = CODING_AGENT_SYSTEM_PROMPT,
 ) -> dict:
     """Si resume_messages viene seteado (reintento tras un veredicto FLAGGED
     retryable del juez -- ver retry_coding_agent_with_feedback() en
@@ -1165,6 +1417,13 @@ async def run_coding_agent(
     ticket completo -- evita repagar la investigacion (listar el repo, leer
     archivos) ya hecha en el primer intento. resume_state siembra
     has_investigated/has_run_verification con lo ya alcanzado.
+
+    system_prompt: swappable -- default CODING_AGENT_SYSTEM_PROMPT, pero
+    run_test_writer_subagent() (mas abajo) reusa este MISMO loop entero
+    (gate de investigacion, confirmacion humana, esquema JSON, self_review)
+    con TEST_WRITER_SYSTEM_PROMPT en su lugar -- esos mecanismos son
+    genericos (no dependen del texto del prompt), asi que no hace falta
+    duplicar el loop para un agente con un objetivo mas acotado.
     """
     backend = _select_backend()
     logger.info(f"coding agent: usando backend '{backend}'")
@@ -1276,9 +1535,17 @@ async def run_coding_agent(
             messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
 
         async with httpx.AsyncClient() as client:
-            for _ in range(MAX_TOOL_TURNS):
+            # while + contador mutable (turn_budget), no "for _ in range(MAX_TOOL_TURNS)":
+            # un cambio real de modelo (maybe_switch_ollama_model) extiende
+            # turn_budget en el momento -- ver MIN_TURNS_AFTER_MODEL_SWITCH
+            # arriba y cada sitio que llama a maybe_switch_ollama_model mas
+            # abajo. range() no se puede extender una vez arrancado el loop.
+            turn_budget = MAX_TOOL_TURNS
+            turns_used = 0
+            while turns_used < turn_budget:
+                turns_used += 1
                 content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
+                    client, messages, tools, system_prompt,
                     ollama_model=ollama_model_state["active"], force_json=True,
                 )
                 total_input_tokens += usage.get("input_tokens", 0)
@@ -1296,6 +1563,7 @@ async def run_coding_agent(
                             "coding agent", "se nego a llamar la tool incluso tras el nudge",
                         )
                     ):
+                        turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
                         continue
 
                     if not tool_call_nudge_given and _TOOL_CALL_REFUSAL_PATTERN.search(final_text):
@@ -1330,7 +1598,7 @@ async def run_coding_agent(
                     except json.JSONDecodeError:
                         # Un solo reintento acotado antes de degradar a blocked.
                         retry_text, retry_usage = await _final_text_with_json_retry(
-                            client, backend, messages, tools, CODING_AGENT_SYSTEM_PROMPT,
+                            client, backend, messages, tools, system_prompt,
                             ollama_model=ollama_model_state["active"], json_schema=CODING_AGENT_RESULT_SCHEMA,
                         )
                         total_input_tokens += retry_usage.get("input_tokens", 0)
@@ -1344,6 +1612,7 @@ async def run_coding_agent(
                                 ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
                                 "coding agent", "JSON invalido incluso tras el reintento de correccion",
                             ):
+                                turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
                                 continue
                             return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
 
@@ -1356,6 +1625,7 @@ async def run_coding_agent(
                             "reporto 'blocked' citando su propia confusion sobre el formato JSON, no una ambiguedad real del ticket",
                         )
                     ):
+                        turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
                         continue
 
                     if (
@@ -1480,9 +1750,31 @@ async def run_coding_agent(
                     tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
                 messages.append({"role": "user", "content": tool_results})
                 compact_old_tool_results(messages, _READ_ONLY_TOOL_NAMES)
-                warn_if_context_large(messages, logger, "coding agent", backend=backend, system_prompt=CODING_AGENT_SYSTEM_PROMPT)
+                warn_if_context_large(messages, logger, "coding agent", backend=backend, system_prompt=system_prompt)
 
     return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
+
+
+async def run_test_writer_subagent(ticket_id: str, diff_text: str, ticket_summary: str, target_repo_dir: str) -> dict:
+    """Conversacion NUEVA (sin resume_messages/resume_state -- arranca de
+    cero, a proposito) enfocada UNICAMENTE en escribir/mejorar tests para un
+    diff que ya existe. Reusa run_coding_agent entero (mismos gates, mismas
+    tools, mismo esquema de respuesta) con TEST_WRITER_SYSTEM_PROMPT en vez
+    del prompt general -- ver el comentario ahi arriba para el porque real
+    (KAN-5: la MISMA conversacion larga que investigo+implemento+reintento
+    llega a escribir el test ya cargada, un contexto fresco enfocado
+    unicamente en testing tiene mas chance de aplicar bien las reglas de
+    mocking/async).
+    """
+    prompt = (
+        f"Historia: {ticket_id} -- {ticket_summary}\n\n"
+        "El siguiente diff ya fue aplicado a este repo (rama actual) -- escribi o mejora los tests que lo "
+        "cubran, siguiendo las reglas del prompt de arriba:\n\n"
+        f"```diff\n{diff_text}\n```"
+    )
+    return await run_coding_agent(
+        ticket_id, prompt, target_repo_dir, system_prompt=TEST_WRITER_SYSTEM_PROMPT,
+    )
 
 
 def _extract_json(text: str) -> dict:
@@ -1516,15 +1808,27 @@ def main():
     ticket_id = payload["ticket_id"]
 
     try:
-        result = asyncio.run(
-            run_coding_agent(
-                ticket_id,
-                payload["sanitized_prompt"],
-                payload["target_repo_dir"],
-                resume_messages=payload.get("resume_messages"),
-                resume_state=payload.get("resume_state"),
+        # mode="test_writer": orchestration.py::run_test_writer_subagent_task
+        # arma este payload cuando el juez marca insufficient-test-coverage
+        # -- conversacion NUEVA (nunca resume_messages/resume_state, a
+        # proposito, ver el docstring de run_test_writer_subagent) enfocada
+        # solo en escribir/mejorar tests para un diff que ya existe.
+        if payload.get("mode") == "test_writer":
+            result = asyncio.run(
+                run_test_writer_subagent(
+                    ticket_id, payload["diff_text"], payload.get("ticket_summary", ""), payload["target_repo_dir"],
+                )
             )
-        )
+        else:
+            result = asyncio.run(
+                run_coding_agent(
+                    ticket_id,
+                    payload["sanitized_prompt"],
+                    payload["target_repo_dir"],
+                    resume_messages=payload.get("resume_messages"),
+                    resume_state=payload.get("resume_state"),
+                )
+            )
     except KeyError as exc:
         print(json.dumps({"error": f"missing_env_var:{exc.args[0]}"}), file=sys.stderr)
         sys.exit(1)

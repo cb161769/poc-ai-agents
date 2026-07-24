@@ -161,6 +161,58 @@ def test_tool_write_file_skips_when_rejected(tmp_path, monkeypatch):
     assert not (tmp_path / "rejected.txt").exists()
 
 
+def test_tool_write_file_rejects_invalid_json_without_writing(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): un edit_file
+    sobre package.json dejo JSON invalido (una '}' de cierre vieja en el
+    medio del objeto) -- recien se detecto varios turnos despues, cuando
+    'npm install' rompio con EJSONPARSE. write_file/edit_file ahora validan
+    JSON en el momento, antes de escribir nada, para dar feedback inmediato.
+    """
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "package.json", '{"a": 1,}')
+
+    assert "error" in result
+    assert "JSON" in result
+    assert not (tmp_path / "package.json").exists()
+
+
+def test_tool_write_file_allows_valid_json(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "package.json", '{"name": "frontend"}')
+
+    assert "escrito ok" in result
+    assert (tmp_path / "package.json").exists()
+
+
+def test_tool_write_file_ignores_json_validation_for_non_json_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "notes.txt", "esto no es JSON y esta bien")
+
+    assert "escrito ok" in result
+
+
+def test_tool_write_file_rejects_json_with_duplicate_keys(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b, reintentos
+    sucesivos sobre el MISMO package.json): cada intento de edit_file
+    re-insertaba el bloque "devDependencies" ENTERO en vez de reemplazar el
+    existente -- el resultado (5 copias del mismo bloque) es JSON
+    TECNICAMENTE VALIDO (claves duplicadas son legales, la ultima gana), asi
+    que el chequeo de sintaxis normal no lo atrapaba. object_pairs_hook
+    ahora lo detecta antes de escribir.
+    """
+    monkeypatch.setattr("builtins.input", lambda: "s")
+    duplicated = '{"devDependencies": {"ionic": "^6.30.0", "@capacitor/core": "^4.0.0", "ionic": "^7.0.0"}}'
+
+    result = ca.tool_write_file(str(tmp_path), "package.json", duplicated)
+
+    assert "error" in result
+    assert "duplicada" in result
+    assert not (tmp_path / "package.json").exists()
+
+
 def test_tool_write_file_warns_on_sibling_with_different_extension(tmp_path, monkeypatch):
     """Bug real confirmado en vivo (PR real, epica KAN-4): el coding agent
     creo Header.ts Y Header.tsx (mismo componente, dos extensiones) en el
@@ -648,6 +700,35 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
     assert result["self_verified"] is True
 
 
+def test_run_test_writer_subagent_uses_test_writer_system_prompt(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas
+    con insufficient-test-coverage): el reintento normal CONTINUA la misma
+    conversacion larga (investigacion+implementacion+intentos previos) --
+    para cuando llega a escribir el test, viene cargada. run_test_writer_subagent
+    arranca una conversacion NUEVA con TEST_WRITER_SYSTEM_PROMPT (no
+    CODING_AGENT_SYSTEM_PROMPT), enfocada solo en tests.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    captured = {}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_prompt"] = messages[0]["content"]
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    diff_text = "diff --git a/frontend/src/auth-guard.ts b/frontend/src/auth-guard.ts\n+ new code"
+    asyncio.run(ca.run_test_writer_subagent("KAN-5", diff_text, "Montar AuthGuard", str(tmp_path)))
+
+    assert captured["system_prompt"] == ca.TEST_WRITER_SYSTEM_PROMPT
+    assert captured["system_prompt"] != ca.CODING_AGENT_SYSTEM_PROMPT
+    assert diff_text in captured["user_prompt"]
+    assert "KAN-5" in captured["user_prompt"]
+
+
 def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(monkeypatch, tmp_path):
     """Gap real (usuario, "hay gaps en el coding agent"): antes, CUALQUIER
     run_shell_command (incluso "ls" o "echo listo") marcaba self_verified=True
@@ -1092,6 +1173,43 @@ def test_run_coding_agent_still_blocks_when_json_invalid_and_only_one_ollama_can
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
     assert result["status"] == "blocked"
+
+
+def test_run_coding_agent_extends_turn_budget_on_model_switch(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, esta sesion): un cambio de
+    modelo pasaba a un backend nuevo PRECISAMENTE porque el actual fallaba,
+    pero el turno usado para detectar eso contaba igual contra el mismo
+    presupuesto compartido -- con MAX_TOOL_TURNS=1, el cambio ocurria en el
+    UNICO turno disponible y no quedaba ningun turno mas para que el modelo
+    nuevo hiciera algo real, degradando a 'blocked' por "se agotaron los
+    turnos" pese a tener un modelo funcional recien elegido. Confirma que
+    el cambio de modelo ahora extiende el presupuesto lo suficiente para
+    que el modelo nuevo tenga una chance real.
+    """
+    monkeypatch.setattr(ca, "_select_backend", lambda: "ollama")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
+    monkeypatch.setattr(ca, "MAX_TOOL_TURNS", 1)
+    monkeypatch.setattr(ca, "MIN_TURNS_AFTER_MODEL_SWITCH", 5)
+    _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if kwargs.get("ollama_model") == "modelo-b":
+            content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el modelo nuevo", "files_changed": []}'}]
+            return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+        content = [{"type": "text", "text": "esto no es json"}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
+
+    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
+        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "done"
+    assert result["summary"] == "listo con el modelo nuevo"
 
 
 def test_run_coding_agent_passes_real_json_schema_to_retry(monkeypatch, tmp_path):
@@ -1725,6 +1843,26 @@ def test_tool_edit_file_applies_unique_replacement(tmp_path, monkeypatch, capsys
     assert "+    return 2" in captured.err
 
 
+def test_tool_edit_file_rejects_edit_that_would_produce_invalid_json(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): mismo mecanismo
+    que tool_write_file -- edit_file tambien puede dejar JSON invalido
+    (insertar propiedades sin sacar la '}' de cierre vieja). Se rechaza
+    ANTES de escribir, con el archivo real sin tocar.
+    """
+    (tmp_path / "package.json").write_text('{"devDependencies": {"a": "1.0.0"}}')
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_edit_file(
+        str(tmp_path), "package.json",
+        '"devDependencies": {"a": "1.0.0"}',
+        '"devDependencies": {"a": "1.0.0", "b": "2.0.0"',  # falta el "}" de cierre a proposito
+    )
+
+    assert "error" in result
+    assert "JSON" in result
+    assert (tmp_path / "package.json").read_text() == '{"devDependencies": {"a": "1.0.0"}}'
+
+
 def test_tool_edit_file_rejects_zero_matches(tmp_path, monkeypatch):
     (tmp_path / "f.py").write_text("def foo():\n    return 1\n")
     monkeypatch.setattr("builtins.input", lambda: "s")
@@ -1932,6 +2070,75 @@ def test_tool_query_sonar_no_issues(tmp_path):
     assert "sin hallazgos" in result
 
 
+# --- tool_verify_npm_package ---
+
+
+def test_tool_verify_npm_package_confirms_real_package(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    fake_result = MagicMock(returncode=0, stdout='["1.0.0", "1.1.0"]', stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result) as mock_run:
+        result = ca.tool_verify_npm_package(str(tmp_path), "react")
+
+    assert "SI existe en npm" in result
+    assert mock_run.call_args[0][0][:2] == ["npm", "view"]
+
+
+def test_tool_verify_npm_package_detects_nonexistent_package(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): '@capacitor/firebase-auth'
+    no existe en npm -- npm view devuelve un error 404/E404 real."""
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    fake_result = MagicMock(returncode=1, stdout="", stderr="npm error 404 Not Found - GET https://registry.npmjs.org/@capacitor%2ffirebase-auth - Not found")
+    with patch("coding_agent.subprocess.run", return_value=fake_result):
+        result = ca.tool_verify_npm_package(str(tmp_path), "@capacitor/firebase-auth")
+
+    assert "NO existe" in result
+
+
+def test_tool_verify_npm_package_falls_back_to_docker_when_npm_unavailable(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+    fake_result = MagicMock(returncode=0, stdout='["1.0.0"]', stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result) as mock_run:
+        result = ca.tool_verify_npm_package(str(tmp_path), "react")
+
+    assert "SI existe en npm" in result
+    assert mock_run.call_args[0][0][0] == "docker"
+
+
+def test_tool_verify_npm_package_errors_without_npm_or_docker(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca.shutil, "which", lambda name: None)
+    result = ca.tool_verify_npm_package(str(tmp_path), "react")
+
+    assert "error" in result
+    assert "no asumas que existe" in result
+
+
+# --- tool_check_tsconfig_decorators ---
+
+
+def test_tool_check_tsconfig_decorators_ok_when_both_flags_true(tmp_path):
+    (tmp_path / "tsconfig.json").write_text(
+        '{"compilerOptions": {"experimentalDecorators": true, "emitDecoratorMetadata": true}}'
+    )
+    result = ca.tool_check_tsconfig_decorators(str(tmp_path), "tsconfig.json")
+
+    assert "OK para usar decoradores de Angular" in result
+
+
+def test_tool_check_tsconfig_decorators_flags_missing_options(tmp_path):
+    (tmp_path / "tsconfig.json").write_text('{"compilerOptions": {"target": "es2020"}}')
+    result = ca.tool_check_tsconfig_decorators(str(tmp_path), "tsconfig.json")
+
+    assert "experimentalDecorators" in result
+    assert "emitDecoratorMetadata" in result
+
+
+def test_tool_check_tsconfig_decorators_missing_file(tmp_path):
+    result = ca.tool_check_tsconfig_decorators(str(tmp_path), "frontend/tsconfig.json")
+
+    assert "no existe" in result
+    assert "experimentalDecorators" in result
+
+
 # --- Guardrail: edit_file tambien exige investigar antes ---
 
 
@@ -2007,6 +2214,18 @@ def test_system_prompt_requires_at_least_one_negative_test_case():
     assert "cubrir solo el camino feliz tampoco cuenta" in ca.CODING_AGENT_SYSTEM_PROMPT
 
 
+def test_system_prompt_requires_checklist_for_multiple_named_requirements():
+    """Gap real confirmado en vivo (epica KAN-4, KAN-9, qwen3:8b): un ticket
+    pedia un boton con 5 estados nombrados -- el modelo implemento y testeo
+    SOLO el primero (Primary) y se declaro 'done' igual, dos veces seguidas
+    (ni el reintento con feedback del juez lo corrigio). El prompt tiene que
+    exigir una checklist explicita para requisitos enumerados con nombre.
+    """
+    assert "Primary, Secondary, Outline, Disabled, Loading" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "checklist" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "UNO POR UNO que cada item tiene codigo Y test real" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
 def test_system_prompt_forbids_destructive_rm_to_work_around_scaffolder_refusal():
     """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): 'ionic start'
     rechazo un directorio no vacio, y el modelo termino corriendo
@@ -2018,6 +2237,52 @@ def test_system_prompt_forbids_destructive_rm_to_work_around_scaffolder_refusal(
     """
     assert "NUNCA uses \"rm -rf\"" in ca.CODING_AGENT_SYSTEM_PROMPT
     assert "se auto-aprobo" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_verifying_new_package_names_before_adding():
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b): el modelo edito
+    package.json agregando '@capacitor/firebase-auth' -- un nombre de
+    paquete que no existe en npm -- rompiendo 'npm install' para todo el
+    sub-proyecto. El modelo se dio cuenta del error INMEDIATAMENTE despues
+    (declaro 'blocked'), pero la edicion ya estaba commiteada. El prompt
+    tiene que exigir verificar la dependencia ANTES de escribirla.
+    """
+    assert "usa la tool verify_npm_package" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "no adivines una alternativa" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_verifying_specific_version_not_just_package_name():
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b, corrida distinta a
+    la de @capacitor/firebase-auth): '@ionic/cli': '^6.30.0' -- el PAQUETE
+    existe, pero esa version especifica nunca se publico (las reales saltan
+    de 6.20.9 a 7.0.0) -- npm install rompe igual con una version inventada
+    que con un nombre inventado. El prompt tiene que exigir verificar el
+    numero de version tambien, no solo el nombre del paquete.
+    """
+    assert "@ionic/cli" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "6.30.0" in ca.CODING_AGENT_SYSTEM_PROMPT
+    assert "no solo el nombre del paquete" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_system_prompt_points_to_tsconfig_checker_tool():
+    assert "usa la tool check_tsconfig_decorators" in ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_test_writer_system_prompt_requires_mocking_and_async_and_negative_case():
+    assert "mockeada explicitamente" in ca.TEST_WRITER_SYSTEM_PROMPT
+    assert "await/resolves/rejects" in ca.TEST_WRITER_SYSTEM_PROMPT
+    assert "UN caso negativo" in ca.TEST_WRITER_SYSTEM_PROMPT
+    assert "NO toques el codigo de" in ca.TEST_WRITER_SYSTEM_PROMPT
+
+
+def test_verify_npm_package_and_check_tsconfig_decorators_are_registered_tools():
+    """Ambos gaps (nombre de paquete inventado, tsconfig.json sin decoradores)
+    ahora tienen un tool DETERMINISTICO dedicado, no solo guia en el prompt
+    -- confirma que estan realmente registrados y disponibles para el modelo."""
+    assert "verify_npm_package" in ca.LOCAL_TOOLS
+    assert ca.LOCAL_TOOLS["verify_npm_package"]["fn"] is ca.tool_verify_npm_package
+    assert "check_tsconfig_decorators" in ca.LOCAL_TOOLS
+    assert ca.LOCAL_TOOLS["check_tsconfig_decorators"]["fn"] is ca.tool_check_tsconfig_decorators
 
 
 def test_system_prompt_requires_mocking_dependencies_and_async_verification():

@@ -115,10 +115,22 @@ detect_stack() {
     # v1.61.1-noble trae Node 24 (v1.44.1-jammy solo traia Node 20, insuficiente
     # para @capacitor/cli/@angular/cli modernos -- bug real confirmado en vivo).
     IMAGE="mcr.microsoft.com/playwright:v1.61.1-noble"
+    # Bug real confirmado en vivo (epica KAN-4, qwen3:8b): "npm install
+    # --silent" no solo baja el ruido del camino feliz -- en esta version de
+    # npm, --silent (loglevel=silent) tambien traga el mensaje de error
+    # FATAL cuando el install realmente falla (confirmado reproduciendo:
+    # "@ionic/cli": "^6.30.0" -- una version que nunca se publico -- produce
+    # exit code != 0 con stdout+stderr COMPLETAMENTE VACIOS bajo --silent,
+    # vs. el error real y legible "ETARGET No matching version found for
+    # @ionic/cli@^6.30.0" sin la flag). Sin esta salida, ni un humano ni el
+    # juez ni el clasificador de gaps puede saber por que fallo -- se ve
+    # identico a un timeout o un problema de infraestructura. Se saca
+    # --silent: el ruido extra en el camino feliz es un costo real menor que
+    # perder el diagnostico entero en el camino de fallo.
     if grep -q '"test"' "${dir}/package.json" 2>/dev/null; then
-      TEST_CMD="npm install --silent && npm test"
+      TEST_CMD="npm install && npm test"
     else
-      TEST_CMD="npm install --silent && echo 'sin script \"test\" en package.json, se omite'"
+      TEST_CMD="npm install && echo 'sin script \"test\" en package.json, se omite'"
     fi
     if [ -d "${dir}/tests" ] || [ -f "${dir}/playwright.config.ts" ]; then
       # Bug real confirmado en una corrida real (KAN-15, frontend/): la

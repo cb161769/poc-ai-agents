@@ -800,6 +800,70 @@ def test_judge_with_tools_nudges_once_on_content_hallucination_and_accepts_corre
     )
 
 
+def test_judge_with_tools_flags_ungrounded_reasoning_on_flagged_verdict(monkeypatch):
+    """Gap real confirmado en vivo esta sesion (mismo riesgo estructural que
+    gap_classifier.py): un veredicto FLAGGED puede citar evidencia
+    especifica que suena concreta pero es falsa -- _reasoning_ignores_real_diff_files
+    solo atrapa "no menciona NINGUN archivo real" (alucinacion burda), no
+    "menciona el archivo correcto pero afirma algo falso sobre el".
+    bespoke-minicheck (grounding_check.py) ahora confirma esto para todo
+    FLAGGED -- si no esta grounded, se marca explicitamente en vez de
+    dejarlo pasar como evidencia verificada.
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+    monkeypatch.setattr(judge_agent, "verify_claim_grounded", lambda document, claim: False)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        text = (
+            '{"verdict": "FLAGGED", "reasoning": '
+            '"lazyLoader.ts no tiene tests (esto es falso, si los tiene)."}'
+        )
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload(change_description=_REAL_DIFF_TEXT)))
+
+    assert result["verdict"] == "FLAGGED"
+    assert result["reasoning_grounded"] is False
+    assert "NO se pudo confirmar" in result["reasoning"]
+    assert "lazyLoader.ts no tiene tests" in result["reasoning"]  # el reasoning original se preserva
+
+
+def test_judge_with_tools_does_not_check_grounding_for_ok_verdict(monkeypatch):
+    """El chequeo de grounding solo aplica a FLAGGED -- esa es la direccion
+    cara (cortar una epica por evidencia inventada). Un veredicto OK no lo
+    necesita: aceptar de mas por error es mucho menos costoso que bloquear
+    de mas por una cita falsa.
+    """
+    monkeypatch.setattr(judge_agent, "_select_backend", lambda: "anthropic")
+
+    async def fake_connect_mcp_servers(stack, servers, label="agente"):
+        return {}
+
+    monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("no deberia chequear grounding para un veredicto OK")
+    monkeypatch.setattr(judge_agent, "verify_claim_grounded", fail_if_called)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        text = '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida."}'
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload(change_description=_REAL_DIFF_TEXT)))
+
+    assert result["verdict"] == "OK"
+    assert "reasoning_grounded" not in result
+
+
 def test_judge_with_tools_accepts_verdict_if_still_contradictory_after_one_nudge(monkeypatch):
     """Un solo empujon -- si el 2do intento repite la misma contradiccion,
     se acepta igual (no bloquea infinito, mismo criterio que el resto de

@@ -922,7 +922,10 @@ def test_retry_local_diff_includes_remediation_hint_for_known_policy_reference(m
     juez y la evidencia deterministica de "falta archivo de test" no
     alcanzan cuando el problema real es calidad de mocks (el test YA existe).
     El feedback ahora tiene que incluir la guia concreta de
-    REMEDIATION_HINTS para ese policy_reference.
+    REMEDIATION_HINTS para ese policy_reference. scope-mismatch (no
+    insufficient-test-coverage): ese ultimo ahora delega al test-writer
+    sub-agent, que no usa feedback_text/REMEDIATION_HINTS (su prompt YA
+    tiene la guia de mocking permanente) -- ver test_retry_local_diff_uses_test_writer_subagent_for_insufficient_test_coverage.
     """
     captured_feedback = {}
 
@@ -937,18 +940,58 @@ def test_retry_local_diff_includes_remediation_hint_for_known_policy_reference(m
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "corregido"})
 
-    flagged_insufficient_coverage = {
-        "verdict": "FLAGGED", "reasoning": "los mocks no cubren AuthService", "policy_reference": "insufficient-test-coverage",
+    flagged_scope_mismatch = {
+        "verdict": "FLAGGED", "reasoning": "toca un archivo fuera de alcance", "policy_reference": "scope-mismatch",
     }
 
     _retry_local_diff(
-        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_insufficient_coverage,
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_scope_mismatch,
         {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary",
         False, None, "2026-01-01T00:00:00Z",
     )
 
     assert "COMO CORREGIRLO" in captured_feedback["text"]
-    assert "mockeada explicitamente" in captured_feedback["text"]
+    assert "releé el alcance exacto" in captured_feedback["text"]
+
+
+def test_retry_local_diff_uses_test_writer_subagent_for_insufficient_test_coverage(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas
+    con insufficient-test-coverage): el reintento normal continua la MISMA
+    conversacion larga -- para cuando llega a escribir el test, viene
+    cargada. Para este policy_reference especificamente, se delega a un
+    sub-agente de testing con conversacion fresca en vez del reintento
+    general.
+    """
+    test_writer_calls = []
+
+    def fake_test_writer(ticket_id, diff_text, ticket_summary, target_repo_dir):
+        test_writer_calls.append((ticket_id, diff_text, ticket_summary))
+        return {"applied": True, "backend": "ollama"}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        raise AssertionError("insufficient-test-coverage no deberia usar el reintento general")
+
+    monkeypatch.setattr(orchestration, "run_test_writer_subagent_task", fake_test_writer)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "tests ahora mockean AuthService"})
+
+    flagged_insufficient_coverage = {
+        "verdict": "FLAGGED", "reasoning": "los mocks no cubren AuthService", "policy_reference": "insufficient-test-coverage",
+    }
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_insufficient_coverage,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary del ticket",
+        False, None, "2026-01-01T00:00:00Z", diff_text="diff original",
+    )
+
+    assert result == {"verdict": "OK", "reasoning": "tests ahora mockean AuthService"}
+    assert len(test_writer_calls) == 1
+    assert test_writer_calls[0] == ("T-1", "diff original", "summary del ticket")
 
 
 def test_retry_local_diff_keeps_retrying_while_still_flagged_with_retryable_reference(monkeypatch):
@@ -956,9 +999,10 @@ def test_retry_local_diff_keeps_retrying_while_still_flagged_with_retryable_refe
     reintento, un segundo veredicto FLAGGED con el MISMO policy_reference
     cortaba la epica entera de inmediato. Ahora, mientras queden intentos
     (LOCAL_DIFF_MAX_RETRY_ATTEMPTS) y el veredicto siga siendo
-    FLAGGED+retryable, se le da otra vuelta al coding agent -- este test
-    simula exactamente ese caso: intento 2 sigue FLAGGED, intento 3 (ultimo,
-    default=2 reintentos) recien ahi corrige.
+    FLAGGED+retryable, se le da otra vuelta -- este test simula exactamente
+    ese caso con scope-mismatch (policy que sigue usando el reintento
+    general, no el test-writer sub-agente): intento 2 sigue FLAGGED, intento
+    3 (ultimo, default=2 reintentos) recien ahi corrige.
     """
     retry_calls = []
 
@@ -967,8 +1011,8 @@ def test_retry_local_diff_keeps_retrying_while_still_flagged_with_retryable_refe
         return {"applied": True, "backend": "anthropic"}
 
     verdicts = iter([
-        {"verdict": "FLAGGED", "reasoning": "todavia sin mocks", "policy_reference": "insufficient-test-coverage"},
-        {"verdict": "OK", "reasoning": "ahora si mockea AuthService"},
+        {"verdict": "FLAGGED", "reasoning": "todavia fuera de alcance", "policy_reference": "scope-mismatch"},
+        {"verdict": "OK", "reasoning": "ahora dentro de alcance"},
     ])
 
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
@@ -984,7 +1028,7 @@ def test_retry_local_diff_keeps_retrying_while_still_flagged_with_retryable_refe
         False, None, "2026-01-01T00:00:00Z",
     )
 
-    assert result == {"verdict": "OK", "reasoning": "ahora si mockea AuthService"}
+    assert result == {"verdict": "OK", "reasoning": "ahora dentro de alcance"}
     assert len(retry_calls) == 2
 
 
@@ -998,7 +1042,7 @@ def test_retry_local_diff_stops_after_max_attempts_still_flagged(monkeypatch):
         retry_calls.append(feedback_text)
         return {"applied": True, "backend": "anthropic"}
 
-    always_flagged = {"verdict": "FLAGGED", "reasoning": "sigue sin mocks", "policy_reference": "insufficient-test-coverage"}
+    always_flagged = {"verdict": "FLAGGED", "reasoning": "sigue fuera de alcance", "policy_reference": "scope-mismatch"}
 
     monkeypatch.setattr(orchestration, "LOCAL_DIFF_MAX_RETRY_ATTEMPTS", 2)
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
@@ -1230,6 +1274,255 @@ def test_deliver_transitions_to_blocked_and_comments_when_judge_gives_no_verdict
     assert any("no pudo evaluar" in text for _key, text in comments)
 
 
+def test_find_invalid_npm_package_versions_detects_hallucinated_exact_version(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo TRES VECES esta sesion (epica KAN-4):
+    '@ionic/cli': '^6.30.0' -- el paquete existe, pero esa version exacta
+    nunca se publico (las reales saltan de 6.20.9 a 7.0.0). Confirma que el
+    chequeo deterministico (npm view real, mockeado aca) lo detecta.
+    """
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(json.dumps({
+        "name": "frontend",
+        "dependencies": {},
+        "devDependencies": {"@ionic/cli": "^6.30.0"},
+    }))
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[:3] == ["npm", "view", "@ionic/cli"]
+        return _fake_subprocess_result(stdout=json.dumps(["6.20.9", "7.0.0", "7.2.1"]))
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    invalid = orchestration._find_invalid_npm_package_versions(str(tmp_path))
+
+    assert "@ionic/cli@^6.30.0" in invalid
+    assert "6.30.0" in invalid["@ionic/cli@^6.30.0"]
+
+
+def test_find_invalid_npm_package_versions_accepts_real_version(tmp_path, monkeypatch):
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(json.dumps({
+        "dependencies": {"react": "^18.2.0"},
+    }))
+
+    def fake_run(cmd, **kwargs):
+        return _fake_subprocess_result(stdout=json.dumps(["18.1.0", "18.2.0", "18.3.0"]))
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert orchestration._find_invalid_npm_package_versions(str(tmp_path)) == {}
+
+
+def test_find_invalid_npm_package_versions_ignores_non_exact_ranges(tmp_path, monkeypatch):
+    """"*", "latest", "workspace:...", "file:...", "git+..." no son el
+    patron real que causo los bugs de esta sesion (siempre un numero exacto
+    inventado) -- no tiene sentido tratar de verificarlos contra npm."""
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "a": "*", "b": "latest", "c": "workspace:*", "d": "file:../local-pkg", "e": "git+https://x.com/y.git",
+        },
+    }))
+
+    def fake_run(cmd, **kwargs):
+        pytest.fail("no deberia consultar npm para versiones no-exactas")
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert orchestration._find_invalid_npm_package_versions(str(tmp_path)) == {}
+
+
+def test_find_invalid_npm_package_versions_skips_vendor_dirs(tmp_path, monkeypatch):
+    vendor = tmp_path / "frontend" / "node_modules" / "some-dep"
+    vendor.mkdir(parents=True)
+    (vendor / "package.json").write_text(json.dumps({"dependencies": {"x": "^1.2.3"}}))
+
+    def fake_run(cmd, **kwargs):
+        pytest.fail("no deberia escanear package.json dentro de node_modules")
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert orchestration._find_invalid_npm_package_versions(str(tmp_path)) == {}
+
+
+def test_find_invalid_npm_package_versions_falls_back_to_docker_when_npm_unavailable(tmp_path, monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-4, esta sesion): este chequeo
+    corre DENTRO del contenedor minimo del propio pipeline
+    (poc-ai-agents-testrunner), que NO tiene npm nativo -- sin este
+    fallback, subprocess.run(["npm", ...]) tiraba FileNotFoundError,
+    atrapado en silencio, y el chequeo entero se saltaba SIEMPRE sin ningun
+    error visible (confirmado real: una dependencia invalida de verdad paso
+    sin que esto la detectara ni una vez).
+    """
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"@ionic/cli": "^6.30.0"}}))
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_subprocess_result(stdout=json.dumps(["6.20.9", "7.0.0"]))
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    invalid = orchestration._find_invalid_npm_package_versions(str(tmp_path))
+
+    assert "@ionic/cli@^6.30.0" in invalid
+    assert captured["cmd"][:2] == ["docker", "run"]
+    assert "npm" in captured["cmd"]
+    assert "view" in captured["cmd"]
+
+
+def test_find_invalid_npm_package_versions_skips_entirely_without_npm_or_docker(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"@ionic/cli": "^6.30.0"}}))
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: None)
+
+    def fake_run(cmd, **kwargs):
+        pytest.fail("no deberia intentar consultar npm sin npm ni docker disponibles")
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert orchestration._find_invalid_npm_package_versions(str(tmp_path)) == {}
+
+
+def test_auto_strip_invalid_npm_dependencies_removes_only_the_bad_one(tmp_path, monkeypatch):
+    """Ultimo recurso deterministico -- confirma que remueve SOLO la
+    dependencia realmente invalida, preserva el resto del archivo intacto
+    (incluidas dependencias reales validas), y reescribe un JSON valido.
+    """
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "frontend",
+        "dependencies": {"react": "^18.2.0"},
+        "devDependencies": {"@ionic/cli": "^6.30.0", "typescript": "^5.4.0"},
+    }))
+
+    def fake_versions(pkg_name, npm_available_natively):
+        real = {"react": ["18.2.0"], "typescript": ["5.4.0"], "@ionic/cli": ["6.20.9", "7.0.0"]}
+        return real.get(pkg_name)
+
+    monkeypatch.setattr(orchestration, "_real_npm_versions", fake_versions)
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+
+    removed = orchestration._auto_strip_invalid_npm_dependencies(str(tmp_path))
+
+    assert removed == ["@ionic/cli@^6.30.0 (package.json)"]
+    data = json.loads((tmp_path / "package.json").read_text())
+    assert "@ionic/cli" not in data["devDependencies"]
+    assert data["devDependencies"]["typescript"] == "^5.4.0"
+    assert data["dependencies"]["react"] == "^18.2.0"
+
+
+def test_auto_strip_invalid_npm_dependencies_no_changes_when_all_valid(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"react": "^18.2.0"}}))
+    monkeypatch.setattr(orchestration, "_real_npm_versions", lambda pkg_name, npm_available_natively: ["18.2.0"])
+    monkeypatch.setattr(orchestration.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+
+    original_content = (tmp_path / "package.json").read_text()
+
+    removed = orchestration._auto_strip_invalid_npm_dependencies(str(tmp_path))
+
+    assert removed == []
+    assert (tmp_path / "package.json").read_text() == original_content  # nunca reescribe si no hizo falta
+
+
+def test_retry_for_invalid_npm_versions_gives_feedback_and_merges_result(monkeypatch, tmp_path):
+    """Camino feliz: el reintento SI corrige el problema (el segundo chequeo
+    ya no encuentra nada invalido) -- nunca llega a necesitar el auto-strip.
+    """
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"@ionic/cli": "^6.30.0"}}))
+    check_calls = {"n": 0}
+
+    def fake_check(target_repo_dir):
+        check_calls["n"] += 1
+        if check_calls["n"] == 1:
+            return {"@ionic/cli@^6.30.0": "la version exacta '6.30.0' no aparece..."}
+        return {}  # el reintento SI lo arreglo
+
+    monkeypatch.setattr(orchestration, "_find_invalid_npm_package_versions", fake_check)
+    monkeypatch.setattr(orchestration, "_auto_strip_invalid_npm_dependencies", lambda *a, **k: pytest.fail("no deberia necesitar auto-strip si el reintento ya arreglo el problema"))
+    captured = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        captured["feedback_text"] = feedback_text
+        return {"applied": True, "backend": "ollama", "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+
+    original = {
+        "applied": True, "branch": "copilot/T-1-123", "base_branch": "main",
+        "backend": "ollama", "conversation_file": "/tmp/conv1.json",
+    }
+
+    result = orchestration._retry_for_invalid_npm_versions("T-1", str(tmp_path), original)
+
+    assert result["branch"] == "copilot/T-1-123"
+    assert result["conversation_file"] == "/tmp/conv2.json"
+    assert "@ionic/cli@^6.30.0" in captured["feedback_text"]
+    assert "verify_npm_package" in captured["feedback_text"]
+
+
+def test_retry_for_invalid_npm_versions_returns_original_when_nothing_invalid(monkeypatch, tmp_path):
+    monkeypatch.setattr(orchestration, "_find_invalid_npm_package_versions", lambda target_repo_dir: {})
+
+    def fake_retry(*a, **k):
+        pytest.fail("no deberia reintentar si no hay versiones invalidas")
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+
+    original = {"applied": True, "branch": "copilot/T-1-123"}
+
+    assert orchestration._retry_for_invalid_npm_versions("T-1", str(tmp_path), original) is original
+
+
+def test_retry_for_invalid_npm_versions_auto_strips_when_retry_does_not_fix_it(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, qwen3:8b, CUATRO corridas
+    seguidas): el reintento reconocia el problema en su propio texto pero no
+    lo corregia de verdad. Si el chequeo SIGUE encontrando versiones
+    invalidas despues del reintento, se auto-elimina la dependencia y se
+    commitea el fix directamente -- ultimo recurso deterministico.
+    """
+    import subprocess as sp
+    _init_real_git_repo(tmp_path)
+    (tmp_path / "package.json").write_text(json.dumps({"dependencies": {"@ionic/cli": "^6.30.0"}}))
+    sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    sp.run(["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "-C", str(tmp_path), "commit", "-q", "-m", "seed"], check=True)
+
+    def fake_strip(target_repo_dir):
+        (tmp_path / "package.json").write_text(json.dumps({"dependencies": {}}))  # simula la remocion real
+        return ["@ionic/cli@^6.30.0 (package.json)"]
+
+    monkeypatch.setattr(orchestration, "_find_invalid_npm_package_versions", lambda target_repo_dir: {"@ionic/cli@^6.30.0": "..."})
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": False})
+    monkeypatch.setattr(orchestration, "_auto_strip_invalid_npm_dependencies", fake_strip)
+
+    original = {"applied": True, "branch": "copilot/T-1-123", "base_branch": "main", "backend": "ollama"}
+
+    result = orchestration._retry_for_invalid_npm_versions("T-1", str(tmp_path), original)
+
+    assert result["applied"] is True
+    log = sp.run(["git", "-C", str(tmp_path), "log", "--oneline", "-1"], capture_output=True, text=True).stdout
+    assert "Auto-fix" in log
+
+
+def test_retry_for_invalid_npm_versions_gives_up_gracefully_when_auto_strip_finds_nothing(monkeypatch, tmp_path):
+    """Best-effort real: si ni el reintento ni el auto-strip resuelven nada
+    (ej. el paquete invalido no matcheaba el patron de version exacta), se
+    sigue con el ultimo agent_result conocido -- nunca bloquea la corrida
+    por su cuenta, el testing agent real es la red de seguridad final.
+    """
+    monkeypatch.setattr(orchestration, "_find_invalid_npm_package_versions", lambda target_repo_dir: {"x@^1.2.3": "..."})
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": False})
+    monkeypatch.setattr(orchestration, "_auto_strip_invalid_npm_dependencies", lambda target_repo_dir: [])
+
+    original = {"applied": True, "branch": "copilot/T-1-123"}
+
+    result = orchestration._retry_for_invalid_npm_versions("T-1", "/repo", original)
+
+    assert result["branch"] == "copilot/T-1-123"
+
+
 def test_retry_for_inadequate_tests_preserves_branch_when_retry_omits_it(monkeypatch):
     """retry_coding_agent_local_real() nunca devuelve branch/base_branch (
     reusa la rama ya checked out por el primer intento) -- si
@@ -1350,6 +1643,56 @@ def test_deliver_does_not_retry_when_tests_adequate_true_or_missing(monkeypatch)
         "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
         {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
     )
+
+
+def test_deliver_retries_coding_agent_when_npm_version_is_invalid(monkeypatch):
+    """Gap real confirmado en vivo TRES VECES esta sesion (epica KAN-4):
+    un nombre/version de paquete npm inventado rompe 'npm install' para
+    TODO el sub-proyecto -- _deliver() ahora le da un turno mas ANTES de
+    correr tests/juez con la evidencia deterministica de que version esta
+    mal, en vez de esperar a que el testing agent lo descubra recien
+    despues (mismo mecanismo que tests_adequate=false).
+    """
+    retry_calls = []
+    monkeypatch.setattr(orchestration, "GITHUB_REPO", "")
+    monkeypatch.setattr(orchestration, "_local_coding_agent_backend_available", lambda: True)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {
+            "applied": True, "branch": "copilot/T-1-1", "base_branch": "main", "backend": "ollama",
+            "conversation_file": "/tmp/conv1.json", "self_review": {"tests_adequate": True},
+        },
+    )
+    monkeypatch.setattr(
+        orchestration, "_find_invalid_npm_package_versions",
+        lambda target_repo_dir: {"@ionic/cli@^6.30.0": "la version exacta '6.30.0' no aparece..."},
+    )
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        retry_calls.append((ticket_id, conversation_file))
+        assert "@ionic/cli@^6.30.0" in feedback_text
+        return {"applied": True, "backend": "ollama", "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ok"})
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "3 passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "push_and_open_pr", lambda *a, **k: {"pr_url": None, "pushed": False, "reason": "sin gh"})
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "comment_jira", lambda *a, **k: None)
+
+    result = _deliver(
+        "T-1", "summary", {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+        {"ticket_id": "T-1", "repository_origen": "Frontend"}, "/repo",
+    )
+
+    assert retry_calls == [("T-1", "/tmp/conv1.json")]
+    assert result["agent"]["branch"] == "copilot/T-1-1"
 
 
 def test_deliver_comments_real_test_output_when_tests_pass(monkeypatch):
@@ -2081,6 +2424,64 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     assert ("EPIC-1", orchestration.JIRA_BLOCKED_STATUS) in transitions
 
 
+def test_deliver_epic_sequential_posts_gap_classification_on_test_failure_block(monkeypatch):
+    """Confirma que _classify_and_report_gap() se llama de verdad cuando un
+    hijo se bloquea por tests reales fallidos, y que su veredicto (+
+    propuesta si es infra_bug) se postea como comentario -- diagnostico
+    best-effort, nunca aplica ningun cambio de codigo el mismo.
+    """
+    children = [_fake_child("C-1")]
+    comments = []
+
+    monkeypatch.setattr(
+        orchestration, "evaluate_firewall",
+        lambda *a, **k: {"status": "APPROVED", "sanitized_prompt": "prompt", "redactions_applied": 0, "reason": None},
+    )
+    monkeypatch.setattr(orchestration, "comment_jira", lambda text, ticket_key=None: comments.append((ticket_key, text)))
+    monkeypatch.setattr(orchestration, "transition_jira", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
+    monkeypatch.setattr(
+        orchestration, "run_coding_agent_local_real",
+        lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
+    )
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "npm test fallo: capacitor no encontrado"})
+    monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "generate_technical_report", lambda *a, **k: None)
+
+    classify_calls = []
+
+    def fake_classify(evidence):
+        classify_calls.append(evidence)
+        return {
+            "bucket": "infra_bug",
+            "reasoning": "el comando capacitor no esta reconocido como stack runtime",
+            "proposal": {
+                "suspected_file": "coding_agent.py",
+                "suspected_root_cause": "_STACK_RUNTIME_IMAGES no incluye capacitor",
+                "suggested_fix": "agregar capacitor/cap al mapeo",
+                "regression_test_sketch": "test que confirma el mapeo reconoce cap",
+            },
+        }
+
+    monkeypatch.setattr(orchestration.gap_classifier, "classify_gap", fake_classify)
+
+    orchestration._deliver_epic_sequential(
+        "EPIC-1", {"summary": "epica", "description": "desc"}, children, "/repo", [], [], [], "", [],
+    )
+
+    assert len(classify_calls) == 1
+    assert "capacitor no encontrado" in classify_calls[0]["salida_tests_real"]
+    diag_comments = [text for ticket_key, text in comments if ticket_key == "C-1" and "Diagnostico automatico" in text]
+    assert len(diag_comments) == 1
+    assert "infra_bug" not in diag_comments[0]  # se muestra el label humano, no el valor crudo del bucket
+    assert "posible defecto REAL en el codigo del pipeline" in diag_comments[0]
+    assert "coding_agent.py" in diag_comments[0]
+    assert "agregar capacitor/cap al mapeo" in diag_comments[0]
+
+
 def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok(monkeypatch):
     """Bug real confirmado (KAN-4): con TODAS las historias en outcome "ok",
     la epica en si nunca se transicionaba -- quedaba en JIRA_IN_PROGRESS_STATUS
@@ -2302,6 +2703,16 @@ def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_his
         }
 
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    # insufficient-test-coverage (el policy_reference que este test dispara
+    # en judge_calls["n"]==2) delega al test-writer sub-agent, no al
+    # reintento general -- ver run_test_writer_subagent_task.
+    monkeypatch.setattr(
+        orchestration, "run_test_writer_subagent_task",
+        lambda ticket_id, diff_text, ticket_summary, target_repo_dir: {
+            "applied": True, "backend": "anthropic",
+            "self_review": {"tests_adequate": True}, "conversation_file": None,
+        },
+    )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
@@ -2884,6 +3295,66 @@ def test_run_coding_agent_local_does_not_crash_when_git_commit_fails(monkeypatch
     monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
 
     result = orchestration.run_coding_agent_local("T-1", "prompt", str(tmp_path))
+
+    assert result["applied"] is False
+
+
+def test_run_test_writer_subagent_task_builds_test_writer_mode_payload(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5): confirma que la task
+    arma el payload con mode="test_writer" + diff_text/ticket_summary (no
+    sanitized_prompt/resume_messages, ese es el shape de retry_coding_agent_local_real)
+    y detecta un commit real via checkpoint HEAD (mismo patron que
+    retry_coding_agent_local_real)."""
+    captured_payload = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "done", "summary": "agregue tests con mocks", "_meta": {"backend": "ollama"},
+            "self_review": {"tests_adequate": True},
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = Path(cmd[2])
+            captured_payload.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            fake_run.head_calls = getattr(fake_run, "head_calls", 0) + 1
+            return _fake_subprocess_result(stdout=f"commit{fake_run.head_calls}\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="M frontend/src/auth-guard.test.ts\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_test_writer_subagent_task("KAN-5", "diff real", "Montar AuthGuard", str(tmp_path))
+
+    assert captured_payload["mode"] == "test_writer"
+    assert captured_payload["diff_text"] == "diff real"
+    assert captured_payload["ticket_summary"] == "Montar AuthGuard"
+    assert "sanitized_prompt" not in captured_payload
+    assert result["applied"] is True
+    assert result["self_review"] == {"tests_adequate": True}
+
+
+def test_run_test_writer_subagent_task_reports_not_applied_when_no_commit(monkeypatch, tmp_path):
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "blocked", "summary": "no pude", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return _fake_subprocess_result(stdout="samecommit\n")  # mismo checkpoint -- sin commit nuevo
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")  # working tree limpio
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_test_writer_subagent_task("KAN-5", "diff real", "resumen", str(tmp_path))
 
     assert result["applied"] is False
 

@@ -15,3 +15,30 @@ import pytest
 def _default_no_test_plan(monkeypatch):
     import orchestration
     monkeypatch.setattr(orchestration, "generate_test_plan", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _default_no_gap_classification(monkeypatch):
+    """Mismo criterio que _default_no_test_plan -- gap_classifier.classify_gap()
+    (llamado desde _classify_and_report_gap en cada punto donde
+    _deliver_epic_sequential corta una historia) es otro real LLM call que
+    los tests existentes de bloqueo no conocen. None por default (best-effort,
+    "no se pudo clasificar" -- el mismo comportamiento que si el backend no
+    estuviera disponible); un test que quiera probar la clasificacion real
+    lo sobreescribe con monkeypatch.setattr."""
+    import gap_classifier
+    monkeypatch.setattr(gap_classifier, "classify_gap", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _default_no_grounding_check(monkeypatch):
+    """Mismo criterio que _default_no_gap_classification -- grounding_check.verify_claim_grounded()
+    (llamado desde judge_agent.judge_with_tools()._finalize() para todo
+    veredicto FLAGGED, y desde gap_classifier._classify_async()) es otro
+    real LLM call (bespoke-minicheck) que los tests existentes de
+    judge_agent no conocen. None por default (best-effort, "no se pudo
+    verificar" -- mismo comportamiento que si bespoke-minicheck no
+    estuviera disponible, nunca reescribe el reasoning); un test que quiera
+    probar el grounding real lo sobreescribe con monkeypatch.setattr."""
+    import judge_agent
+    monkeypatch.setattr(judge_agent, "verify_claim_grounded", lambda *a, **k: None)

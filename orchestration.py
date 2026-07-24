@@ -71,6 +71,7 @@ from prefect.artifacts import create_markdown_artifact
 
 import conversation_memory
 import epic_planner
+import gap_classifier
 import graph_writer
 import jira_client
 import judge_agent
@@ -643,6 +644,43 @@ def _transition_all(status: str, ticket_id: str, is_epic: bool, child_ticket_key
     if is_epic:
         for child_key in (child_ticket_keys or []):
             transition_jira(status, ticket_key=child_key, blocked=blocked)
+
+
+_GAP_BUCKET_LABELS = {
+    "content_gap": "necesita otro intento con mejor feedback (mecanismo ya automatizado por el pipeline)",
+    "infra_bug": "posible defecto REAL en el codigo del pipeline",
+    "model_ceiling": "limite de capacidad del modelo -- ningun reintento lo va a resolver",
+}
+
+
+def _classify_and_report_gap(ticket_id: str, block_reason: str, evidence: dict) -> None:
+    """Diagnostico best-effort de por que se corto una corrida -- NUNCA
+    edita orchestration.py/coding_agent.py, nunca corre tests, nunca hace
+    commit (ver el docstring de gap_classifier.py para el porque). Solo
+    postea el veredicto (+ propuesta sin aplicar si es infra_bug) como
+    comentario de Jira, para no tener que releer el log de Prefect a mano
+    cada vez que una corrida se bloquea -- exactamente el trabajo manual que
+    esta sesion tuvo que hacer, repetidas veces, para diagnosticar cada
+    bloqueo real de la epica KAN-4.
+    """
+    classification = gap_classifier.classify_gap({"motivo_del_bloqueo": block_reason, **evidence})
+    if classification is None:
+        return
+    bucket = classification.get("bucket")
+    lines = [
+        f"🔍 Diagnostico automatico (gap_classifier, best-effort, NO aplica cambios): {_GAP_BUCKET_LABELS.get(bucket, bucket)}.",
+        f"Razonamiento: {classification.get('reasoning')}",
+    ]
+    proposal = classification.get("proposal")
+    if bucket == "infra_bug" and proposal:
+        lines.append(
+            "Propuesta (requiere revision humana, NO aplicada automaticamente): "
+            f"archivo sospechoso: {proposal.get('suspected_file') or 'no identificado'}. "
+            f"Causa probable: {proposal.get('suspected_root_cause')}. "
+            f"Sugerencia: {proposal.get('suggested_fix')}. "
+            f"Test de regresion sugerido: {proposal.get('regression_test_sketch')}."
+        )
+    comment_jira("\n".join(lines), ticket_key=ticket_id)
 
 
 def _log_best_effort(level: str, message: str) -> None:
@@ -1816,6 +1854,97 @@ def retry_coding_agent_local_real(
     }
 
 
+@task(retries=0, name="test-writer-subagent")
+def run_test_writer_subagent_task(ticket_id: str, diff_text: str, ticket_summary: str, target_repo_dir: str) -> dict:
+    """Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas
+    con el mismo veredicto insufficient-test-coverage): el reintento normal
+    (retry_coding_agent_local_real) CONTINUA la misma conversacion larga
+    (investigacion+implementacion+intentos previos) -- para cuando llega a
+    escribir el test, viene cargada. Esta task dispara coding_agent.py en
+    modo "test_writer" (ver ahi): conversacion SIEMPRE nueva, enfocada
+    unicamente en escribir/mejorar tests para el diff actual, sin la carga
+    de la conversacion principal. Mismo shape de retorno que
+    retry_coding_agent_local_real (applied/backend/self_review/etc.) para
+    que _retry_local_diff() pueda usar cualquiera de las dos sin distinguir
+    cual corrio.
+    """
+    checkpoint = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+    payload = {
+        "mode": "test_writer", "ticket_id": ticket_id, "target_repo_dir": target_repo_dir,
+        "diff_text": diff_text, "ticket_summary": ticket_summary,
+    }
+    payload_file = SCRIPT_DIR / "logs" / f".coding_agent_test_writer_payload_{ticket_id}_{int(time.time())}.json"
+    payload_file.parent.mkdir(parents=True, exist_ok=True)
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            ["python3", str(SCRIPT_DIR / "coding_agent.py"), str(payload_file)],
+            stdout=subprocess.PIPE, text=True, cwd=target_repo_dir,
+        )
+    finally:
+        payload_file.unlink(missing_ok=True)
+
+    run_logger = get_run_logger()
+    if result.returncode != 0:
+        run_logger.warning(f"coding_agent.py (test-writer sub-agent) salio con returncode={result.returncode} para {ticket_id}.")
+
+    backend = None
+    self_review = None
+    self_verified = None
+    consulted_risk_graph = None
+    subagent_summary = None
+    subagent_conversation_file = None
+    try:
+        agent_result = json.loads(result.stdout)
+        run_logger.info(f"Resultado del test-writer sub-agent: {agent_result.get('status')} — {agent_result.get('summary')}")
+        backend = agent_result.get("_meta", {}).get("backend")
+        self_review = agent_result.get("self_review")
+        self_verified = agent_result.get("self_verified")
+        consulted_risk_graph = agent_result.get("consulted_risk_graph")
+        subagent_summary = agent_result.get("summary")
+        subagent_conversation_file = agent_result.get("_conversation_file")
+    except json.JSONDecodeError:
+        run_logger.warning(f"El test-writer sub-agent no devolvio un JSON valido en stdout para {ticket_id}.")
+    finally:
+        # A diferencia de retry_coding_agent_local_real, esta conversacion
+        # nunca se resume (cada intento del test-writer arranca fresco a
+        # proposito, ver docstring de coding_agent.run_test_writer_subagent)
+        # -- nadie mas la va a continuar, se limpia apenas se consume.
+        if subagent_conversation_file:
+            Path(subagent_conversation_file).unlink(missing_ok=True)
+
+    status = subprocess.run(
+        ["git", "-C", target_repo_dir, "status", "--porcelain"], capture_output=True, text=True
+    ).stdout
+    head_now = subprocess.run(
+        ["git", "-C", target_repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    has_own_commits = bool(checkpoint) and head_now != checkpoint
+
+    if status.strip():
+        _git_add_all_excluding_vendor(target_repo_dir)
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo_dir, "commit", "-m", f"Test-writer sub-agent for {ticket_id}"], check=True
+            )
+            has_own_commits = True
+        except subprocess.CalledProcessError as exc:
+            get_run_logger().warning(f"{ticket_id}: 'git commit' fallo en el test-writer sub-agent ({exc}) -- se trata como que no se aplico ningun cambio nuevo.")
+
+    if not has_own_commits:
+        return {
+            "applied": False, "backend": backend, "self_review": self_review, "conversation_file": None,
+            "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": subagent_summary,
+        }
+    return {
+        "applied": True, "backend": backend, "self_review": self_review, "conversation_file": None,
+        "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": subagent_summary,
+    }
+
+
 @task(retries=0, name="output-guard")
 def run_output_guard(diff_text: str, jira_context: dict) -> dict:
     """El AI Firewall (firewall_proxy.py) audita el prompt que ENTRA al
@@ -2275,6 +2404,246 @@ INADEQUATE_TESTS_FEEDBACK = (
 )
 
 
+_NPM_EXACT_VERSION_PATTERN = re.compile(r"^[\^~]?(\d+\.\d+\.\d+)(?:[^0-9].*)?$")
+
+
+def _real_npm_versions(pkg_name: str, npm_available_natively: bool) -> list | None:
+    """El "npm view" real (nativo o via Docker si el contenedor de
+    orchestration.py no tiene npm -- ver el comentario en la funcion de
+    abajo) -- devuelve la lista real de versiones publicadas, o None si no
+    se pudo consultar (best-effort: el llamador decide que hacer con eso,
+    nunca se asume "no existe" solo porque la consulta fallo).
+    """
+    npm_view_cmd = ["npm", "view", pkg_name, "versions", "--json"]
+    try:
+        if npm_available_natively:
+            result = subprocess.run(npm_view_cmd, capture_output=True, text=True, timeout=30)
+        else:
+            result = subprocess.run(
+                ["docker", "run", "--rm", "mcr.microsoft.com/playwright:v1.61.1-noble", *npm_view_cmd],
+                capture_output=True, text=True, timeout=60,
+            )
+        if result.returncode != 0:
+            return None
+        real_versions = json.loads(result.stdout or "[]")
+        if isinstance(real_versions, str):
+            real_versions = [real_versions]  # npm view devuelve un string pelado si solo hay UNA version publicada
+        return real_versions
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        return None
+
+
+def _find_invalid_npm_package_versions(target_repo_dir: str) -> dict:
+    """Heuristica deterministica (no resuelve rangos semver completos --
+    ver mas abajo por que no hace falta): para cada dependencia declarada en
+    algun package.json real del repo con un version string que arranca con
+    un numero exacto ("^X.Y.Z", "~X.Y.Z", "X.Y.Z"), confirma que ESE numero
+    exacto aparece en la lista real de versiones publicadas de npm.
+
+    Gap real confirmado en vivo TRES VECES esta sesion (epica KAN-4):
+    "@capacitor/firebase-auth" (nombre de paquete inventado), "@ionic/cli":
+    "^6.30.0", "@ionic/angular": "6.12.0" (numeros de version que suenan
+    plausibles -- mismo formato, en el rango correcto -- pero nunca se
+    publicaron). La guia de prompt (la tool verify_npm_package) no alcanza
+    sola: el modelo no siempre la llama antes de escribir la version. Esto
+    es la red de seguridad determinista -- corre DESPUES de que el modelo
+    commitea, ANTES de tests/juez, sobre TODO package.json real tocado, sin
+    depender de que el modelo se acuerde de verificar nada.
+
+    No resuelve rangos semver completos a proposito: el patron real que
+    causo los 3 bugs de esta sesion fue siempre un numero EXACTO inventado
+    (no "^6.x" generico, sino "^6.30.0" puntual) -- confirmar que ese numero
+    literal existe en la lista real es suficiente para atrapar el patron
+    real, sin necesitar una libreria de resolucion de rangos semver.
+    Ignora deliberadamente "*", "latest", "workspace:", "file:", "git+" y
+    similares -- no son el patron real, y no tiene sentido tratar de
+    verificarlos contra el registro de npm.
+
+    Devuelve {"paquete@version_declarada": "razon"} -- vacio si no se
+    encontro ningun package.json real, o si todas las versiones declaradas
+    confirmaron existir. Best-effort total: cualquier error de I/O o de red
+    al consultar un paquete puntual se ignora para ESE paquete (no bloquea
+    el chequeo de los demas) -- nunca bloquea la corrida por su cuenta,
+    el llamador decide si reintentar.
+    """
+    invalid = {}
+    root = Path(target_repo_dir).resolve()
+    try:
+        package_json_paths = [
+            p for p in root.rglob("package.json")
+            if not any(part in _SCAFFOLD_SCAN_SKIP_DIRS for part in p.relative_to(root).parts)
+        ]
+    except OSError:
+        return invalid
+
+    # Bug real confirmado en vivo (epica KAN-4, esta misma sesion): este
+    # chequeo corre DENTRO de orchestration.py, que a su vez corre en el
+    # contenedor minimo del propio pipeline (poc-ai-agents-testrunner,
+    # Python + git + jq + cypher-shell -- NO Node/npm, mismo motivo por el
+    # que coding_agent.py necesita _resolve_stack_image_if_needed para sus
+    # propios comandos ad-hoc). "npm" nativo simplemente no existe ahi --
+    # subprocess.run(["npm", ...]) tiraba FileNotFoundError, atrapado por el
+    # except silencioso de abajo, asi que el chequeo entero se saltaba SIEMPRE
+    # sin ningun error visible (confirmado real: "@capacitor/android-gradle-plugin":
+    # "^4.0.0" -- invalido de verdad -- paso sin que este chequeo lo
+    # detectara ni una vez). Mismo fallback nativo-o-Docker que
+    # coding_agent.tool_verify_npm_package ya usa.
+    npm_available_natively = shutil.which("npm") is not None
+    docker_available = shutil.which("docker") is not None
+    if not npm_available_natively and not docker_available:
+        logger.warning("_find_invalid_npm_package_versions: ni npm ni docker disponibles -- no se puede verificar ninguna version, se omite el chequeo entero.")
+        return invalid
+
+    for package_json_path in package_json_paths:
+        try:
+            data = json.loads(package_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        deps = {**(data.get("dependencies") or {}), **(data.get("devDependencies") or {})}
+        for pkg_name, declared_version in deps.items():
+            match = _NPM_EXACT_VERSION_PATTERN.match(declared_version.strip())
+            if not match:
+                continue  # "*", "latest", "workspace:...", "file:...", "git+...", rangos con "||"/" - ", etc.
+            exact_version = match.group(1)
+            real_versions = _real_npm_versions(pkg_name, npm_available_natively)
+            if real_versions is None:
+                continue  # best-effort: no se pudo consultar este paquete puntual, no bloquea a los demas
+            if exact_version not in real_versions:
+                invalid[f"{pkg_name}@{declared_version}"] = (
+                    f"la version exacta '{exact_version}' no aparece en las versiones reales publicadas de '{pkg_name}' "
+                    f"({package_json_path.relative_to(root)})"
+                )
+    return invalid
+
+
+def _auto_strip_invalid_npm_dependencies(target_repo_dir: str) -> list:
+    """Ultimo recurso deterministico, NUNCA el primero -- ver
+    _retry_for_invalid_npm_versions para donde se usa. Gap real confirmado
+    en vivo (epica KAN-4, qwen3:8b, CUATRO corridas seguidas): incluso con
+    feedback especifico y correcto ("estas versiones no existen, usa
+    verify_npm_package"), el modelo reconocia el problema en su propio texto
+    ("El paquete X no existe en npm... Debe usar verify_npm_package") pero
+    el reintento no aplicaba ningun cambio real -- declaraba "blocked" de
+    nuevo sin corregir el archivo. Tres capas de guia/herramientas/feedback
+    ya existen (prompt, tool verify_npm_package, retry con evidencia
+    deterministica) -- esto es la CUARTA capa, la que no depende de que el
+    modelo actue: si sigue habiendo versiones invalidas DESPUES de darle una
+    chance real, se eliminan del package.json directamente. Casi siempre son
+    dependencias que el propio modelo agrego de mas durante el scaffolding
+    (nunca el nucleo del ticket que un humano pidio), asi que perderlas no
+    es una perdida real -- lo que SI seria una perdida real es que la epica
+    entera se quede trabada para siempre por una linea de package.json.
+
+    Devuelve la lista de "pkg@version_declarada (archivo)" removidos -- []
+    si no se modifico nada real (nada invalido encontrado, o no se pudo
+    verificar ningun paquete).
+    """
+    removed = []
+    root = Path(target_repo_dir).resolve()
+    try:
+        package_json_paths = [
+            p for p in root.rglob("package.json")
+            if not any(part in _SCAFFOLD_SCAN_SKIP_DIRS for part in p.relative_to(root).parts)
+        ]
+    except OSError:
+        return removed
+
+    npm_available_natively = shutil.which("npm") is not None
+    docker_available = shutil.which("docker") is not None
+    if not npm_available_natively and not docker_available:
+        return removed
+
+    for package_json_path in package_json_paths:
+        try:
+            data = json.loads(package_json_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        file_changed = False
+        for section in ("dependencies", "devDependencies"):
+            section_deps = data.get(section)
+            if not isinstance(section_deps, dict):
+                continue
+            for pkg_name in list(section_deps.keys()):
+                declared_version = section_deps[pkg_name]
+                match = _NPM_EXACT_VERSION_PATTERN.match(str(declared_version).strip())
+                if not match:
+                    continue
+                real_versions = _real_npm_versions(pkg_name, npm_available_natively)
+                if real_versions is None or match.group(1) in real_versions:
+                    continue
+                del section_deps[pkg_name]
+                file_changed = True
+                removed.append(f"{pkg_name}@{declared_version} ({package_json_path.relative_to(root)})")
+        if file_changed:
+            package_json_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return removed
+
+
+INVALID_NPM_VERSIONS_FEEDBACK_TEMPLATE = (
+    "Verificacion deterministica (npm view real, no una opinion): las siguientes dependencias que agregaste/"
+    "modificaste tienen una version que NO existe de verdad en el registro de npm -- 'npm install' va a romper "
+    "para TODO el sub-proyecto con esto adentro:\n{details}\n\nCorregi cada una: usa la tool verify_npm_package "
+    "para confirmar una version real (o un rango que la cubra) ANTES de reescribir, o revertí la dependencia si "
+    "no la necesitas de verdad."
+)
+
+
+def _retry_for_invalid_npm_versions(ticket_id: str, target_repo_dir: str, agent_result: dict) -> dict:
+    """Mismo mecanismo/forma que _retry_for_inadequate_tests -- un turno mas,
+    real, ANTES de correr tests/juez, con la evidencia deterministica de
+    _find_invalid_npm_package_versions() como feedback.
+
+    Gap real confirmado en vivo (epica KAN-4, qwen3:8b, CUATRO corridas
+    seguidas): el reintento reconocia el problema en su propio texto
+    ("El paquete X no existe en npm... debo usar verify_npm_package") pero
+    no siempre lo corregia de verdad -- declaraba "blocked" de nuevo sin
+    tocar el archivo. Si DESPUES del reintento el chequeo sigue encontrando
+    versiones invalidas, esta funcion las elimina directamente
+    (_auto_strip_invalid_npm_dependencies) y commitea ese fix ella misma --
+    ultimo recurso deterministico que no depende de que el modelo actue.
+    Nunca bloquea la corrida por su cuenta: si ni el reintento ni el
+    auto-strip resuelven nada, se sigue con el ultimo agent_result conocido,
+    y el testing agent real (que corre despues) es la red de seguridad final.
+    """
+    invalid = _find_invalid_npm_package_versions(target_repo_dir)
+    if not invalid:
+        return agent_result
+    details = "\n".join(f"- {pkg}: {reason}" for pkg, reason in invalid.items())
+    feedback = INVALID_NPM_VERSIONS_FEEDBACK_TEMPLATE.format(details=details)
+    retried = retry_coding_agent_local_real(
+        ticket_id, feedback, target_repo_dir, conversation_file=agent_result.get("conversation_file")
+    )
+    merged = dict(agent_result)
+    if retried.get("applied"):
+        merged.update(retried)
+
+    still_invalid = _find_invalid_npm_package_versions(target_repo_dir)
+    if not still_invalid:
+        return merged
+
+    removed = _auto_strip_invalid_npm_dependencies(target_repo_dir)
+    if not removed:
+        return merged
+
+    _git_add_all_excluding_vendor(target_repo_dir)
+    try:
+        subprocess.run(
+            ["git", "-C", target_repo_dir, "commit", "-m", f"Auto-fix: remove invalid npm dependencies for {ticket_id}"],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _log_best_effort("warning", f"{ticket_id}: 'git commit' fallo en el auto-strip de dependencias invalidas ({exc}) -- se sigue con el ultimo agent_result conocido, sin el fix.")
+        return merged
+
+    _log_best_effort(
+        "warning",
+        f"{ticket_id}: el modelo no corrigio las versiones npm invalidas tras un reintento real -- se removieron "
+        f"automaticamente (ultimo recurso deterministico): {', '.join(removed)}",
+    )
+    merged["applied"] = True
+    return merged
+
+
 def _retry_for_inadequate_tests(ticket_id: str, target_repo_dir: str, agent_result: dict) -> dict:
     """Confirmado real (KAN-15, KAN-5): el coding agent se autoevalua con
     honestidad (self_review.tests_adequate=False) pero termina igual con
@@ -2401,9 +2770,23 @@ def _retry_local_diff(
             if not conversation_file:
                 feedback_text = f"{sanitized}\n\n{feedback_text}"
 
-            retry_result = retry_coding_agent_local_real(
-                ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
-            )
+            # Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas
+            # seguidas con el mismo veredicto): el reintento normal continua
+            # la MISMA conversacion larga (investigacion+implementacion+
+            # intentos previos) -- para cuando llega a escribir el test,
+            # viene cargada. Para insufficient-test-coverage especificamente,
+            # un sub-agente de testing con conversacion fresca (ver
+            # coding_agent.run_test_writer_subagent) tiene mas chance real de
+            # aplicar bien las reglas de mocking/async sin esa carga. Otros
+            # policy_reference (scope-mismatch, graph-impact-unverified seguen
+            # con el reintento general -- son sobre el cambio en si, no sobre
+            # tests, y SI se benefician de la memoria de la conversacion.
+            if current_verdict.get("policy_reference") == "insufficient-test-coverage":
+                retry_result = run_test_writer_subagent_task(ticket_id, current_diff_text, summary, target_repo_dir)
+            else:
+                retry_result = retry_coding_agent_local_real(
+                    ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
+                )
             conversation_file = retry_result.get("conversation_file") or conversation_file
             if not retry_result["applied"]:
                 print(f"El {label} no produjo cambios nuevos -- se mantiene el ultimo veredicto conocido.")
@@ -2640,6 +3023,23 @@ def _deliver(
                     ticket_id, is_epic, child_ticket_keys,
                 )
                 agent_result = _retry_for_inadequate_tests(ticket_id, target_repo_dir, agent_result)
+                backend = agent_result.get("backend") or backend
+
+            # Gap real confirmado en vivo TRES VECES esta sesion (epica
+            # KAN-4): un nombre/version de paquete npm inventado (sonaba
+            # plausible, nunca se publico de verdad) rompe "npm install"
+            # para TODO el sub-proyecto -- la guia de prompt sola
+            # (verify_npm_package) no bastaba, el modelo no siempre la
+            # llamaba. Chequeo deterministico ANTES de tests/juez, no
+            # depende de que el modelo se acuerde de nada.
+            invalid_npm_versions = _find_invalid_npm_package_versions(target_repo_dir)
+            if invalid_npm_versions:
+                _comment_all(
+                    f"📦 Verificacion deterministica: {len(invalid_npm_versions)} dependencia(s) con version "
+                    "invalida detectada(s) -- dandole un turno mas para corregirla(s) antes de correr el testing agent.",
+                    ticket_id, is_epic, child_ticket_keys,
+                )
+                agent_result = _retry_for_invalid_npm_versions(ticket_id, target_repo_dir, agent_result)
                 backend = agent_result.get("backend") or backend
 
             resumed_note = ""
@@ -3080,6 +3480,20 @@ def _deliver_epic_sequential(
             agent_result = _retry_for_inadequate_tests(epic_key, target_repo_dir, agent_result)
             backend = agent_result.get("backend") or backend
 
+        # Gap real confirmado en vivo TRES VECES esta sesion (epica KAN-4):
+        # un nombre/version de paquete npm inventado rompe "npm install"
+        # para TODO el sub-proyecto -- ver el comentario equivalente en
+        # _deliver().
+        invalid_npm_versions = _find_invalid_npm_package_versions(target_repo_dir)
+        if invalid_npm_versions:
+            comment_jira(
+                f"📦 Verificacion deterministica: {len(invalid_npm_versions)} dependencia(s) con version invalida "
+                f"detectada(s) en {child_id} -- dandole un turno mas para corregirla(s) antes de correr el testing agent.",
+                ticket_key=child_id,
+            )
+            agent_result = _retry_for_invalid_npm_versions(epic_key, target_repo_dir, agent_result)
+            backend = agent_result.get("backend") or backend
+
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
 
@@ -3115,6 +3529,7 @@ def _deliver_epic_sequential(
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             check_falco_correlation(falco_since, child_id)
             _post_child_technical_report(epic_key, child_id, backend, f"bloqueada por la guardia de salida ({reason})")
+            _classify_and_report_gap(child_id, "guardia de salida bloqueo el diff", {"guardia_de_salida": reason})
             blocked_at = child_id
             break
 
@@ -3129,6 +3544,7 @@ def _deliver_epic_sequential(
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             check_falco_correlation(falco_since, child_id)
             _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- los tests reales fallaron", {"salida_tests": test_result["output"][:2000]})
+            _classify_and_report_gap(child_id, "tests reales fallaron", {"salida_tests_real": test_result["output"][-3000:]})
             blocked_at = child_id
             break
 
@@ -3200,6 +3616,10 @@ def _deliver_epic_sequential(
             post_alert_webhook(f"🧑‍⚖️ Juez FLAGGED en {child_id} (modo epica secuencial): {judge_verdict['reasoning']}")
             transition_jira(JIRA_BLOCKED_STATUS, ticket_key=child_id, blocked=True)
             _post_child_technical_report(epic_key, child_id, backend, "bloqueada -- el juez marco FLAGGED", {"veredicto_juez": judge_verdict["reasoning"], "rama_git": branch})
+            _classify_and_report_gap(
+                child_id, "el juez marco FLAGGED tras agotar los reintentos",
+                {"veredicto_juez": judge_verdict["reasoning"], "policy_reference": judge_verdict.get("policy_reference")},
+            )
             blocked_at = child_id
             break
         else:
