@@ -2112,6 +2112,39 @@ def test_tool_verify_npm_package_errors_without_npm_or_docker(tmp_path, monkeypa
     assert "no asumas que existe" in result
 
 
+def test_tool_verify_npm_package_keeps_newest_versions_not_oldest(tmp_path, monkeypatch):
+    """Gap real (revision de codigo): npm devuelve el array de versiones en
+    orden cronologico ASCENDENTE (confirmado real contra
+    registry.npmjs.org/react) -- truncar el string crudo con [:1000] se
+    quedaba con las versiones mas VIEJAS y cortaba las mas recientes, que
+    son las que un agente necesita verificar. Con muchas versiones viejas
+    (>1000 caracteres de JSON), la mas nueva debe seguir apareciendo."""
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    old_versions = [f"0.0.{i}" for i in range(200)]  # infla el JSON bien mas alla de 1000 chars
+    all_versions = old_versions + ["19.3.0"]
+    fake_result = MagicMock(returncode=0, stdout=json.dumps(all_versions), stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result):
+        result = ca.tool_verify_npm_package(str(tmp_path), "react")
+
+    assert "19.3.0" in result
+    assert "0.0.0" not in result  # la mas vieja ya no deberia estar en el recorte de ultimas 20
+
+
+def test_tool_verify_npm_package_checks_exact_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    fake_result = MagicMock(returncode=0, stdout='["1.0.0", "1.1.0"]', stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result):
+        result = ca.tool_verify_npm_package(str(tmp_path), "react", version="9.9.9")
+
+    assert "NO existe" in result
+    assert "1.1.0" in result
+
+
+def test_semver_sort_key_orders_numerically_not_lexicographically():
+    versions = ["1.2.0", "1.10.0", "1.9.0", "2.0.0"]
+    assert sorted(versions, key=ca._semver_sort_key) == ["1.2.0", "1.9.0", "1.10.0", "2.0.0"]
+
+
 # --- verify_pip_package / verify_maven_package / verify_go_module /
 # verify_gem_package / verify_cargo_crate / verify_nuget_package ---
 # Gap real confirmado en vivo (epica KAN-4, TRES corridas seguidas de
@@ -2148,6 +2181,29 @@ def test_tool_verify_pip_package_checks_exact_version(tmp_path):
     assert "NO existe en PyPI" in result
 
 
+def test_tool_verify_pip_package_sorts_versions_numerically_not_lexicographically(tmp_path):
+    """Gap real (revision de codigo): sorted(releases) de texto plano pone
+    '1.9.0' DESPUES de '1.10.0' (compara caracter por caracter), mostrandole
+    al agente una version vieja como si fuera la mas nueva."""
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = {"releases": {"1.2.0": [], "1.9.0": [], "1.10.0": []}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_pip_package(str(tmp_path), "requests", version="9.9.9")
+
+    tail = result.split(":\n", 1)[1]
+    assert tail.split(", ")[-1] == "1.10.0"
+
+
+def test_tool_verify_pip_package_handles_malformed_json_response(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.side_effect = ValueError("not json")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_pip_package(str(tmp_path), "requests")
+
+    assert "no se pudo confirmar" in result
+    assert "no asumas que existe" in result
+
+
 def test_tool_verify_maven_package_confirms_real_dependency(tmp_path):
     fake_resp = MagicMock(status_code=200)
     fake_resp.raise_for_status = lambda: None
@@ -2167,6 +2223,42 @@ def test_tool_verify_maven_package_detects_nonexistent_dependency(tmp_path):
         result = ca.tool_verify_maven_package(str(tmp_path), "com.fake", "does-not-exist")
 
     assert "NO existe en Maven Central" in result
+
+
+def test_tool_verify_maven_package_sorts_versions_numerically_not_lexicographically(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.raise_for_status = lambda: None
+    fake_resp.json.return_value = {"response": {"docs": [{"v": "1.2.0"}, {"v": "1.9.0"}, {"v": "1.10.0"}]}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_maven_package(str(tmp_path), "org.springframework", "spring-core")
+
+    tail = result.split(":\n", 1)[1]
+    assert tail.split(", ")[-1] == "1.10.0"
+
+
+def test_tool_verify_maven_package_escapes_quotes_in_query(tmp_path):
+    """Gap real (revision de codigo): un groupId/artifactId con un '"'
+    literal (ej. alucinado por el modelo) rompia la sintaxis de la query
+    Solr y producia un falso 'NO existe' en vez de un error real."""
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.raise_for_status = lambda: None
+    fake_resp.json.return_value = {"response": {"docs": [{"v": "1.0.0"}]}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp) as mock_get:
+        ca.tool_verify_maven_package(str(tmp_path), 'org.spring"framework', "spring-core")
+
+    query = mock_get.call_args.kwargs["params"]["q"]
+    assert '\\"' in query
+
+
+def test_tool_verify_maven_package_handles_malformed_json_response(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.raise_for_status = lambda: None
+    fake_resp.json.side_effect = ValueError("not json")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_maven_package(str(tmp_path), "org.springframework", "spring-core")
+
+    assert "no se pudo confirmar" in result
+    assert "no asumas que existe" in result
 
 
 def test_tool_verify_go_module_confirms_real_module(tmp_path):
@@ -2204,6 +2296,16 @@ def test_tool_verify_gem_package_detects_nonexistent_gem(tmp_path):
     assert "NO existe en RubyGems" in result
 
 
+def test_tool_verify_gem_package_handles_malformed_json_response(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.side_effect = ValueError("not json")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_gem_package(str(tmp_path), "rails")
+
+    assert "no se pudo confirmar" in result
+    assert "no asumas que existe" in result
+
+
 def test_tool_verify_cargo_crate_confirms_real_crate(tmp_path):
     fake_resp = MagicMock(status_code=200)
     fake_resp.json.return_value = {"versions": [{"num": "1.0.0"}, {"num": "1.1.0"}]}
@@ -2222,6 +2324,16 @@ def test_tool_verify_cargo_crate_detects_nonexistent_crate(tmp_path):
     assert "NO existe en crates.io" in result
 
 
+def test_tool_verify_cargo_crate_handles_malformed_json_response(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.side_effect = ValueError("not json")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_cargo_crate(str(tmp_path), "serde")
+
+    assert "no se pudo confirmar" in result
+    assert "no asumas que existe" in result
+
+
 def test_tool_verify_nuget_package_confirms_real_package(tmp_path):
     fake_resp = MagicMock(status_code=200)
     fake_resp.json.return_value = {"versions": ["12.0.0", "13.0.1"]}
@@ -2238,6 +2350,16 @@ def test_tool_verify_nuget_package_detects_nonexistent_package(tmp_path):
         result = ca.tool_verify_nuget_package(str(tmp_path), "Does.Not.Exist.Xyz")
 
     assert "NO existe en NuGet" in result
+
+
+def test_tool_verify_nuget_package_handles_malformed_json_response(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.side_effect = ValueError("not json")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_nuget_package(str(tmp_path), "Newtonsoft.Json")
+
+    assert "no se pudo confirmar" in result
+    assert "no asumas que existe" in result
 
 
 def test_registry_verification_tools_handle_network_errors_gracefully(tmp_path):

@@ -1001,12 +1001,31 @@ def tool_query_sonar(target_repo_dir: str, component: str) -> str:
 # nada), es una verificacion determinista que no depende de que el modelo
 # la recuerde en el momento justo -- se puede ademas nudgear directamente
 # desde el prompt como el paso obligatorio antes de tocar package.json.
-def tool_verify_npm_package(target_repo_dir: str, package_name: str) -> str:
-    """Verifica si un paquete existe de verdad en el registro real de npm
-    (npm view, sin instalar nada) -- solo lectura, no requiere confirmacion
-    humana. Corre nativo si npm esta disponible en este contenedor, o
-    delega a la imagen real de Node (Docker-outside-of-Docker, mismo patron
-    que run_shell_command) si no lo esta.
+def _semver_sort_key(version_str: str):
+    """Ordena versiones por sus componentes numericos reales, no como texto
+    plano -- un sort de strings pone '1.9.0' DESPUES de '1.10.0' (compara
+    caracter por caracter: '9' > '1'), lo que le muestra al agente una
+    version vieja como si fuera la mas nueva. Componentes no numericos
+    (ej. '1.0.0-beta') se comparan como texto solo dentro del mismo prefijo
+    numerico, no rompen el sort si algo no matchea el patron esperado.
+    """
+    parts = re.split(r"[.\-+]", version_str)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return key
+
+
+def tool_verify_npm_package(target_repo_dir: str, package_name: str, version: str = "") -> str:
+    """Verifica si un paquete (y opcionalmente una version exacta) existe de
+    verdad en el registro real de npm (npm view, sin instalar nada) -- solo
+    lectura, no requiere confirmacion humana. Corre nativo si npm esta
+    disponible en este contenedor, o delega a la imagen real de Node
+    (Docker-outside-of-Docker, mismo patron que run_shell_command) si no lo
+    esta.
     """
     npm_available = shutil.which("npm") is not None
     cmd = ["npm", "view", package_name, "versions", "--json"]
@@ -1028,7 +1047,29 @@ def tool_verify_npm_package(target_repo_dir: str, package_name: str) -> str:
     if result.returncode != 0 or "404" in stderr or "E404" in stderr:
         return f"'{package_name}' NO existe en el registro de npm (verificado con npm view) -- no lo agregues a package.json con este nombre. Detalle: {stderr[:300]}"
     stdout = (result.stdout or "").strip()
-    return f"'{package_name}' SI existe en npm. Versiones reales disponibles:\n{stdout[:1000]}"
+    # npm devuelve el array de versiones en orden cronologico ASCENDENTE (la
+    # mas vieja primero) -- confirmado real contra el registro publico
+    # (registry.npmjs.org/react: ['0.0.1', '0.0.2', ..., mas reciente al
+    # final]). Truncar el string crudo con [:1000] se queda con las
+    # versiones mas viejas y corta las mas recientes, que son justo las que
+    # un agente necesita verificar (una version recien pineada en
+    # package.json). Parseamos el JSON real y devolvemos las ultimas 20
+    # (mas nuevas) en vez de los primeros 1000 caracteres del string crudo.
+    try:
+        all_versions = json.loads(stdout)
+        if isinstance(all_versions, str):
+            all_versions = [all_versions]
+    except (ValueError, TypeError):
+        all_versions = None
+    if all_versions is None:
+        return f"'{package_name}' SI existe en npm, pero no se pudo parsear la lista de versiones -- no asumas que una version especifica existe sin confirmarlo de otra forma."
+    if version:
+        exists = version in all_versions
+        return (
+            f"'{package_name}@{version}' {'SI' if exists else 'NO'} existe en npm."
+            + ("" if exists else f" Versiones reales disponibles (ultimas 20):\n{', '.join(all_versions[-20:])}")
+        )
+    return f"'{package_name}' SI existe en npm. Versiones reales disponibles (ultimas 20):\n{', '.join(all_versions[-20:])}"
 
 
 # Gap real confirmado en vivo (epica KAN-4, TRES corridas seguidas):
@@ -1055,14 +1096,17 @@ def tool_verify_pip_package(target_repo_dir: str, package_name: str, version: st
         return f"'{package_name}' NO existe en PyPI -- no lo agregues a requirements.txt/Pipfile con este nombre."
     if resp.status_code != 200:
         return f"error: PyPI devolvio {resp.status_code} consultando '{package_name}' -- no se pudo confirmar"
-    releases = list((resp.json() or {}).get("releases", {}).keys())
+    try:
+        releases = list((resp.json() or {}).get("releases", {}).keys())
+    except ValueError:
+        return f"error: PyPI devolvio una respuesta no-JSON consultando '{package_name}' -- no se pudo confirmar, no asumas que existe"
     if version:
         exists = version in releases
         return (
             f"'{package_name}=={version}' {'SI' if exists else 'NO'} existe en PyPI."
-            + ("" if exists else f" Versiones reales disponibles:\n{', '.join(sorted(releases)[-20:])}")
+            + ("" if exists else f" Versiones reales disponibles:\n{', '.join(sorted(releases, key=_semver_sort_key)[-20:])}")
         )
-    return f"'{package_name}' SI existe en PyPI. Versiones reales disponibles (ultimas 20):\n{', '.join(sorted(releases)[-20:])}"
+    return f"'{package_name}' SI existe en PyPI. Versiones reales disponibles (ultimas 20):\n{', '.join(sorted(releases, key=_semver_sort_key)[-20:])}"
 
 
 def tool_verify_maven_package(target_repo_dir: str, group_id: str, artifact_id: str, version: str = "") -> str:
@@ -1071,7 +1115,12 @@ def tool_verify_maven_package(target_repo_dir: str, group_id: str, artifact_id: 
     (search.maven.org), solo lectura. Usa esto antes de agregar algo al
     pom.xml.
     """
-    query = f'g:"{group_id}" AND a:"{artifact_id}"'
+    # Escapa comillas embebidas en group_id/artifact_id -- un nombre
+    # hallucinado con un '"' literal rompe la sintaxis de la query Solr y
+    # produce un falso "NO existe" (0 resultados) en vez de un error real.
+    safe_group = group_id.replace('"', '\\"')
+    safe_artifact = artifact_id.replace('"', '\\"')
+    query = f'g:"{safe_group}" AND a:"{safe_artifact}"'
     try:
         resp = httpx.get(
             "https://search.maven.org/solrsearch/select",
@@ -1081,10 +1130,13 @@ def tool_verify_maven_package(target_repo_dir: str, group_id: str, artifact_id: 
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         return f"error: no se pudo consultar Maven Central para '{group_id}:{artifact_id}' ({exc}) -- no se pudo confirmar, no asumas que existe"
-    docs = ((resp.json() or {}).get("response") or {}).get("docs", [])
+    try:
+        docs = ((resp.json() or {}).get("response") or {}).get("docs", [])
+    except ValueError:
+        return f"error: Maven Central devolvio una respuesta no-JSON consultando '{group_id}:{artifact_id}' -- no se pudo confirmar, no asumas que existe"
     if not docs:
         return f"'{group_id}:{artifact_id}' NO existe en Maven Central (0 resultados) -- no lo agregues al pom.xml con este groupId/artifactId."
-    versions = sorted({d.get("v") for d in docs if d.get("v")})
+    versions = sorted({d.get("v") for d in docs if d.get("v")}, key=_semver_sort_key)
     if version:
         exists = version in versions
         return f"'{group_id}:{artifact_id}:{version}' {'SI' if exists else 'NO'} existe en Maven Central." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions)}")
@@ -1127,7 +1179,11 @@ def tool_verify_gem_package(target_repo_dir: str, gem_name: str, version: str = 
         return f"'{gem_name}' NO existe en RubyGems -- no lo agregues al Gemfile con este nombre."
     if resp.status_code != 200:
         return f"error: RubyGems devolvio {resp.status_code} consultando '{gem_name}' -- no se pudo confirmar"
-    versions = [v.get("number") for v in (resp.json() or []) if v.get("number")]
+    try:
+        payload = resp.json()
+    except ValueError:
+        return f"error: RubyGems devolvio una respuesta no-JSON consultando '{gem_name}' -- no se pudo confirmar, no asumas que existe"
+    versions = [v.get("number") for v in (payload or []) if v.get("number")]
     if version:
         exists = version in versions
         return f"'{gem_name} {version}' {'SI' if exists else 'NO'} existe en RubyGems." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[:20])}")
@@ -1152,7 +1208,11 @@ def tool_verify_cargo_crate(target_repo_dir: str, crate_name: str, version: str 
         return f"'{crate_name}' NO existe en crates.io -- no lo agregues al Cargo.toml con este nombre."
     if resp.status_code != 200:
         return f"error: crates.io devolvio {resp.status_code} consultando '{crate_name}' -- no se pudo confirmar"
-    versions = [v.get("num") for v in (resp.json() or {}).get("versions", []) if v.get("num")]
+    try:
+        payload = resp.json()
+    except ValueError:
+        return f"error: crates.io devolvio una respuesta no-JSON consultando '{crate_name}' -- no se pudo confirmar, no asumas que existe"
+    versions = [v.get("num") for v in (payload or {}).get("versions", []) if v.get("num")]
     if version:
         exists = version in versions
         return f"'{crate_name} {version}' {'SI' if exists else 'NO'} existe en crates.io." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[:20])}")
@@ -1175,7 +1235,11 @@ def tool_verify_nuget_package(target_repo_dir: str, package_id: str, version: st
         return f"'{package_id}' NO existe en NuGet -- no lo agregues al .csproj con este nombre."
     if resp.status_code != 200:
         return f"error: NuGet devolvio {resp.status_code} consultando '{package_id}' -- no se pudo confirmar"
-    versions = (resp.json() or {}).get("versions", [])
+    try:
+        payload = resp.json()
+    except ValueError:
+        return f"error: NuGet devolvio una respuesta no-JSON consultando '{package_id}' -- no se pudo confirmar, no asumas que existe"
+    versions = (payload or {}).get("versions", [])
     if version:
         exists = version in versions
         return f"'{package_id} {version}' {'SI' if exists else 'NO'} existe en NuGet." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[-20:])}")
@@ -1517,11 +1581,16 @@ LOCAL_TOOLS = {
     },
     "verify_npm_package": {
         "description": (
-            "Confirma si un paquete existe DE VERDAD en el registro real de npm (npm view, sin instalar "
-            "nada) -- usalo SIEMPRE antes de agregar una dependencia nueva a package.json, el nombre exacto "
-            "de un paquete (sobre todo plugins de nicho) no es algo que puedas confiar de memoria. Solo lectura."
+            "Confirma si un paquete (y opcionalmente una version exacta) existe DE VERDAD en el registro "
+            "real de npm (npm view, sin instalar nada) -- usalo SIEMPRE antes de agregar una dependencia "
+            "nueva a package.json, el nombre exacto de un paquete (sobre todo plugins de nicho) no es algo "
+            "que puedas confiar de memoria. Solo lectura."
         ),
-        "input_schema": {"type": "object", "properties": {"package_name": {"type": "string"}}, "required": ["package_name"]},
+        "input_schema": {
+            "type": "object",
+            "properties": {"package_name": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["package_name"],
+        },
         "fn": tool_verify_npm_package,
     },
     "check_tsconfig_decorators": {
