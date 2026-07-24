@@ -765,6 +765,33 @@ def _json_validation_error(path: str, content: str) -> str | None:
     return None
 
 
+_KNOWN_EXTENSIONLESS_FILENAMES = {
+    "dockerfile", "makefile", "license", "readme", "gemfile", "rakefile",
+    "procfile", "vagrantfile", "gruntfile", "gulpfile", "berksfile",
+}
+
+
+def _looks_like_directory_placeholder(path: str, content: str) -> bool:
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2 y KAN-10, dos
+    corridas distintas): el modelo "crea un directorio" llamando a
+    write_file con el path del directorio mismo (ej.
+    'frontend/src/components') y contenido descriptivo (ej. "Directory
+    for reusable components") en vez de mkdir -- el resultado es un
+    ARCHIVO real con ese nombre, que despues bloquea cualquier intento
+    real de escribir archivos DENTRO de esa ruta (confirmado: rompio la
+    implementacion Y el test-writer sub-agent en tickets distintos).
+    Heuristica: sin extension real, contenido de una sola linea corta que
+    lee como descripcion (sin puntuacion de codigo).
+    """
+    basename = path.rsplit("/", 1)[-1]
+    if "." in basename or basename.lower() in _KNOWN_EXTENSIONLESS_FILENAMES:
+        return False
+    stripped = content.strip()
+    if not stripped or len(stripped) > 200 or "\n" in stripped:
+        return False
+    return not re.search(r"[{}();=<>]", stripped)
+
+
 def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     try:
         full_path = _safe_path(target_repo_dir, path)
@@ -777,6 +804,16 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
         return json_error
 
     is_new_file = not full_path.exists()
+    if is_new_file and _looks_like_directory_placeholder(path, content):
+        return (
+            f"error: '{path}' no tiene extension y el contenido ('{content.strip()}') parece una descripcion, "
+            "no codigo real -- esto crea un ARCHIVO con ese nombre, que despues bloquea cualquier intento real "
+            f"de escribir archivos DENTRO de esa ruta (confirmado real: rompio tickets anteriores de esta forma). "
+            f"Si necesitas la carpeta '{path}' para poner archivos reales adentro, no hace falta crearla aparte -- "
+            f"llama a write_file directamente con la ruta completa del archivo real (ej. '{path}/index.ts') y se "
+            "crea el directorio automaticamente. Si de verdad necesitas un directorio vacio sin archivos adentro, "
+            f"usa run_shell_command con 'mkdir -p {path}'."
+        )
     if full_path.exists() and full_path.is_file():
         try:
             old_content = full_path.read_text(encoding="utf-8", errors="replace")

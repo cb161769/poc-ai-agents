@@ -213,6 +213,45 @@ def test_tool_write_file_rejects_json_with_duplicate_keys(tmp_path, monkeypatch)
     assert not (tmp_path / "package.json").exists()
 
 
+def test_tool_write_file_rejects_directory_placeholder(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2 y KAN-10): el modelo
+    "crea un directorio" con write_file(path='frontend/src/components',
+    content='Directory for reusable components') en vez de mkdir -- el
+    archivo resultante bloquea cualquier write_file real DENTRO de esa
+    ruta despues. No deberia escribirse nada."""
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "frontend/src/components", "Directory for reusable components")
+
+    assert "error" in result
+    assert not (tmp_path / "frontend" / "src" / "components").exists()
+
+
+def test_tool_write_file_allows_real_extensionless_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "Dockerfile", "FROM node:20\nCMD [\"npm\", \"start\"]")
+
+    assert "escrito ok" in result
+    assert (tmp_path / "Dockerfile").exists()
+
+
+def test_tool_write_file_allows_short_extensionless_content_with_code_punctuation(tmp_path, monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    result = ca.tool_write_file(str(tmp_path), "Procfile", "web: node index.js; PORT=3000")
+
+    assert "escrito ok" in result
+
+
+def test_looks_like_directory_placeholder_direct():
+    assert ca._looks_like_directory_placeholder("frontend/src/components", "Directory for reusable components")
+    assert not ca._looks_like_directory_placeholder("frontend/src/components.ts", "export class X {}")
+    assert not ca._looks_like_directory_placeholder("Dockerfile", "short desc")
+    assert not ca._looks_like_directory_placeholder("frontend/src/components", "line1\nline2")
+    assert not ca._looks_like_directory_placeholder("frontend/src/components", "x" * 250)
+
+
 def test_tool_write_file_warns_on_sibling_with_different_extension(tmp_path, monkeypatch):
     """Bug real confirmado en vivo (PR real, epica KAN-4): el coding agent
     creo Header.ts Y Header.tsx (mismo componente, dos extensiones) en el
