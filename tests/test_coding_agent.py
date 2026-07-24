@@ -700,6 +700,58 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
     assert result["self_verified"] is True
 
 
+def test_strip_lockfile_hunks_from_diff_removes_lockfile_but_keeps_source():
+    """Gap real (epica KAN-4, KAN-10): el test-writer sub-agent recibio el
+    diff COMPLETO de la rama, incluyendo un package-lock.json de 3322
+    lineas de un intento anterior -- el ruido lo hizo alucinar 'no tengo
+    suficiente informacion' en vez de escribir el test."""
+    diff_text = (
+        "diff --git a/frontend/src/input.component.ts b/frontend/src/input.component.ts\n"
+        "+ export class InputComponent {}\n"
+        "diff --git a/frontend/package-lock.json b/frontend/package-lock.json\n"
+        "+ " + ("\"noise\": \"x\",\n" * 50) +
+        "diff --git a/frontend/package.json b/frontend/package.json\n"
+        "+ \"typescript\": \"^7.0.2\"\n"
+    )
+    result = ca._strip_lockfile_hunks_from_diff(diff_text)
+
+    assert "InputComponent" in result
+    assert "typescript" in result
+    assert "noise" not in result
+    assert "package-lock.json" in result  # mencionado en la nota de omision, no silenciado
+
+
+def test_strip_lockfile_hunks_from_diff_handles_no_lockfiles():
+    diff_text = "diff --git a/a.ts b/a.ts\n+ x"
+    assert ca._strip_lockfile_hunks_from_diff(diff_text) == diff_text
+
+
+def test_strip_lockfile_hunks_from_diff_handles_empty_input():
+    assert ca._strip_lockfile_hunks_from_diff("") == ""
+
+
+def test_run_test_writer_subagent_strips_lockfile_noise_from_prompt(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    captured = {}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        captured["user_prompt"] = messages[0]["content"]
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    diff_text = (
+        "diff --git a/frontend/src/x.ts b/frontend/src/x.ts\n+ real code\n"
+        "diff --git a/frontend/package-lock.json b/frontend/package-lock.json\n+ " + ("noise\n" * 30)
+    )
+    asyncio.run(ca.run_test_writer_subagent("KAN-10", diff_text, "Inputs", str(tmp_path)))
+
+    assert "real code" in captured["user_prompt"]
+    assert "noise" not in captured["user_prompt"]
+
+
 def test_run_test_writer_subagent_uses_test_writer_system_prompt(monkeypatch, tmp_path):
     """Gap real confirmado en vivo (epica KAN-4, KAN-5, dos corridas seguidas
     con insufficient-test-coverage): el reintento normal CONTINUA la misma

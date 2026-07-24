@@ -495,6 +495,12 @@ comportamiento real (una rama condicional, un error, un cambio de estado) -- nun
 REGLA OBLIGATORIA: no podes usar write_file, edit_file, ni run_shell_command hasta haber usado al menos una \
 vez read_file, list_directory, o grep_search en esta corrida.
 
+El diff que te pasan puede incluir cambios de intentos anteriores que NO son tu problema (ej. un bump de \
+version de una dependencia en package.json/pom.xml/requirements.txt). NO evalues si esos cambios son una buena \
+idea, NO los cuestiones, NO te bloquees por ellos -- tu unico trabajo es escribir tests para el codigo de \
+aplicacion nuevo o modificado. Si un cambio en el diff no tiene codigo de aplicacion testeable (solo config o \
+dependencias), ignoralo y segui con el resto.
+
 Antes de declararte "done", corré los tests reales con run_shell_command (el comando del sub-proyecto real, \
 con el `cwd` correspondiente) y confirma que pasan -- un test que no corriste no cuenta como agregado.
 
@@ -2050,6 +2056,46 @@ async def run_coding_agent(
     return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
 
 
+_LOCKFILE_BASENAMES = {
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+    "Gemfile.lock", "poetry.lock", "Pipfile.lock", "Cargo.lock", "go.sum", "composer.lock",
+}
+
+
+def _strip_lockfile_hunks_from_diff(diff_text: str) -> str:
+    """Gap real confirmado en vivo (epica KAN-4, KAN-10): el test-writer
+    sub-agent recibe el diff COMPLETO de la rama (git diff base..rama), no
+    solo lo del ticket actual -- si un intento anterior en la misma rama
+    modifico un lockfile (confirmado real: 3322 lineas insertadas en
+    package-lock.json en un solo commit), ese ruido diluye/empuja fuera de
+    contexto el diff real que el modelo necesita ver, y termina
+    alucinando "no tengo suficiente informacion" en vez de escribir el
+    test. Los lockfiles no tienen codigo de aplicacion testeable -- se
+    omiten enteros, dejando una marca explicita de que se omitieron (no
+    silenciosamente, para que el modelo no asuma que el diff esta
+    incompleto por error).
+    """
+    if not diff_text.strip():
+        return diff_text
+    file_diffs = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+    kept = []
+    omitted = []
+    for chunk in file_diffs:
+        if not chunk.strip():
+            continue
+        header_match = re.match(r"^diff --git a/(\S+) b/(\S+)", chunk)
+        path = header_match.group(2) if header_match else ""
+        basename = path.rsplit("/", 1)[-1] if path else ""
+        if basename in _LOCKFILE_BASENAMES:
+            omitted.append(path)
+        else:
+            kept.append(chunk)
+    result = "".join(kept)
+    if omitted:
+        result += "\n[diff de " + ", ".join(omitted) + " omitido a proposito -- son lockfiles sin codigo de aplicacion testeable]\n"
+    return result
+
+
 async def run_test_writer_subagent(ticket_id: str, diff_text: str, ticket_summary: str, target_repo_dir: str) -> dict:
     """Conversacion NUEVA (sin resume_messages/resume_state -- arranca de
     cero, a proposito) enfocada UNICAMENTE en escribir/mejorar tests para un
@@ -2065,7 +2111,7 @@ async def run_test_writer_subagent(ticket_id: str, diff_text: str, ticket_summar
         f"Historia: {ticket_id} -- {ticket_summary}\n\n"
         "El siguiente diff ya fue aplicado a este repo (rama actual) -- escribi o mejora los tests que lo "
         "cubran, siguiendo las reglas del prompt de arriba:\n\n"
-        f"```diff\n{diff_text}\n```"
+        f"```diff\n{_strip_lockfile_hunks_from_diff(diff_text)}\n```"
     )
     return await run_coding_agent(
         ticket_id, prompt, target_repo_dir, system_prompt=TEST_WRITER_SYSTEM_PROMPT,
