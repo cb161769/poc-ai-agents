@@ -6,37 +6,37 @@
   <title>Vista de Sprint · Copilot como copiloto operativo</title>
   <style>
     :root {
-      --bg:#f7f4ec;
-      --surface:#ffffff;
-      --ink:#0c0d10;
-      --ink-dim:#4b4d52;
-      --ink-faint:#87878a;
-      --border:#e6e0d0;
-      --border-strong:#cfc6ac;
-      --primary:#1f4e8c;
-      --primary-soft:#1f4e8c0f;
-      --gold:#d9a52c;
-      --gold-soft:#d9a52c1a;
-      --danger:#b23a3a;
-      --danger-soft:#b23a3a0f;
-      --ok:#1f7a54;
-      --ok-soft:#1f7a540f;
-      --warn:#a9740a;
-      --warn-soft:#a9740a0f;
-      --serif: Georgia, "Iowan Old Style", "Palatino Linotype", ui-serif, serif;
+      --bg:#0a0c11;
+      --bg-2:#0d1016;
+      --surface:#12151c;
+      --surface-2:#171b23;
+      --ink:#e8ecf2;
+      --ink-dim:#9aa4b2;
+      --ink-faint:#5a6372;
+      --border:#232833;
+      --border-strong:#333b48;
+      --accent:#6e8bff;
+      --accent-soft:#6e8bff1a;
+      --accent-strong:#a3b4ff;
+      --danger:#f0685f;
+      --danger-soft:#f0685f17;
+      --ok:#39c58a;
+      --ok-soft:#39c58a17;
+      --warn:#e3a63c;
+      --warn-soft:#e3a63c17;
       --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      --mono: ui-monospace, "SF Mono", Consolas, monospace;
+      --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: var(--sans);
       color: var(--ink);
-      background: radial-gradient(800px 400px at 5% -10%, #1f4e8c10, transparent 60%), var(--bg);
+      background: radial-gradient(900px 460px at 8% -12%, #6e8bff1f, transparent 60%), var(--bg);
       line-height: 1.6;
       padding: 0 24px 80px;
     }
-    a { color: var(--primary); }
+    a { color: var(--accent-strong); }
     .container { max-width: 1200px; margin: 0 auto; }
     .hero {
       padding: 42px 0 28px;
@@ -45,22 +45,37 @@
     }
     .eyebrow {
       text-transform: uppercase;
-      letter-spacing: .14em;
+      letter-spacing: .16em;
       font-size: 11px;
-      color: var(--ink-faint);
+      color: var(--accent-strong);
       font-family: var(--mono);
-      margin-bottom: 10px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 8px 1px var(--accent);
+      flex-shrink: 0;
     }
     h1 {
-      font-family: var(--serif);
-      font-size: clamp(30px, 4.2vw, 44px);
+      font-family: var(--sans);
+      font-weight: 700;
+      letter-spacing: -.01em;
+      font-size: clamp(28px, 4vw, 40px);
       margin: 0 0 12px;
-      line-height: 1.15;
+      line-height: 1.18;
+      text-wrap: balance;
     }
     .lede {
-      font-size: 17px;
+      font-size: 16px;
       color: var(--ink-dim);
-      max-width: 80ch;
+      max-width: 74ch;
       margin: 0;
     }
     .chip-row {
@@ -70,25 +85,29 @@
       margin-top: 18px;
     }
     .chip {
-      border: 1px solid var(--border);
+      border: 1px solid var(--border-strong);
       background: var(--surface);
-      padding: 7px 11px;
-      border-radius: 999px;
+      padding: 7px 12px;
+      border-radius: 6px;
       font-size: 12px;
+      font-family: var(--mono);
+      letter-spacing: .01em;
       color: var(--ink-dim);
     }
     section { margin-top: 38px; }
     .card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 18px;
-      padding: 20px 20px 22px;
-      box-shadow: 0 12px 28px -24px rgba(12,13,16,.4);
+      border-radius: 12px;
+      padding: 22px 22px 24px;
     }
     h2 {
-      font-family: var(--serif);
-      font-size: 24px;
+      font-family: var(--sans);
+      font-weight: 700;
+      letter-spacing: -.005em;
+      font-size: 21px;
       margin: 0 0 6px;
+      text-wrap: balance;
     }
     .sub { color: var(--ink-faint); margin: 0 0 16px; }
     .board {
@@ -97,9 +116,9 @@
       gap: 12px;
     }
     .column {
-      background: linear-gradient(180deg, var(--surface), #fbf8f2);
+      background: linear-gradient(180deg, var(--surface), var(--bg-2));
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: 12px;
       padding: 14px;
       min-height: 260px;
     }
@@ -112,29 +131,29 @@
       color: var(--ink-faint);
     }
     .step {
-      border: 1px solid var(--border);
-      background: var(--surface);
-      border-radius: 12px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-2);
+      border-radius: 8px;
       padding: 10px 11px;
       margin-bottom: 8px;
       font-size: 13px;
       color: var(--ink-dim);
     }
     .step strong { color: var(--ink); display: block; margin-bottom: 3px; }
-    .step.ok { border-color: #b9daba; background: var(--ok-soft); }
-    .step.warn { border-color: #f0d79f; background: var(--warn-soft); }
-    .step.danger { border-color: #e7b7b7; background: var(--danger-soft); }
+    .step.ok { border-color: #2c8f6a; background: var(--ok-soft); }
+    .step.warn { border-color: #b5852f; background: var(--warn-soft); }
+    .step.danger { border-color: #bb4d47; background: var(--danger-soft); }
     .flow {
       display: grid;
-      grid-template-columns: repeat(7, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
       align-items: start;
       margin-top: 10px;
     }
     .agent-card {
-      background: var(--surface);
+      background: var(--surface-2);
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: 10px;
       padding: 14px;
       min-height: 170px;
     }
@@ -143,7 +162,7 @@
       font-size: 10px;
       letter-spacing: .08em;
       text-transform: uppercase;
-      color: var(--ink-faint);
+      color: var(--accent-strong);
       margin-bottom: 8px;
     }
     .agent-card h3 { margin: 0 0 6px; font-size: 16px; }
@@ -163,9 +182,9 @@
       margin-top: 10px;
     }
     .time-block {
-      background: var(--surface);
+      background: var(--surface-2);
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: 10px;
       padding: 14px;
     }
     .time-block .t { font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-faint); }
@@ -181,14 +200,20 @@
     .list li { margin-bottom: 8px; }
     .qa {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .qa-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 12px;
       margin-top: 10px;
     }
     .mini-card {
-      background: var(--surface);
+      background: var(--surface-2);
       border: 1px solid var(--border);
-      border-radius: 14px;
+      border-radius: 10px;
       padding: 14px;
     }
     .mini-card h4 { margin: 0 0 6px; font-size: 15px; }
@@ -198,7 +223,7 @@
       .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .flow { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .arrow { display: none; }
-      .timeline, .qa { grid-template-columns: 1fr; }
+      .timeline, .qa, .qa-2 { grid-template-columns: 1fr; }
       .grid-2 { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
@@ -211,19 +236,19 @@
 <body>
   <div class="container">
     <header class="hero">
-      <div class="eyebrow">visión ejecutiva · sprint</div>
       <h1>Así se ve este diseño en un sprint real</h1>
       <p class="lede">No es una herramienta aislada en el editor. Es un flujo de trabajo que acompaña la historia desde que entra al sprint hasta que queda validada, revisada y con evidencia para el equipo.</p>
       <div class="chip-row">
         <span class="chip">Ticket → contexto → acción → validación</span>
         <span class="chip">Firewall + tests + juez</span>
+        <span class="chip">Verificación real + anti-alucinación</span>
         <span class="chip">Evidencia por corrida</span>
       </div>
     </header>
 
     <section class="card">
       <h2>Vista del sprint: cómo se mueve una historia</h2>
-      <p class="sub">Cada historia atraviesa una secuencia visible y controlada. El equipo ve el progreso, el riesgo y la evidencia sin tener que reconstruirlo manualmente.</p>
+      <p class="sub">Narrativa simplificada para lectura rápida — el detalle técnico real (los 6 agentes y las tareas de Prefect) está en las dos secciones de abajo.</p>
       <div class="board">
         <div class="column">
           <h3>Backlog</h3>
@@ -239,6 +264,7 @@
           <h3>Control</h3>
           <div class="step warn"><strong>Firewall</strong>Rechaza manipulaciones y elimina secretos.</div>
           <div class="step"><strong>Seguridad</strong>Se filtran hallazgos sensibles antes de seguir.</div>
+          <div class="step"><strong>Verificación real</strong>Dependencias (npm, PyPI, Maven, Go, RubyGems, crates.io, NuGet), JSON y estructura de archivos se confirman contra fuentes reales, no de memoria del modelo.</div>
         </div>
         <div class="column">
           <h3>Trabajo</h3>
@@ -249,6 +275,7 @@
           <h3>Validación</h3>
           <div class="step ok"><strong>Tests reales</strong>Se corren pruebas del componente en un entorno descartable.</div>
           <div class="step"><strong>Juez</strong>Evalúa si el cambio y la decisión tienen sentido.</div>
+          <div class="step"><strong>Anti-alucinación</strong>Todo veredicto que bloquea una historia se contrasta contra la evidencia real antes de confiar en su justificación.</div>
         </div>
         <div class="column">
           <h3>Entrega</h3>
@@ -259,37 +286,83 @@
     </section>
 
     <section class="card">
-      <h2>El ciclo de agentes dentro del sprint</h2>
-      <p class="sub">No es un agente único. Es una cadena de agentes de responsabilidad distinta, todos conectados por el mismo ticket.</p>
+      <h2>Antes de tocar la primera historia</h2>
+      <p class="sub">Un solo agente corre una vez por épica, no por ticket.</p>
+      <div class="agent-card" style="max-width: 420px;">
+        <div class="label">antes de la primera historia</div>
+        <h3>Epic Planner</h3>
+        <p>Ordena las historias, detecta dependencias entre ellas y marca conflictos potenciales antes de que arranque el primer ticket — ej. "KAN-7 y KAN-8 podrían ir en paralelo, se mantiene orden alfabético por no tener dependencia explícita".</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>El ciclo real por historia — 6 agentes, en este orden</h2>
+      <p class="sub">Cada paso corresponde a un componente real del pipeline. No es una metáfora.</p>
       <div class="flow">
         <div class="agent-card">
-          <div class="label">1</div>
-          <h3>Agente de Triage</h3>
-          <p>Recibe el ticket y lo convierte en un contexto claro para el sprint.</p>
+          <div class="label">1 · antes del código</div>
+          <h3>Test Plan</h3>
+          <p>Redacta el plan de pruebas (casos funcionales, negativos, de borde) antes de que se toque una línea de código.</p>
         </div>
         <div class="arrow">→</div>
         <div class="agent-card">
-          <div class="label">2</div>
-          <h3>Agente de Impacto</h3>
-          <p>Consulta Neo4j y detecta qué otros servicios o equipos podrían verse afectados.</p>
+          <div class="label">2 · implementación</div>
+          <h3>Coding Agent</h3>
+          <p>Investiga el repo real y aplica el cambio en una rama — nunca se confía en su "listo" autoreportado sin evidencia de git.</p>
         </div>
         <div class="arrow">→</div>
         <div class="agent-card">
-          <div class="label">3</div>
-          <h3>Agente de Seguridad</h3>
-          <p>Evalúa el contenido, filtra secretos y bloquea intentos de manipulación.</p>
+          <div class="label">3 · sin modelo</div>
+          <h3>Tests reales</h3>
+          <p>Corre las pruebas del componente en un entorno descartable. Determinístico, no es un agente — el resultado es el que manda, no lo que dice el agente anterior.</p>
         </div>
         <div class="arrow">→</div>
         <div class="agent-card">
-          <div class="label">4</div>
-          <h3>Agente de Implementación</h3>
-          <p>Propone y aplica la solución en una rama de revisión.</p>
+          <div class="label">4 · segunda opinión</div>
+          <h3>Judge</h3>
+          <p>Segunda opinión independiente sobre el diff y la decisión — puede aprobar o marcar FLAGGED con una política concreta.</p>
         </div>
         <div class="arrow">→</div>
         <div class="agent-card">
-          <div class="label">5</div>
-          <h3>Agente de Validación</h3>
-          <p>Corre tests, revisa el diff y deja una segunda opinión independiente.</p>
+          <div class="label">5 · solo si bloquea</div>
+          <h3>Anti-alucinación</h3>
+          <p>Solo si el juez bloquea: contrasta su justificación contra la evidencia real, para no confiar en una cita inventada.</p>
+        </div>
+        <div class="arrow">→</div>
+        <div class="agent-card">
+          <div class="label">6 · cierre</div>
+          <h3>Comprobante técnico</h3>
+          <p>Deja el reporte de la corrida — modelo usado, resultado real, evidencia — como comentario en el ticket.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Agentes de apoyo, activados solo cuando hacen falta</h2>
+      <p class="sub">No todo se resuelve reintentando con el mismo contexto. Cuando el bloqueo es específico, entra un agente especializado en vez de repetir el mismo intento.</p>
+      <div class="qa-2">
+        <div class="mini-card">
+          <h4>Test-writer sub-agent</h4>
+          <p>Si el juez marca cobertura insuficiente, un agente con conversación nueva —enfocado únicamente en escribir el test, sin el peso de los intentos previos— entra a resolverlo. Si diagnostica que el problema real es de código y no de tests, lo delega de vuelta al Coding Agent con su propio diagnóstico como feedback, en vez de bloquearse en silencio.</p>
+        </div>
+        <div class="mini-card">
+          <h4>Gap Classifier</h4>
+          <p>Cuando una historia se detiene, separa causa raíz (contenido, infraestructura, o límite real del modelo) y deja una propuesta para revisión humana. Nunca aplica el cambio por su cuenta.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Higiene entre corridas: no arrastrar bugs ya resueltos</h2>
+      <p class="sub">No es un agente — es una regla determinística sobre qué rama se puede retomar.</p>
+      <div class="qa-2">
+        <div class="mini-card">
+          <h4>Ramas frescas solamente</h4>
+          <p>Si una historia interrumpida tiene una rama abierta de una corrida anterior, se retoma para no perder el trabajo ya hecho — pero solo si es reciente. Una rama de horas atrás puede tener un bug que el pipeline ya arregló después de crearla.</p>
+        </div>
+        <div class="mini-card">
+          <h4>Sin rama fresca, arranca limpio</h4>
+          <p>Si la única rama disponible está vencida, no se fuerza su uso — la historia arranca de cero desde la rama principal, con el código del pipeline ya actualizado.</p>
         </div>
       </div>
     </section>
@@ -360,6 +433,10 @@
         <div class="mini-card">
           <h4>Gate 3 · Validación</h4>
           <p>El cambio solo avanza si las pruebas reales lo respaldan.</p>
+        </div>
+        <div class="mini-card">
+          <h4>Gate 4 · Anti-alucinación</h4>
+          <p>Un veredicto que bloquea una historia se verifica contra la evidencia real antes de confiar en su justificación.</p>
         </div>
       </div>
     </section>
