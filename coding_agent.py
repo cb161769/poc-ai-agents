@@ -1829,6 +1829,7 @@ async def run_coding_agent(
         result["self_verified"] = has_run_verification
         result["initial_plan"] = initial_plan
         result["consulted_risk_graph"] = consulted_risk_graph
+        result["wrote_any_file"] = wrote_any_file
         result["_meta"] = {
             "backend": backend,
             "latency_seconds": round(time.monotonic() - start_time, 2),

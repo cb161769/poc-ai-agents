@@ -1085,6 +1085,39 @@ def _list_ticket_branch_candidates(target_repo_dir: str, ticket_id: str) -> list
     return candidates
 
 
+# Gap real confirmado en vivo (epica KAN-4, KAN-2, DOS corridas seguidas):
+# _find_open_branch_for_ticket retomaba la rama abierta mas reciente sin
+# mirar su antiguedad -- una rama de una corrida de HORAS atras, con un bug
+# ya arreglado en el codigo del pipeline (ej. el guard de write_file que
+# evita crear un directorio como archivo), seguia trayendo ese bug ya
+# resuelto de vuelta cada vez que se la retomaba. El fix del pipeline solo
+# previene el bug hacia ADELANTE -- no puede deshacer algo ya commiteado en
+# una rama vieja. BRANCH_RESUME_MAX_AGE_HOURS (default 6) descarta
+# candidatas cuyo ultimo commit real sea mas viejo que esta ventana; si
+# todas quedan afuera, se comporta igual que "no hay ninguna abierta"
+# (arranca de cero desde base_branch), en vez de forzar una retomada vieja.
+BRANCH_RESUME_MAX_AGE_HOURS = float(os.environ.get("BRANCH_RESUME_MAX_AGE_HOURS", "6"))
+
+
+def _branch_tip_age_hours(target_repo_dir: str, branch: str) -> float | None:
+    """Horas desde el ultimo commit real de `branch` (committer date, UTC).
+    None si no se pudo determinar (rama borrada a mitad de camino, error de
+    git, etc.) -- en ese caso NO se descarta por prudencia (mismo criterio
+    que el resto del pipeline: sin evidencia clara, no se asume nada).
+    """
+    result = subprocess.run(
+        ["git", "-C", target_repo_dir, "log", "-1", "--format=%ct", branch],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        commit_ts = int(result.stdout.strip())
+    except ValueError:
+        return None
+    return (time.time() - commit_ts) / 3600.0
+
+
 def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
     """Confirmado real (epica KAN-4): antes de este chequeo, cada re-corrida
     de un ticket (ej. un humano revierte manualmente el status en Jira
@@ -1111,13 +1144,32 @@ def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_bran
     if not open_branches:
         return None
 
-    open_branches.sort(key=lambda b: b.rsplit("-", 1)[-1], reverse=True)
-    if len(open_branches) > 1:
+    fresh_branches = []
+    stale_branches = []
+    for branch in open_branches:
+        age_hours = _branch_tip_age_hours(target_repo_dir, branch)
+        if age_hours is not None and age_hours > BRANCH_RESUME_MAX_AGE_HOURS:
+            stale_branches.append(branch)
+        else:
+            fresh_branches.append(branch)
+
+    if stale_branches:
         logger.warning(
-            f"{ticket_id}: hay {len(open_branches)} ramas abiertas sin mergear -- se retoma la mas reciente "
-            f"'{open_branches[0]}', las demas quedan sin tocar (revisar a mano): {open_branches[1:]}"
+            f"{ticket_id}: {len(stale_branches)} rama(s) abierta(s) descartada(s) por antiguedad "
+            f"(> {BRANCH_RESUME_MAX_AGE_HOURS}h desde su ultimo commit, pueden traer bugs ya arreglados en el "
+            f"pipeline) -- no se retoman: {stale_branches}"
         )
-    return open_branches[0]
+
+    if not fresh_branches:
+        return None
+
+    fresh_branches.sort(key=lambda b: b.rsplit("-", 1)[-1], reverse=True)
+    if len(fresh_branches) > 1:
+        logger.warning(
+            f"{ticket_id}: hay {len(fresh_branches)} ramas abiertas sin mergear -- se retoma la mas reciente "
+            f"'{fresh_branches[0]}', las demas quedan sin tocar (revisar a mano): {fresh_branches[1:]}"
+        )
+    return fresh_branches[0]
 
 
 def _find_merged_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:
@@ -1897,6 +1949,8 @@ def run_test_writer_subagent_task(ticket_id: str, diff_text: str, ticket_summary
     consulted_risk_graph = None
     subagent_summary = None
     subagent_conversation_file = None
+    subagent_status = None
+    wrote_any_file = None
     try:
         agent_result = json.loads(result.stdout)
         run_logger.info(f"Resultado del test-writer sub-agent: {agent_result.get('status')} — {agent_result.get('summary')}")
@@ -1906,6 +1960,8 @@ def run_test_writer_subagent_task(ticket_id: str, diff_text: str, ticket_summary
         consulted_risk_graph = agent_result.get("consulted_risk_graph")
         subagent_summary = agent_result.get("summary")
         subagent_conversation_file = agent_result.get("_conversation_file")
+        subagent_status = agent_result.get("status")
+        wrote_any_file = agent_result.get("wrote_any_file")
     except json.JSONDecodeError:
         run_logger.warning(f"El test-writer sub-agent no devolvio un JSON valido en stdout para {ticket_id}.")
     finally:
@@ -1938,10 +1994,12 @@ def run_test_writer_subagent_task(ticket_id: str, diff_text: str, ticket_summary
         return {
             "applied": False, "backend": backend, "self_review": self_review, "conversation_file": None,
             "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": subagent_summary,
+            "blocked_without_trying": subagent_status == "blocked" and wrote_any_file is False,
         }
     return {
         "applied": True, "backend": backend, "self_review": self_review, "conversation_file": None,
         "self_verified": self_verified, "consulted_risk_graph": consulted_risk_graph, "summary": subagent_summary,
+        "blocked_without_trying": False,
     }
 
 
@@ -2788,6 +2846,29 @@ def _retry_local_diff(
                     ticket_id, feedback_text, target_repo_dir, conversation_file=conversation_file
                 )
             conversation_file = retry_result.get("conversation_file") or conversation_file
+            if not retry_result["applied"] and retry_result.get("blocked_without_trying"):
+                # Gap real confirmado en vivo (epica KAN-4, KAN-2, dos corridas
+                # seguidas): el test-writer sub-agent diagnostico correctamente
+                # en su propio texto que el bloqueo real es de CODIGO (ej. un
+                # path que deberia ser directorio y es un archivo), no de
+                # tests -- y devolvio "blocked" sin llamar a ninguna tool de
+                # escritura. Escribir tests ahi es imposible por diseno (no
+                # hay nada real que testear), asi que reintentar con OTRO
+                # test-writer desde cero repetiria el mismo diagnostico. En
+                # vez de aceptar el bloqueo silencioso, se delega UNA vez al
+                # coding agent general (que si puede tocar codigo de
+                # produccion) con el diagnostico del test-writer como
+                # feedback explicito.
+                handoff_reason = retry_result.get("summary") or "el test-writer sub-agent no pudo escribir ningun test porque el bloqueo real es de codigo, no de cobertura."
+                print(f"🔁 {ticket_id}: el test-writer sub-agent se bloqueo sin escribir nada (fuera de su alcance) -- delegando al coding agent con su diagnostico.")
+                handoff_feedback = (
+                    f"{feedback_text}\n\n--- DIAGNOSTICO DEL TEST-WRITER SUB-AGENTE (no escribio ningun test; dice que el "
+                    f"problema real es de codigo de produccion, no de cobertura) ---\n{handoff_reason}"
+                )
+                retry_result = retry_coding_agent_local_real(
+                    ticket_id, handoff_feedback, target_repo_dir, conversation_file=conversation_file
+                )
+                conversation_file = retry_result.get("conversation_file") or conversation_file
             if not retry_result["applied"]:
                 print(f"El {label} no produjo cambios nuevos -- se mantiene el ultimo veredicto conocido.")
                 break

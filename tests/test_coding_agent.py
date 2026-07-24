@@ -854,6 +854,52 @@ def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(m
     assert result["self_verified"] is False
 
 
+def test_run_coding_agent_reports_wrote_any_file_false_when_blocked_without_writing(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2): el test-writer
+    sub-agent diagnostica el problema en su propio texto ('necesito
+    reescribir los tests') pero devuelve 'blocked' sin llamar a write_file
+    ni una vez. wrote_any_file en el resultado le permite a orchestration.py
+    distinguir esto de un bloqueo real donde SI se intento escribir."""
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "el path es un archivo, no un directorio", "files_changed": []}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert result["wrote_any_file"] is False
+
+
+def test_run_coding_agent_reports_wrote_any_file_true_when_a_write_succeeded(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    monkeypatch.setattr("builtins.input", lambda: "s")
+
+    call_count = {"n": 0}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            content = [{"type": "tool_use", "id": "call_1", "name": "list_directory", "input": {"path": "."}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if call_count["n"] == 2:
+            content = [{"type": "tool_use", "id": "call_2", "name": "write_file", "input": {"path": "new.ts", "content": "export const x = 1;"}}]
+            return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": ["new.ts"]}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
+
+    assert result["wrote_any_file"] is True
+
+
 def test_run_coding_agent_blocks_scaffold_command_without_listing_target_dir(monkeypatch, tmp_path):
     """Bug real confirmado en vivo (PR real, epica KAN-4): "ionic start
     my-app" corrio dentro de frontend/ sin revisar antes si ya habia un

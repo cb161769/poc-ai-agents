@@ -7,6 +7,7 @@ retry path touches is monkeypatched at the module level.
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -3359,6 +3360,134 @@ def test_run_test_writer_subagent_task_reports_not_applied_when_no_commit(monkey
     assert result["applied"] is False
 
 
+def test_run_test_writer_subagent_task_flags_blocked_without_trying(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2, dos corridas seguidas):
+    el test-writer sub-agent diagnostica el bloqueo real en su propio texto
+    pero nunca llama a write_file/edit_file -- wrote_any_file=False en su
+    resultado. blocked_without_trying distingue esto de un bloqueo real
+    donde SI se intento escribir algo."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "blocked", "summary": "el path es un archivo, no un directorio",
+            "_meta": {"backend": "ollama"}, "wrote_any_file": False,
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return _fake_subprocess_result(stdout="samecommit\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_test_writer_subagent_task("KAN-2", "diff real", "resumen", str(tmp_path))
+
+    assert result["applied"] is False
+    assert result["blocked_without_trying"] is True
+
+
+def test_run_test_writer_subagent_task_does_not_flag_blocked_when_it_tried(monkeypatch, tmp_path):
+    """Si wrote_any_file=True (intento escribir algo pero no genero un diff
+    real, ej. el commit fallo por otra razon), NO es el mismo caso -- no
+    deberia delegarse al coding agent como si nunca hubiera intentado."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "blocked", "summary": "escribi el test pero fallo la corrida",
+            "_meta": {"backend": "ollama"}, "wrote_any_file": True,
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return _fake_subprocess_result(stdout="samecommit\n")
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return _fake_subprocess_result(stdout="")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    result = orchestration.run_test_writer_subagent_task("KAN-2", "diff real", "resumen", str(tmp_path))
+
+    assert result["applied"] is False
+    assert result["blocked_without_trying"] is False
+
+
+def test_retry_local_diff_hands_off_to_coding_agent_when_test_writer_blocked_without_trying(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2): el test-writer
+    sub-agent diagnostico que frontend/src/components es un archivo, no un
+    directorio -- fuera de su alcance de "solo tests" -- y devolvio blocked
+    sin escribir nada. En vez de aceptar ese bloqueo silencioso, se delega
+    UNA vez al coding agent general con el diagnostico como feedback."""
+    handoff_calls = []
+
+    def fake_test_writer(ticket_id, diff_text, ticket_summary, target_repo_dir):
+        return {
+            "applied": False, "backend": "ollama", "blocked_without_trying": True,
+            "summary": "el path frontend/src/components es un archivo, no un directorio",
+        }
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        handoff_calls.append(feedback_text)
+        return {"applied": True, "backend": "anthropic"}
+
+    monkeypatch.setattr(orchestration, "run_test_writer_subagent_task", fake_test_writer)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "ahora si"})
+
+    flagged_insufficient_coverage = {
+        "verdict": "FLAGGED", "reasoning": "faltan tests", "policy_reference": "insufficient-test-coverage",
+    }
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_insufficient_coverage,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary del ticket",
+        False, None, "2026-01-01T00:00:00Z", diff_text="diff original",
+    )
+
+    assert result == {"verdict": "OK", "reasoning": "ahora si"}
+    assert len(handoff_calls) == 1
+    assert "es un archivo, no un directorio" in handoff_calls[0]
+
+
+def test_retry_local_diff_does_not_hand_off_when_test_writer_tried_and_still_failed(monkeypatch):
+    """Si el test-writer SI intento (wrote_any_file=True, blocked_without_trying=False),
+    no se delega al coding agent -- se acepta el bloqueo como antes."""
+    def fake_test_writer(ticket_id, diff_text, ticket_summary, target_repo_dir):
+        return {"applied": False, "backend": "ollama", "blocked_without_trying": False}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        raise AssertionError("no deberia delegarse si el test-writer ya intento escribir algo")
+
+    monkeypatch.setattr(orchestration, "run_test_writer_subagent_task", fake_test_writer)
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: _CLEAN_GUARD_RESULT)
+    monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "2 tests passed"})
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "diff text nuevo")
+    monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
+
+    flagged_insufficient_coverage = {
+        "verdict": "FLAGGED", "reasoning": "faltan tests", "policy_reference": "insufficient-test-coverage",
+    }
+
+    result = _retry_local_diff(
+        "T-1", "prompt original", "/repo", _AGENT_RESULT, flagged_insufficient_coverage,
+        {"ticket_id": "T-1"}, {"status": "APPROVED"}, ["AuthService"], "summary del ticket",
+        False, None, "2026-01-01T00:00:00Z", diff_text="diff original",
+    )
+
+    assert result is None
+
+
 def test_retry_coding_agent_local_real_does_not_crash_when_git_commit_fails(monkeypatch, tmp_path):
     """Mismo bug en el camino de reintento (feedback del juez): un
     'git commit' fallido no debe crashear la epica, y ademas no debe
@@ -3969,6 +4098,84 @@ def test_find_open_branch_for_ticket_picks_most_recent_of_multiple_open(monkeypa
     )
 
     assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-200"
+
+
+def _fake_branch_list_merge_base_and_age(monkeypatch, branch_list_stdout: str, merged: set, ages_hours: dict):
+    """Como _fake_branch_list_and_merge_base, pero ademas responde a
+    'git log -1 --format=%ct <branch>' con un timestamp real derivado de
+    ages_hours[branch] (horas atras desde ahora) -- branches no presentes
+    en el dict devuelven stdout vacio (edad desconocida)."""
+    def fake_run(cmd, **kwargs):
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout=branch_list_stdout)
+        if "merge-base" in cmd:
+            branch = cmd[-2]
+            return _fake_subprocess_result(returncode=0 if branch in merged else 1)
+        if "log" in cmd and "--format=%ct" in cmd:
+            branch = cmd[-1]
+            if branch not in ages_hours:
+                return _fake_subprocess_result(stdout="")
+            ts = int(time.time() - ages_hours[branch] * 3600)
+            return _fake_subprocess_result(stdout=f"{ts}\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+
+def test_branch_tip_age_hours_returns_none_on_git_error(monkeypatch):
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: _fake_subprocess_result(returncode=1))
+    assert orchestration._branch_tip_age_hours("/repo", "copilot/KAN-2-100") is None
+
+
+def test_branch_tip_age_hours_computes_real_hours_since_commit(monkeypatch):
+    ts = int(time.time() - 3 * 3600)
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda *a, **k: _fake_subprocess_result(stdout=f"{ts}\n"))
+    age = orchestration._branch_tip_age_hours("/repo", "copilot/KAN-2-100")
+    assert 2.9 < age < 3.1
+
+
+def test_find_open_branch_for_ticket_skips_stale_branch_and_starts_fresh(monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2, dos corridas
+    seguidas): retomar una rama de horas atras trae de vuelta un bug ya
+    arreglado en el pipeline (ej. frontend/src/components commiteado como
+    archivo, de antes del guard de write_file). Una rama mas vieja que
+    BRANCH_RESUME_MAX_AGE_HOURS se descarta -- si es la unica candidata,
+    se comporta como si no hubiera ninguna abierta."""
+    _fake_branch_list_merge_base_and_age(
+        monkeypatch,
+        branch_list_stdout="  copilot/KAN-2-100\n",
+        merged=set(),
+        ages_hours={"copilot/KAN-2-100": orchestration.BRANCH_RESUME_MAX_AGE_HOURS + 1},
+    )
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
+def test_find_open_branch_for_ticket_keeps_fresh_branch_under_threshold(monkeypatch):
+    _fake_branch_list_merge_base_and_age(
+        monkeypatch,
+        branch_list_stdout="  copilot/KAN-2-100\n",
+        merged=set(),
+        ages_hours={"copilot/KAN-2-100": orchestration.BRANCH_RESUME_MAX_AGE_HOURS - 1},
+    )
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-100"
+
+
+def test_find_open_branch_for_ticket_picks_freshest_when_one_of_several_is_stale(monkeypatch):
+    _fake_branch_list_merge_base_and_age(
+        monkeypatch,
+        branch_list_stdout="  copilot/KAN-2-100\n  copilot/KAN-2-200\n",
+        merged=set(),
+        ages_hours={
+            "copilot/KAN-2-100": orchestration.BRANCH_RESUME_MAX_AGE_HOURS - 1,
+            "copilot/KAN-2-200": orchestration.BRANCH_RESUME_MAX_AGE_HOURS + 1,
+        },
+    )
+
+    # KAN-2-200 ordenaria primero por nombre (sufijo numerico mas alto), pero
+    # esta stale -- se descarta y queda la unica fresca (KAN-2-100).
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") == "copilot/KAN-2-100"
 
 
 def test_find_merged_branch_for_ticket_returns_none_when_no_branches_match(monkeypatch):
