@@ -399,10 +399,13 @@ Bug real confirmado en vivo (epica KAN-4, qwen3:8b): editaste package.json para 
 paquete (sobre todo plugins de nicho de Capacitor/Ionic) no es algo que puedas confiar de memoria, y un nombre \
 inventado rompe "npm install" para TODO el sub-proyecto, no solo tu cambio puntual. Antes de agregar CUALQUIER \
 dependencia nueva a package.json (no antes de editar una version YA presente), usa la tool verify_npm_package \
-para confirmar que existe de verdad ANTES de escribir la edicion -- para otros manejadores de paquetes \
-(requirements.txt/pom.xml/etc.) corré `pip index versions <paquete>` (o el equivalente real del stack) con \
-run_shell_command. Si la verificacion dice que no existe o no encontras el nombre exacto, no adivines una \
-alternativa parecida: marcá "blocked" y explicá que dependencia necesitabas y por que no pudiste confirmarla.
+para confirmar que existe de verdad ANTES de escribir la edicion -- MISMO criterio para cualquier otro \
+manejador de paquetes: verify_pip_package (requirements.txt/Pipfile), verify_maven_package (pom.xml), \
+verify_go_module (go.mod), verify_gem_package (Gemfile), verify_cargo_crate (Cargo.toml), verify_nuget_package \
+(.csproj) -- todas consultan el registro REAL del ecosistema correspondiente, nunca asumas que un nombre/version \
+suena bien solo porque el formato es correcto. Si la verificacion dice que no existe o no encontras el nombre \
+exacto, no adivines una alternativa parecida: marcá "blocked" y explicá que dependencia necesitabas y por que \
+no pudiste confirmarla.
 
 Segundo bug real confirmado en vivo, mismo mecanismo (epica KAN-4, corrida siguiente): agregaste \
 "@ionic/cli": "^6.30.0" -- el PAQUETE existe (verify_npm_package hubiera dicho que si), pero esa VERSION \
@@ -1028,6 +1031,157 @@ def tool_verify_npm_package(target_repo_dir: str, package_name: str) -> str:
     return f"'{package_name}' SI existe en npm. Versiones reales disponibles:\n{stdout[:1000]}"
 
 
+# Gap real confirmado en vivo (epica KAN-4, TRES corridas seguidas):
+# verify_npm_package existia SOLO para npm -- el mismo patron real
+# (nombre/version de dependencia inventada rompiendo la instalacion entera)
+# puede pasar en CUALQUIER stack que este pipeline soporta (ver
+# _STACK_MARKERS), no solo Node. Estos 5 tools cubren el resto via las
+# APIs REALES y publicas de cada registro -- HTTPS directo, sin necesitar
+# el CLI nativo del lenguaje instalado en este contenedor (a diferencia de
+# npm, que si necesita el binario o Docker-outside-of-Docker).
+_REGISTRY_REQUEST_TIMEOUT_SECONDS = 15
+
+
+def tool_verify_pip_package(target_repo_dir: str, package_name: str, version: str = "") -> str:
+    """Verifica si un paquete (y opcionalmente una version exacta) existe
+    de verdad en PyPI -- API real (pypi.org/pypi/<paquete>/json), solo
+    lectura. Usa esto antes de agregar algo a requirements.txt/Pipfile.
+    """
+    try:
+        resp = httpx.get(f"https://pypi.org/pypi/{package_name}/json", timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar PyPI para '{package_name}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    if resp.status_code == 404:
+        return f"'{package_name}' NO existe en PyPI -- no lo agregues a requirements.txt/Pipfile con este nombre."
+    if resp.status_code != 200:
+        return f"error: PyPI devolvio {resp.status_code} consultando '{package_name}' -- no se pudo confirmar"
+    releases = list((resp.json() or {}).get("releases", {}).keys())
+    if version:
+        exists = version in releases
+        return (
+            f"'{package_name}=={version}' {'SI' if exists else 'NO'} existe en PyPI."
+            + ("" if exists else f" Versiones reales disponibles:\n{', '.join(sorted(releases)[-20:])}")
+        )
+    return f"'{package_name}' SI existe en PyPI. Versiones reales disponibles (ultimas 20):\n{', '.join(sorted(releases)[-20:])}"
+
+
+def tool_verify_maven_package(target_repo_dir: str, group_id: str, artifact_id: str, version: str = "") -> str:
+    """Verifica si una dependencia Maven (groupId:artifactId, opcionalmente
+    una version exacta) existe de verdad en Maven Central -- API real
+    (search.maven.org), solo lectura. Usa esto antes de agregar algo al
+    pom.xml.
+    """
+    query = f'g:"{group_id}" AND a:"{artifact_id}"'
+    try:
+        resp = httpx.get(
+            "https://search.maven.org/solrsearch/select",
+            params={"q": query, "core": "gav", "rows": 20, "wt": "json"},
+            timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar Maven Central para '{group_id}:{artifact_id}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    docs = ((resp.json() or {}).get("response") or {}).get("docs", [])
+    if not docs:
+        return f"'{group_id}:{artifact_id}' NO existe en Maven Central (0 resultados) -- no lo agregues al pom.xml con este groupId/artifactId."
+    versions = sorted({d.get("v") for d in docs if d.get("v")})
+    if version:
+        exists = version in versions
+        return f"'{group_id}:{artifact_id}:{version}' {'SI' if exists else 'NO'} existe en Maven Central." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions)}")
+    return f"'{group_id}:{artifact_id}' SI existe en Maven Central. Versiones reales disponibles:\n{', '.join(versions)}"
+
+
+def tool_verify_go_module(target_repo_dir: str, module_path: str, version: str = "") -> str:
+    """Verifica si un modulo Go (y opcionalmente una version exacta) existe
+    de verdad -- API real del proxy oficial de modulos (proxy.golang.org),
+    solo lectura. Usa esto antes de agregar algo al go.mod.
+    """
+    module_path = module_path.strip()
+    try:
+        if version:
+            resp = httpx.get(f"https://proxy.golang.org/{module_path}/@v/{version}.info", timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS)
+            if resp.status_code == 404:
+                versions_resp = httpx.get(f"https://proxy.golang.org/{module_path}/@v/list", timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS)
+                real_versions = versions_resp.text.strip() if versions_resp.status_code == 200 else "(no se pudo listar)"
+                return f"'{module_path}@{version}' NO existe. Versiones reales disponibles:\n{real_versions}"
+            resp.raise_for_status()
+            return f"'{module_path}@{version}' SI existe (confirmado via proxy.golang.org)."
+        resp = httpx.get(f"https://proxy.golang.org/{module_path}/@v/list", timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar el proxy de modulos Go para '{module_path}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    if resp.status_code == 404 or not resp.text.strip():
+        return f"'{module_path}' NO existe (o no tiene versiones publicadas) en proxy.golang.org -- no lo agregues al go.mod con este path."
+    return f"'{module_path}' SI existe. Versiones reales disponibles:\n{resp.text.strip()}"
+
+
+def tool_verify_gem_package(target_repo_dir: str, gem_name: str, version: str = "") -> str:
+    """Verifica si una gema Ruby (y opcionalmente una version exacta) existe
+    de verdad en RubyGems -- API real (rubygems.org), solo lectura. Usa
+    esto antes de agregar algo al Gemfile.
+    """
+    try:
+        resp = httpx.get(f"https://rubygems.org/api/v1/versions/{gem_name}.json", timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar RubyGems para '{gem_name}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    if resp.status_code == 404:
+        return f"'{gem_name}' NO existe en RubyGems -- no lo agregues al Gemfile con este nombre."
+    if resp.status_code != 200:
+        return f"error: RubyGems devolvio {resp.status_code} consultando '{gem_name}' -- no se pudo confirmar"
+    versions = [v.get("number") for v in (resp.json() or []) if v.get("number")]
+    if version:
+        exists = version in versions
+        return f"'{gem_name} {version}' {'SI' if exists else 'NO'} existe en RubyGems." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[:20])}")
+    return f"'{gem_name}' SI existe en RubyGems. Versiones reales disponibles (mas recientes primero):\n{', '.join(versions[:20])}"
+
+
+def tool_verify_cargo_crate(target_repo_dir: str, crate_name: str, version: str = "") -> str:
+    """Verifica si un crate Rust (y opcionalmente una version exacta) existe
+    de verdad en crates.io -- API real, solo lectura. Usa esto antes de
+    agregar algo al Cargo.toml. crates.io exige un User-Agent real
+    (bloquea pedidos sin uno).
+    """
+    try:
+        resp = httpx.get(
+            f"https://crates.io/api/v1/crates/{crate_name}",
+            headers={"User-Agent": "poc-ai-agents-coding-agent (verificacion de dependencias)"},
+            timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar crates.io para '{crate_name}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    if resp.status_code == 404:
+        return f"'{crate_name}' NO existe en crates.io -- no lo agregues al Cargo.toml con este nombre."
+    if resp.status_code != 200:
+        return f"error: crates.io devolvio {resp.status_code} consultando '{crate_name}' -- no se pudo confirmar"
+    versions = [v.get("num") for v in (resp.json() or {}).get("versions", []) if v.get("num")]
+    if version:
+        exists = version in versions
+        return f"'{crate_name} {version}' {'SI' if exists else 'NO'} existe en crates.io." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[:20])}")
+    return f"'{crate_name}' SI existe en crates.io. Versiones reales disponibles (mas recientes primero):\n{', '.join(versions[:20])}"
+
+
+def tool_verify_nuget_package(target_repo_dir: str, package_id: str, version: str = "") -> str:
+    """Verifica si un paquete NuGet (.NET, y opcionalmente una version
+    exacta) existe de verdad -- API real (api.nuget.org), solo lectura. Usa
+    esto antes de agregar algo al .csproj.
+    """
+    try:
+        resp = httpx.get(
+            f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json",
+            timeout=_REGISTRY_REQUEST_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        return f"error: no se pudo consultar NuGet para '{package_id}' ({exc}) -- no se pudo confirmar, no asumas que existe"
+    if resp.status_code == 404:
+        return f"'{package_id}' NO existe en NuGet -- no lo agregues al .csproj con este nombre."
+    if resp.status_code != 200:
+        return f"error: NuGet devolvio {resp.status_code} consultando '{package_id}' -- no se pudo confirmar"
+    versions = (resp.json() or {}).get("versions", [])
+    if version:
+        exists = version in versions
+        return f"'{package_id} {version}' {'SI' if exists else 'NO'} existe en NuGet." + ("" if exists else f" Versiones reales disponibles:\n{', '.join(versions[-20:])}")
+    return f"'{package_id}' SI existe en NuGet. Versiones reales disponibles (ultimas 20):\n{', '.join(versions[-20:])}"
+
+
 def tool_check_tsconfig_decorators(target_repo_dir: str, path: str) -> str:
     """Confirma si un tsconfig.json real tiene experimentalDecorators +
     emitDecoratorMetadata en true -- gap real confirmado en vivo (epica
@@ -1379,6 +1533,78 @@ LOCAL_TOOLS = {
         ),
         "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
         "fn": tool_check_tsconfig_decorators,
+    },
+    "verify_pip_package": {
+        "description": (
+            "Confirma si un paquete Python (y opcionalmente una version exacta) existe DE VERDAD en PyPI -- "
+            "usalo SIEMPRE antes de agregar una dependencia nueva a requirements.txt/Pipfile. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"package_name": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["package_name"],
+        },
+        "fn": tool_verify_pip_package,
+    },
+    "verify_maven_package": {
+        "description": (
+            "Confirma si una dependencia Maven (groupId:artifactId, y opcionalmente una version exacta) "
+            "existe DE VERDAD en Maven Central -- usalo SIEMPRE antes de agregar algo nuevo al pom.xml. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"group_id": {"type": "string"}, "artifact_id": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["group_id", "artifact_id"],
+        },
+        "fn": tool_verify_maven_package,
+    },
+    "verify_go_module": {
+        "description": (
+            "Confirma si un modulo Go (y opcionalmente una version exacta) existe DE VERDAD (proxy.golang.org) "
+            "-- usalo SIEMPRE antes de agregar algo nuevo al go.mod. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"module_path": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["module_path"],
+        },
+        "fn": tool_verify_go_module,
+    },
+    "verify_gem_package": {
+        "description": (
+            "Confirma si una gema Ruby (y opcionalmente una version exacta) existe DE VERDAD en RubyGems -- "
+            "usalo SIEMPRE antes de agregar algo nuevo al Gemfile. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"gem_name": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["gem_name"],
+        },
+        "fn": tool_verify_gem_package,
+    },
+    "verify_cargo_crate": {
+        "description": (
+            "Confirma si un crate Rust (y opcionalmente una version exacta) existe DE VERDAD en crates.io -- "
+            "usalo SIEMPRE antes de agregar algo nuevo al Cargo.toml. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"crate_name": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["crate_name"],
+        },
+        "fn": tool_verify_cargo_crate,
+    },
+    "verify_nuget_package": {
+        "description": (
+            "Confirma si un paquete NuGet .NET (y opcionalmente una version exacta) existe DE VERDAD "
+            "(api.nuget.org) -- usalo SIEMPRE antes de agregar algo nuevo al .csproj. Solo lectura."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"package_id": {"type": "string"}, "version": {"type": "string"}},
+            "required": ["package_id"],
+        },
+        "fn": tool_verify_nuget_package,
     },
 }
 

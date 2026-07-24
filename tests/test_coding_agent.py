@@ -2112,6 +2112,160 @@ def test_tool_verify_npm_package_errors_without_npm_or_docker(tmp_path, monkeypa
     assert "no asumas que existe" in result
 
 
+# --- verify_pip_package / verify_maven_package / verify_go_module /
+# verify_gem_package / verify_cargo_crate / verify_nuget_package ---
+# Gap real confirmado en vivo (epica KAN-4, TRES corridas seguidas de
+# hallucinacion de dependencias npm): el mismo patron real puede pasar en
+# CUALQUIER stack que este pipeline soporta -- estos tools verifican contra
+# la API REAL y publica de cada registro, solo lectura, sin necesitar el
+# CLI nativo instalado.
+
+
+def test_tool_verify_pip_package_confirms_real_package(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = {"releases": {"1.0.0": [], "1.1.0": []}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp) as mock_get:
+        result = ca.tool_verify_pip_package(str(tmp_path), "requests")
+
+    assert "SI existe en PyPI" in result
+    assert "pypi.org/pypi/requests/json" in mock_get.call_args[0][0]
+
+
+def test_tool_verify_pip_package_detects_nonexistent_package(tmp_path):
+    fake_resp = MagicMock(status_code=404)
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_pip_package(str(tmp_path), "this-package-does-not-exist-xyz")
+
+    assert "NO existe en PyPI" in result
+
+
+def test_tool_verify_pip_package_checks_exact_version(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = {"releases": {"1.0.0": []}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_pip_package(str(tmp_path), "requests", version="9.9.9")
+
+    assert "NO existe en PyPI" in result
+
+
+def test_tool_verify_maven_package_confirms_real_dependency(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.raise_for_status = lambda: None
+    fake_resp.json.return_value = {"response": {"docs": [{"v": "5.3.0"}, {"v": "5.4.0"}]}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_maven_package(str(tmp_path), "org.springframework", "spring-core")
+
+    assert "SI existe en Maven Central" in result
+    assert "5.4.0" in result
+
+
+def test_tool_verify_maven_package_detects_nonexistent_dependency(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.raise_for_status = lambda: None
+    fake_resp.json.return_value = {"response": {"docs": []}}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_maven_package(str(tmp_path), "com.fake", "does-not-exist")
+
+    assert "NO existe en Maven Central" in result
+
+
+def test_tool_verify_go_module_confirms_real_module(tmp_path):
+    fake_resp = MagicMock(status_code=200, text="v1.0.0\nv1.1.0\n")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_go_module(str(tmp_path), "github.com/gin-gonic/gin")
+
+    assert "SI existe" in result
+    assert "v1.1.0" in result
+
+
+def test_tool_verify_go_module_detects_nonexistent_module(tmp_path):
+    fake_resp = MagicMock(status_code=404, text="")
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_go_module(str(tmp_path), "github.com/fake/does-not-exist")
+
+    assert "NO existe" in result
+
+
+def test_tool_verify_gem_package_confirms_real_gem(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = [{"number": "7.0.0"}, {"number": "6.1.0"}]
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_gem_package(str(tmp_path), "rails")
+
+    assert "SI existe en RubyGems" in result
+    assert "7.0.0" in result
+
+
+def test_tool_verify_gem_package_detects_nonexistent_gem(tmp_path):
+    fake_resp = MagicMock(status_code=404)
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_gem_package(str(tmp_path), "does-not-exist-xyz")
+
+    assert "NO existe en RubyGems" in result
+
+
+def test_tool_verify_cargo_crate_confirms_real_crate(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = {"versions": [{"num": "1.0.0"}, {"num": "1.1.0"}]}
+    with patch("coding_agent.httpx.get", return_value=fake_resp) as mock_get:
+        result = ca.tool_verify_cargo_crate(str(tmp_path), "serde")
+
+    assert "SI existe en crates.io" in result
+    assert mock_get.call_args.kwargs["headers"]["User-Agent"]  # crates.io exige un User-Agent real
+
+
+def test_tool_verify_cargo_crate_detects_nonexistent_crate(tmp_path):
+    fake_resp = MagicMock(status_code=404)
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_cargo_crate(str(tmp_path), "does-not-exist-xyz")
+
+    assert "NO existe en crates.io" in result
+
+
+def test_tool_verify_nuget_package_confirms_real_package(tmp_path):
+    fake_resp = MagicMock(status_code=200)
+    fake_resp.json.return_value = {"versions": ["12.0.0", "13.0.1"]}
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_nuget_package(str(tmp_path), "Newtonsoft.Json")
+
+    assert "SI existe en NuGet" in result
+    assert "13.0.1" in result
+
+
+def test_tool_verify_nuget_package_detects_nonexistent_package(tmp_path):
+    fake_resp = MagicMock(status_code=404)
+    with patch("coding_agent.httpx.get", return_value=fake_resp):
+        result = ca.tool_verify_nuget_package(str(tmp_path), "Does.Not.Exist.Xyz")
+
+    assert "NO existe en NuGet" in result
+
+
+def test_registry_verification_tools_handle_network_errors_gracefully(tmp_path):
+    """Best-effort real: un error de red (timeout, DNS, etc.) nunca debe
+    lanzar -- se degrada a un mensaje de error explicito que empuja al
+    modelo a NO asumir que la dependencia existe."""
+    import httpx as real_httpx
+
+    def boom(*a, **k):
+        raise real_httpx.ConnectError("sin red")
+
+    with patch("coding_agent.httpx.get", side_effect=boom):
+        assert "no se pudo confirmar" in ca.tool_verify_pip_package(str(tmp_path), "x")
+        assert "no se pudo confirmar" in ca.tool_verify_maven_package(str(tmp_path), "g", "a")
+        assert "no se pudo confirmar" in ca.tool_verify_go_module(str(tmp_path), "example.com/x")
+        assert "no se pudo confirmar" in ca.tool_verify_gem_package(str(tmp_path), "x")
+        assert "no se pudo confirmar" in ca.tool_verify_cargo_crate(str(tmp_path), "x")
+        assert "no se pudo confirmar" in ca.tool_verify_nuget_package(str(tmp_path), "x")
+
+
+def test_local_tools_registers_all_registry_verification_tools():
+    for name in (
+        "verify_npm_package", "verify_pip_package", "verify_maven_package",
+        "verify_go_module", "verify_gem_package", "verify_cargo_crate", "verify_nuget_package",
+    ):
+        assert name in ca.LOCAL_TOOLS
+
+
 # --- tool_check_tsconfig_decorators ---
 
 
@@ -2283,6 +2437,19 @@ def test_verify_npm_package_and_check_tsconfig_decorators_are_registered_tools()
     assert ca.LOCAL_TOOLS["verify_npm_package"]["fn"] is ca.tool_verify_npm_package
     assert "check_tsconfig_decorators" in ca.LOCAL_TOOLS
     assert ca.LOCAL_TOOLS["check_tsconfig_decorators"]["fn"] is ca.tool_check_tsconfig_decorators
+
+
+def test_system_prompt_points_to_all_registry_verification_tools():
+    """Gap real confirmado en vivo (epica KAN-4, TRES corridas de
+    hallucinacion de dependencias npm -- el mismo patron real puede pasar
+    en CUALQUIER stack, no solo Node): el prompt tiene que mencionar los
+    tools de verificacion de TODOS los ecosistemas soportados, no solo npm.
+    """
+    for tool_name in (
+        "verify_pip_package", "verify_maven_package", "verify_go_module",
+        "verify_gem_package", "verify_cargo_crate", "verify_nuget_package",
+    ):
+        assert tool_name in ca.CODING_AGENT_SYSTEM_PROMPT
 
 
 def test_system_prompt_requires_mocking_dependencies_and_async_verification():
