@@ -1104,18 +1104,31 @@ def _branch_tip_age_hours(target_repo_dir: str, branch: str) -> float | None:
     None si no se pudo determinar (rama borrada a mitad de camino, error de
     git, etc.) -- en ese caso NO se descarta por prudencia (mismo criterio
     que el resto del pipeline: sin evidencia clara, no se asume nada).
+
+    Bug real confirmado en vivo (epica KAN-4, primer uso de este filtro): el
+    nombre "pelado" de una rama (ej. 'copilot/KAN-4-X', el formato que
+    devuelve _list_ticket_branch_candidates tras sacarle el prefijo
+    'remotes/origin/') NO resuelve con 'git log' si esa rama solo existe en
+    el remoto y nunca se hizo checkout local -- el ref real es
+    'refs/remotes/origin/copilot/KAN-4-X', no 'refs/remotes/copilot/KAN-4-X'.
+    Confirmado con 'git rev-parse --verify' devolviendo exit 128 para una
+    rama remota-only real. Sin este fallback, TODA rama remota sin checkout
+    previo devolvia edad=None (desconocida) y el filtro nunca la descartaba
+    -- exactamente el caso que este filtro deberia cubrir. Se prueba el
+    nombre pelado primero (cubre ramas locales), y si falla, origin/<rama>.
     """
-    result = subprocess.run(
-        ["git", "-C", target_repo_dir, "log", "-1", "--format=%ct", branch],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        commit_ts = int(result.stdout.strip())
-    except ValueError:
-        return None
-    return (time.time() - commit_ts) / 3600.0
+    for ref in (branch, f"origin/{branch}"):
+        result = subprocess.run(
+            ["git", "-C", target_repo_dir, "log", "-1", "--format=%ct", ref],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                commit_ts = int(result.stdout.strip())
+            except ValueError:
+                continue
+            return (time.time() - commit_ts) / 3600.0
+    return None
 
 
 def _find_open_branch_for_ticket(target_repo_dir: str, ticket_id: str, base_branch: str) -> str | None:

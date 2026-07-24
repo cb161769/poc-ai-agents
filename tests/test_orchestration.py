@@ -4134,6 +4134,58 @@ def test_branch_tip_age_hours_computes_real_hours_since_commit(monkeypatch):
     assert 2.9 < age < 3.1
 
 
+def test_branch_tip_age_hours_falls_back_to_origin_ref_for_remote_only_branches(monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-4, primera corrida con este
+    filtro): _list_ticket_branch_candidates devuelve el nombre PELADO de la
+    rama (sin 'remotes/origin/') -- pero si esa rama solo existe en el
+    remoto y nunca se hizo checkout local, 'git log' con el nombre pelado
+    devuelve exit 128 (unknown revision), NO el commit real. Confirmado con
+    'git rev-parse --verify' contra una rama remota real de este mismo repo.
+    Sin este fallback a origin/<rama>, TODA rama remota-only quedaba con
+    edad=None (desconocida) y el filtro de antiguedad nunca la descartaba
+    -- exactamente el caso que deberia cubrir."""
+    ts = int(time.time() - 10 * 3600)
+
+    def fake_run(cmd, **kwargs):
+        ref = cmd[-1]
+        if ref == "copilot/KAN-2-100":
+            return _fake_subprocess_result(returncode=128, stderr="fatal: ambiguous argument 'copilot/KAN-2-100': unknown revision")
+        if ref == "origin/copilot/KAN-2-100":
+            return _fake_subprocess_result(stdout=f"{ts}\n")
+        return _fake_subprocess_result(returncode=1)
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    age = orchestration._branch_tip_age_hours("/repo", "copilot/KAN-2-100")
+    assert age is not None
+    assert 9.9 < age < 10.1
+
+
+def test_find_open_branch_for_ticket_skips_stale_remote_only_branch(monkeypatch):
+    """Version end-to-end del bug de arriba: una rama que solo existe en el
+    remoto (nunca checkouteada localmente) y es vieja debe descartarse
+    igual que una local vieja -- antes de este fallback, se resumia sin
+    filtrar porque su edad no se podia determinar con el nombre pelado."""
+    ts = int(time.time() - (orchestration.BRANCH_RESUME_MAX_AGE_HOURS + 1) * 3600)
+
+    def fake_run(cmd, **kwargs):
+        if "branch" in cmd and "--list" in cmd:
+            return _fake_subprocess_result(stdout="  remotes/origin/copilot/KAN-2-100\n")
+        if "merge-base" in cmd:
+            return _fake_subprocess_result(returncode=1)  # sin mergear
+        if "log" in cmd and "--format=%ct" in cmd:
+            ref = cmd[-1]
+            if ref == "copilot/KAN-2-100":
+                return _fake_subprocess_result(returncode=128)
+            if ref == "origin/copilot/KAN-2-100":
+                return _fake_subprocess_result(stdout=f"{ts}\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+
+    assert _find_open_branch_for_ticket("/repo", "KAN-2", "main") is None
+
+
 def test_find_open_branch_for_ticket_skips_stale_branch_and_starts_fresh(monkeypatch):
     """Gap real confirmado en vivo (epica KAN-4, KAN-2, dos corridas
     seguidas): retomar una rama de horas atras trae de vuelta un bug ya
