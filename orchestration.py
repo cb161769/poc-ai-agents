@@ -2715,6 +2715,45 @@ def _retry_for_invalid_npm_versions(ticket_id: str, target_repo_dir: str, agent_
     return merged
 
 
+def _retry_for_npm_eresolve_conflict(ticket_id: str, target_repo_dir: str, agent_result: dict, test_output: str) -> dict | None:
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2): cada dependencia en
+    package.json existia de verdad Y su version tambien existia de verdad
+    (verify_npm_package/verify_npm_install la hubieran confirmado una por
+    una) -- pero eran mutuamente INCOMPATIBLES entre si ("@angular/core":
+    "^17.0.0" mientras otra dependencia del arbol resolvia a
+    "@angular/common@22.0.8", que exige "@angular/core@22.0.8" como peer).
+    Nada lo detectaba hasta que el testing agent corria "npm install" de
+    verdad -- recien ahi aparece "npm error ERESOLVE unable to resolve
+    dependency tree". Antes de aceptar esto como bloqueo final, un turno
+    mas con el error REAL de npm como feedback (no una version resumida) --
+    mismo mecanismo que _retry_for_invalid_npm_versions, pero sin auto-fix
+    deterministico (a diferencia de "esta version no existe, borrala", un
+    conflicto de peer dependencies no tiene una correccion deterministica
+    segura -- requiere elegir CUAL version bajar/subir, una decision real).
+    Devuelve None si test_output no es un caso ERESOLVE (nada que hacer
+    aca) para que el llamador sepa que no hubo reintento.
+    """
+    if "ERESOLVE" not in test_output:
+        return None
+    feedback = (
+        "Verificacion real (npm install de verdad corrido por el testing agent, no una opinion): el arbol de "
+        "dependencias de package.json NO resuelve -- rompio con un conflicto ERESOLVE real:\n\n"
+        f"{test_output[-3000:]}\n\n"
+        "Esto significa que dos paquetes declarados exigen versiones incompatibles entre si (el mensaje de npm "
+        "arriba dice EXACTAMENTE que paquete pide que version de que peer). Alinea las versiones de la MISMA "
+        "familia de paquetes (ej. todos los @angular/* al mismo major) y confirma con la tool verify_npm_install "
+        "ANTES de declararte done -- no alcanza con verify_npm_package (esa confirma un paquete a la vez, no el "
+        "arbol completo)."
+    )
+    retried = retry_coding_agent_local_real(
+        ticket_id, feedback, target_repo_dir, conversation_file=agent_result.get("conversation_file")
+    )
+    merged = dict(agent_result)
+    if retried.get("applied"):
+        merged.update(retried)
+    return merged
+
+
 def _retry_for_inadequate_tests(ticket_id: str, target_repo_dir: str, agent_result: dict) -> dict:
     """Confirmado real (KAN-15, KAN-5): el coding agent se autoevalua con
     honestidad (self_review.tests_adequate=False) pero termina igual con
@@ -3628,6 +3667,28 @@ def _deliver_epic_sequential(
             break
 
         test_result = run_tests(target_repo_dir)
+        if not test_result["passed"] and "ERESOLVE" in test_result["output"]:
+            # Gap real confirmado en vivo (epica KAN-4, KAN-2): un conflicto
+            # real de peer dependencies (paquetes que existen individualmente
+            # pero son mutuamente incompatibles) recien se detecta aca, con
+            # 'npm install' de verdad -- ver _retry_for_npm_eresolve_conflict.
+            # Un turno mas con el error REAL como feedback antes de aceptar
+            # el bloqueo.
+            comment_jira(
+                f"📦 Verificacion real: 'npm install' fallo con un conflicto ERESOLVE en {child_id} -- "
+                "dandole un turno mas con el error real antes de cortar la epica.",
+                ticket_key=child_id,
+            )
+            retried_result = _retry_for_npm_eresolve_conflict(epic_key, target_repo_dir, agent_result, test_result["output"])
+            if retried_result is not None:
+                agent_result = retried_result
+                backend = agent_result.get("backend") or backend
+                test_result = run_tests(target_repo_dir)
+                # diff_text ya se habia calculado antes de este bloque -- si el
+                # reintento aplico un commit nuevo, queda desactualizado (el
+                # juez, mas abajo, evaluaria un diff viejo sin el fix real).
+                diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
+                    else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
         if not test_result["passed"]:
             comment_jira(
                 f"🧪 Testing agent (Prefect): los tests reales FALLARON procesando {child_id}. Esto corta el "

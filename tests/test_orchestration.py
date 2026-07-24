@@ -1429,6 +1429,58 @@ def test_auto_strip_invalid_npm_dependencies_no_changes_when_all_valid(tmp_path,
     assert (tmp_path / "package.json").read_text() == original_content  # nunca reescribe si no hizo falta
 
 
+def test_retry_for_npm_eresolve_conflict_returns_none_when_not_eresolve(tmp_path):
+    """No es un caso ERESOLVE -- no deberia intentar nada."""
+    result = orchestration._retry_for_npm_eresolve_conflict(
+        "T-1", str(tmp_path), {"applied": True}, "algun otro error real de tests, no de npm"
+    )
+    assert result is None
+
+
+def test_retry_for_npm_eresolve_conflict_gives_feedback_and_merges_result(monkeypatch, tmp_path):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2): un conflicto ERESOLVE
+    real (paquetes que existen individualmente pero son incompatibles entre
+    si) recien se detecta cuando el testing agent corre 'npm install' de
+    verdad -- un turno mas con el error REAL como feedback antes de aceptar
+    el bloqueo."""
+    captured = {}
+
+    def fake_retry(ticket_id, feedback_text, target_repo_dir, conversation_file=None, **kwargs):
+        captured["feedback_text"] = feedback_text
+        captured["conversation_file"] = conversation_file
+        return {"applied": True, "backend": "ollama", "conversation_file": "/tmp/conv2.json"}
+
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+
+    original = {
+        "applied": True, "branch": "copilot/T-1-123", "base_branch": "main",
+        "backend": "ollama", "conversation_file": "/tmp/conv1.json",
+    }
+    eresolve_output = (
+        "npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree\n"
+        "npm error peer @angular/core@\"22.0.8\" from @angular/common@22.0.8"
+    )
+
+    result = orchestration._retry_for_npm_eresolve_conflict("T-1", str(tmp_path), original, eresolve_output)
+
+    assert result["branch"] == "copilot/T-1-123"
+    assert result["conversation_file"] == "/tmp/conv2.json"
+    assert captured["conversation_file"] == "/tmp/conv1.json"
+    assert "ERESOLVE" in captured["feedback_text"]
+    assert "@angular/core" in captured["feedback_text"]
+    assert "verify_npm_install" in captured["feedback_text"]
+
+
+def test_retry_for_npm_eresolve_conflict_keeps_original_when_retry_not_applied(monkeypatch, tmp_path):
+    monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", lambda *a, **k: {"applied": False, "backend": None})
+
+    original = {"applied": True, "branch": "copilot/T-1-123", "backend": "ollama"}
+    result = orchestration._retry_for_npm_eresolve_conflict("T-1", str(tmp_path), original, "npm error ERESOLVE unable to resolve dependency tree")
+
+    assert result["branch"] == "copilot/T-1-123"
+    assert result["backend"] == "ollama"  # no se piso con el resultado no-aplicado
+
+
 def test_retry_for_invalid_npm_versions_gives_feedback_and_merges_result(monkeypatch, tmp_path):
     """Camino feliz: el reintento SI corrige el problema (el segundo chequeo
     ya no encuentra nada invalido) -- nunca llega a necesitar el auto-strip.

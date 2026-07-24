@@ -2241,6 +2241,59 @@ def test_tool_verify_npm_package_falls_back_to_docker_when_npm_unavailable(tmp_p
     assert mock_run.call_args[0][0][0] == "docker"
 
 
+def test_tool_verify_npm_install_confirms_clean_resolve(tmp_path, monkeypatch):
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text('{"name": "frontend"}')
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    fake_result = MagicMock(returncode=0, stdout="added 42 packages", stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result) as mock_run:
+        result = ca.tool_verify_npm_install(str(tmp_path), "frontend")
+
+    assert "SIN conflictos" in result
+    assert "npm install --dry-run" in mock_run.call_args[0][0]
+    assert mock_run.call_args.kwargs["cwd"] == str((tmp_path / "frontend").resolve())
+
+
+def test_tool_verify_npm_install_detects_eresolve_conflict(tmp_path, monkeypatch):
+    """Gap real confirmado en vivo (epica KAN-4, KAN-2): cada dependencia
+    existia de verdad y su version tambien -- pero eran mutuamente
+    incompatibles (distintas versiones major de @angular/*). Solo un
+    'npm install' real detecta esto, no la verificacion paquete-por-paquete."""
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text('{"name": "frontend"}')
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    fake_result = MagicMock(
+        returncode=1, stdout="",
+        stderr="npm error code ERESOLVE\nnpm error ERESOLVE unable to resolve dependency tree\n"
+        "npm error peer @angular/core@\"22.0.8\" from @angular/common@22.0.8",
+    )
+    with patch("coding_agent.subprocess.run", return_value=fake_result):
+        result = ca.tool_verify_npm_install(str(tmp_path), "frontend")
+
+    assert "ERESOLVE" in result
+    assert "FALLO" in result
+    assert "@angular/core" in result
+
+
+def test_tool_verify_npm_install_errors_without_package_json(tmp_path):
+    (tmp_path / "empty-dir").mkdir()
+    result = ca.tool_verify_npm_install(str(tmp_path), "empty-dir")
+    assert "error" in result
+    assert "package.json" in result
+
+
+def test_tool_verify_npm_install_falls_back_to_docker_when_npm_unavailable(tmp_path, monkeypatch):
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "package.json").write_text('{"name": "frontend"}')
+    monkeypatch.setattr(ca.shutil, "which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+    fake_result = MagicMock(returncode=0, stdout="added 42 packages", stderr="")
+    with patch("coding_agent.subprocess.run", return_value=fake_result) as mock_run:
+        result = ca.tool_verify_npm_install(str(tmp_path), "frontend")
+
+    assert "SIN conflictos" in result
+    assert mock_run.call_args[0][0][0] == "docker"
+
+
 def test_tool_verify_npm_package_errors_without_npm_or_docker(tmp_path, monkeypatch):
     monkeypatch.setattr(ca.shutil, "which", lambda name: None)
     result = ca.tool_verify_npm_package(str(tmp_path), "react")
@@ -2521,8 +2574,13 @@ def test_local_tools_registers_all_registry_verification_tools():
     for name in (
         "verify_npm_package", "verify_pip_package", "verify_maven_package",
         "verify_go_module", "verify_gem_package", "verify_cargo_crate", "verify_nuget_package",
+        "verify_npm_install",
     ):
         assert name in ca.LOCAL_TOOLS
+
+
+def test_system_prompt_mentions_verify_npm_install():
+    assert "verify_npm_install" in ca.CODING_AGENT_SYSTEM_PROMPT
 
 
 # --- tool_check_tsconfig_decorators ---

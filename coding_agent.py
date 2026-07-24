@@ -416,6 +416,15 @@ package.json (no solo el nombre del paquete), confirma que ese numero exacto (o 
 cubra una version real de la lista) aparece ahi. No asumas que una version "suena razonable" solo porque el \
 formato es correcto.
 
+Tercer bug real confirmado en vivo, mismo mecanismo pero distinto (epica KAN-4, corrida siguiente): cada \
+dependencia agregada existia de verdad Y su version tambien existia de verdad -- pero eran mutuamente \
+INCOMPATIBLES entre si ("@angular/core": "^17.0.0" mientras otra dependencia del arbol resolvia a \
+"@angular/common@22.0.8", que exige "@angular/core@22.0.8" como peer). verify_npm_package no puede detectar \
+esto -- confirma paquetes uno por uno, no el arbol completo. Despues de CUALQUIER cambio a package.json \
+(agregar, quitar, o cambiar version), usa verify_npm_install sobre el sub-proyecto real ANTES de declararte \
+done -- si devuelve un conflicto ERESOLVE, alinea las versiones de la MISMA familia de paquetes (ej. todos los \
+@angular/* al mismo major) hasta que resuelva limpio.
+
 Bug real confirmado en vivo (epica KAN-4, scaffold Angular/Ionic): un archivo con decoradores de Angular \
 (@NgModule, @Component, @Injectable) sin un tsconfig.json real en ese sub-proyecto con \
 "experimentalDecorators": true (y "emitDecoratorMetadata": true) rompe el test runner con un error de \
@@ -1534,6 +1543,72 @@ def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") ->
         return "error: el comando supero el timeout de 120s"
 
 
+# Gap real confirmado en vivo (epica KAN-4, KAN-2, dos corridas seguidas):
+# verify_npm_package confirma que un paquete/version EXISTE, pero eso no
+# alcanza -- package.json puede pinear versiones que existen individualmente
+# pero son mutuamente INCOMPATIBLES (ej. "@angular/core": "^17.0.0" mientras
+# otra dependencia del arbol resuelve a "@angular/common@22.0.8", que exige
+# "@angular/core@22.0.8" como peer -- confirmado real via 'npm error
+# ERESOLVE unable to resolve dependency tree'). Nada verificaba esto ANTES
+# de declararse "done" -- recien se descubria cuando el testing agent
+# corria "npm install" de verdad, ya con el cambio commiteado, cortando la
+# epica entera. verify_npm_install corre 'npm install --dry-run' (no
+# instala nada de verdad, solo lectura) para que el coding agent pueda
+# confirmar que el arbol de dependencias resuelve ANTES de terminar.
+def tool_verify_npm_install(target_repo_dir: str, path: str = "") -> str:
+    """Corre 'npm install --dry-run' en el sub-proyecto real (path relativo
+    a la raiz del repo, ej. 'frontend') -- no instala nada de verdad, solo
+    confirma si el arbol de dependencias de package.json resuelve sin
+    conflictos. Usa esto DESPUES de editar package.json (agregar, quitar, o
+    cambiar de version cualquier dependencia) y ANTES de declararte 'done'.
+    """
+    try:
+        work_dir = _safe_path(target_repo_dir, path) if path else Path(target_repo_dir).resolve()
+    except ValueError as exc:
+        return f"error: {exc}"
+    if not work_dir.is_dir():
+        return f"error: '{path}' no es un directorio dentro del repo objetivo"
+    if not (work_dir / "package.json").is_file():
+        return f"error: no hay package.json en '{path}' -- verifica la ruta del sub-proyecto"
+
+    command = "npm install --dry-run --no-audit --no-fund"
+    npm_available = shutil.which("npm") is not None
+    if npm_available:
+        try:
+            result = subprocess.run(
+                command, shell=True, cwd=str(work_dir), capture_output=True, text=True, timeout=120,
+                env=_sanitized_subprocess_env(),
+            )
+            stdout, stderr = result.stdout, result.stderr
+            returncode = result.returncode
+        except subprocess.TimeoutExpired:
+            return "error: 'npm install --dry-run' supero el timeout de 120s -- no se pudo confirmar"
+    elif shutil.which("docker") is not None:
+        output = _run_command_in_stack_container("mcr.microsoft.com/playwright:v1.61.1-noble", command, target_repo_dir, work_dir)
+        # _run_command_in_stack_container ya devuelve el string final formateado
+        # (exit_code=.../stdout:.../stderr:...) -- se parsea liviano solo para
+        # decidir el mensaje ERESOLVE de abajo, no hace falta re-ejecutar nada.
+        stdout = output
+        stderr = output
+        exit_code_match = re.match(r"exit_code=(-?\d+)", output)
+        returncode = int(exit_code_match.group(1)) if exit_code_match else 1
+    else:
+        return "error: ni npm ni docker estan disponibles para verificar el install -- no se puede confirmar, no asumas que el arbol de dependencias resuelve"
+
+    if returncode == 0:
+        return f"'npm install --dry-run' en '{path or '.'}' resolvio SIN conflictos -- el arbol de dependencias es consistente."
+    combined = f"{stdout}\n{stderr}"
+    if "ERESOLVE" in combined:
+        return (
+            f"'npm install --dry-run' en '{path or '.'}' FALLO con un conflicto real de dependencias (ERESOLVE) -- "
+            f"esto significa que dos paquetes declarados en package.json exigen versiones incompatibles entre si "
+            f"(ej. un paquete X pineado en una version que requiere @angular/core en una version distinta a la "
+            f"que vos pineaste). Alinea las versiones de la MISMA familia (ej. todos los @angular/* al mismo "
+            f"major) antes de declararte done. Detalle real:\n{_truncate(combined, _MAX_SHELL_OUTPUT_CHARS)}"
+        )
+    return f"'npm install --dry-run' en '{path or '.'}' fallo (no es ERESOLVE, revisa el detalle) -- no declares done sin resolver esto:\n{_truncate(combined, _MAX_SHELL_OUTPUT_CHARS)}"
+
+
 LOCAL_TOOLS = {
     "read_file": {
         "description": "Lee el contenido de un archivo dentro del repo objetivo.",
@@ -1635,6 +1710,18 @@ LOCAL_TOOLS = {
             "required": ["package_name"],
         },
         "fn": tool_verify_npm_package,
+    },
+    "verify_npm_install": {
+        "description": (
+            "Corre 'npm install --dry-run' en un sub-proyecto real (path relativo, ej. 'frontend') -- confirma "
+            "si el arbol COMPLETO de dependencias de package.json resuelve sin conflictos, no solo si un paquete "
+            "individual existe. Usa esto SIEMPRE despues de agregar/quitar/cambiar de version cualquier "
+            "dependencia y ANTES de declararte done -- un paquete puede existir de verdad pero ser incompatible "
+            "con otro ya declarado (ej. distintas versiones major de @angular/*). No instala nada de verdad, "
+            "solo lectura."
+        ),
+        "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": []},
+        "fn": tool_verify_npm_install,
     },
     "check_tsconfig_decorators": {
         "description": (
