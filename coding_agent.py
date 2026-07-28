@@ -520,6 +520,66 @@ o por que no pudiste", "files_changed": ["ruta1", "ruta2", ...], "self_review": 
 true (tu alcance ES escribir tests, no hay otro alcance que evaluar) -- "tests_adequate" es tu propia \
 autocritica honesta contra las 4 reglas de arriba, no la completes con true por defecto."""
 
+# Gap real: un solo coding agent maneja TODO el stack (backend Java/Python +
+# frontend Angular/Ionic) en la misma conversacion -- un cambio de contexto
+# grande dentro del mismo turno (de auth-service en Java a frontend en
+# Angular) diluye el foco del modelo. backend_agent/frontend_agent son el
+# MISMO agente de codigo (mismas tools, mismo gate de investigacion, mismo
+# esquema JSON final) pero con una restriccion de alcance explicita -- cada
+# uno SOLO toca los sub-proyectos de su stack. orchestration.py rutea el
+# ticket a uno u otro segun el componente real (Frontend -> frontend_agent,
+# el resto -> backend_agent), nunca a ambos para el mismo ticket.
+_BACKEND_SCOPE_RESTRICTION = """
+
+RESTRICCION DE ALCANCE: sos el agente de BACKEND -- SOLO toca sub-proyectos de servidor (ej. auth-service/, \
+data-worker/, o cualquier sub-proyecto con stack de Java/Maven, Python, Node backend, Go, etc.). NUNCA edites \
+NADA bajo frontend/ (o cualquier sub-proyecto Angular/Ionic/React/Vue) -- si el ticket real requiere un cambio \
+ahi, marcá "blocked" y explicá que ese trabajo le corresponde al agente de frontend."""
+
+_FRONTEND_SCOPE_RESTRICTION = """
+
+RESTRICCION DE ALCANCE: sos el agente de FRONTEND -- SOLO toca el sub-proyecto frontend/ (Angular/Ionic/\
+Capacitor u otro stack de UI). NUNCA edites NADA en sub-proyectos de backend (auth-service/, data-worker/, o \
+cualquier stack de servidor) -- si el ticket real requiere un cambio ahi, marcá "blocked" y explicá que ese \
+trabajo le corresponde al agente de backend."""
+
+BACKEND_AGENT_SYSTEM_PROMPT = CODING_AGENT_SYSTEM_PROMPT + _BACKEND_SCOPE_RESTRICTION
+FRONTEND_AGENT_SYSTEM_PROMPT = CODING_AGENT_SYSTEM_PROMPT + _FRONTEND_SCOPE_RESTRICTION
+
+# "El coding agent sera el juez" (pedido explicito del usuario) -- una capa
+# NUEVA, ANTES del juez independiente real (judge_agent.py, que sigue
+# corriendo igual que siempre despues de esto). Este revisor NO reemplaza al
+# juez -- es una revision mas rapida y especifica al stack que acaba de
+# tocarse (backend o frontend), pensada para atrapar problemas obvios
+# (alcance incorrecto, secretos hardcodeados, sintaxis rota) antes de gastar
+# el turno completo del juez independiente. Solo lectura -- nunca reescribe
+# nada el mismo.
+CODING_AGENT_REVIEW_SYSTEM_PROMPT = """Sos el coding agent general, actuando como revisor de un cambio que un \
+sub-agente especializado (backend o frontend) ya implemento y commiteo en este mismo repo real. Tu trabajo es \
+revisar el diff real (no un resumen) y decidir si esta listo para seguir al juez independiente, o si necesita \
+otra vuelta antes de eso -- vos NO reemplazas al juez, sos una revision previa mas rapida y especifica al \
+stack que acaba de tocarse.
+
+Tenes las mismas herramientas de solo lectura que cualquier coding agent: read_file, list_directory, \
+grep_search, run_shell_command (con confirmacion humana, util para correr tests/lint si hace falta confirmar \
+algo puntual) -- NO uses write_file ni edit_file, tu trabajo es revisar, no reescribir vos mismo.
+
+Antes de decidir, usa read_file para ver el diff real y el contexto real de los archivos tocados -- no asumas \
+el contenido de memoria del prompt.
+
+Chequeá especificamente: (1) el cambio corresponde de verdad al ticket, no a otra cosa; (2) no hay secretos/\
+credenciales hardcodeadas; (3) no hay codigo obviamente roto (sintaxis invalida, imports que no existen, \
+llamadas a funciones que no se definieron); (4) el sub-agente no se salio de su alcance de stack (ej. el \
+agente de frontend no deberia haber tocado backend, y viceversa).
+
+Cuando termines, respondé con texto plano que sea UNICAMENTE un objeto JSON, sin texto antes ni despues, con \
+este esquema exacto: {"status": "done" si el cambio esta listo para el juez independiente, o "blocked" si \
+necesita otra vuelta antes de eso, "summary": "tu veredicto y por que", "files_changed": [], "self_review": \
+{"scope_matches_ticket": true, "no_secrets_introduced": true o false, "tests_adequate": true}, \
+"review_feedback": "si status es blocked, que especificamente hay que corregir -- sino, string vacio"}. \
+"files_changed" queda vacio (no escribiste nada, solo revisaste) -- "self_review" es tu autocritica honesta \
+sobre lo que revisaste, no sobre codigo que no escribiste vos."""
+
 MCP_SERVERS = {
     "neo4j-cypher": StdioServerParameters(
         command="uvx",
@@ -2243,6 +2303,26 @@ async def run_test_writer_subagent(ticket_id: str, diff_text: str, ticket_summar
     )
 
 
+async def run_coding_agent_review(ticket_id: str, diff_text: str, sub_agent_role: str, target_repo_dir: str) -> dict:
+    """Conversacion NUEVA (sin resume_messages/resume_state, a proposito) --
+    revision de una sola vez del diff que un sub-agente especializado
+    (backend_agent/frontend_agent) acaba de commitear. Reusa run_coding_agent
+    entero (mismas tools de solo lectura, mismo gate de investigacion) con
+    CODING_AGENT_REVIEW_SYSTEM_PROMPT. Capa NUEVA, ANTES del juez
+    independiente (judge_agent.py, que sigue corriendo despues sin cambios)
+    -- nunca lo reemplaza. Ver CODING_AGENT_REVIEW_SYSTEM_PROMPT arriba.
+    """
+    prompt = (
+        f"Historia: {ticket_id} -- revision del cambio hecho por el agente de {sub_agent_role}\n\n"
+        "El siguiente diff ya fue aplicado a este repo (rama actual) -- revisalo y decidi si esta listo para "
+        "seguir al juez independiente:\n\n"
+        f"```diff\n{diff_text}\n```"
+    )
+    return await run_coding_agent(
+        ticket_id, prompt, target_repo_dir, system_prompt=CODING_AGENT_REVIEW_SYSTEM_PROMPT,
+    )
+
+
 def _extract_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
@@ -2283,6 +2363,43 @@ def main():
             result = asyncio.run(
                 run_test_writer_subagent(
                     ticket_id, payload["diff_text"], payload.get("ticket_summary", ""), payload["target_repo_dir"],
+                )
+            )
+        # mode="backend_agent"/"frontend_agent": mismo shape de payload que el
+        # default (resume_messages/resume_state incluidos -- estos sub-agentes
+        # SI continuan su propia conversacion turno a turno, a diferencia de
+        # test_writer/coding_agent_review que siempre arrancan de cero), solo
+        # que con el system_prompt scoped a su stack. Ver BACKEND_AGENT_
+        # SYSTEM_PROMPT/FRONTEND_AGENT_SYSTEM_PROMPT arriba.
+        elif payload.get("mode") == "backend_agent":
+            result = asyncio.run(
+                run_coding_agent(
+                    ticket_id,
+                    payload["sanitized_prompt"],
+                    payload["target_repo_dir"],
+                    resume_messages=payload.get("resume_messages"),
+                    resume_state=payload.get("resume_state"),
+                    system_prompt=BACKEND_AGENT_SYSTEM_PROMPT,
+                )
+            )
+        elif payload.get("mode") == "frontend_agent":
+            result = asyncio.run(
+                run_coding_agent(
+                    ticket_id,
+                    payload["sanitized_prompt"],
+                    payload["target_repo_dir"],
+                    resume_messages=payload.get("resume_messages"),
+                    resume_state=payload.get("resume_state"),
+                    system_prompt=FRONTEND_AGENT_SYSTEM_PROMPT,
+                )
+            )
+        # mode="coding_agent_review": "el coding agent sera el juez" (pedido
+        # explicito del usuario) -- conversacion NUEVA (nunca resume, revision
+        # de una sola vez), ver run_coding_agent_review().
+        elif payload.get("mode") == "coding_agent_review":
+            result = asyncio.run(
+                run_coding_agent_review(
+                    ticket_id, payload["diff_text"], payload.get("sub_agent_role", "backend"), payload["target_repo_dir"],
                 )
             )
         else:

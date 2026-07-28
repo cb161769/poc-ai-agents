@@ -1552,13 +1552,77 @@ def _branch_diff_deletes_existing_subproject(target_repo_dir: str, branch: str, 
     return None
 
 
-@task(retries=0, name="coding-agent-local-real")
-def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_repo_dir: str) -> dict:
+def _stack_role_for_component(repository_origen: str) -> str:
+    """Ruteo real (pedido explicito del usuario): 'Frontend' -- el
+    componente real derivado del grafo Neo4j, ver discover_known_components
+    -- va al agente de frontend; cualquier otro componente real (AuthService,
+    DataWorker, etc.) va al agente de backend. Nunca ambos para el mismo
+    ticket.
+    """
+    return "frontend" if "frontend" in (repository_origen or "").lower() else "backend"
+
+
+@task(retries=0, name="coding-agent-review")
+def run_coding_agent_review_task(ticket_id: str, diff_text: str, sub_agent_role: str, target_repo_dir: str) -> dict:
+    """"El coding agent sera el juez" (pedido explicito del usuario) -- capa
+    NUEVA, ANTES del juez independiente real (judge_agent.py, que sigue
+    corriendo despues sin cambios). Revision de solo lectura, conversacion
+    SIEMPRE nueva (nunca resume) -- ver coding_agent.run_coding_agent_review().
+    Best-effort: si la revision no devuelve un verdict valido, se trata como
+    "no se pudo revisar" (verdict=None) y el caller sigue de largo -- esta
+    capa nunca bloquea la epica por su cuenta, esa es responsabilidad
+    exclusiva del juez independiente que corre despues.
+    """
+    payload = {
+        "mode": "coding_agent_review", "ticket_id": ticket_id, "target_repo_dir": target_repo_dir,
+        "diff_text": diff_text, "sub_agent_role": sub_agent_role,
+    }
+    payload_file = SCRIPT_DIR / "logs" / f".coding_agent_review_payload_{ticket_id}_{int(time.time())}.json"
+    payload_file.parent.mkdir(parents=True, exist_ok=True)
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            ["python3", str(SCRIPT_DIR / "coding_agent.py"), str(payload_file)],
+            stdout=subprocess.PIPE, text=True, cwd=target_repo_dir,
+        )
+    finally:
+        payload_file.unlink(missing_ok=True)
+
+    run_logger = get_run_logger()
+    if result.returncode != 0:
+        run_logger.warning(f"coding_agent.py (coding-agent-review) salio con returncode={result.returncode} para {ticket_id}.")
+
+    try:
+        agent_result = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        run_logger.warning(f"coding-agent-review no devolvio un JSON valido en stdout para {ticket_id}.")
+        return {"verdict": None, "reasoning": None, "feedback": None}
+
+    conversation_file = agent_result.get("_conversation_file")
+    if conversation_file:
+        Path(conversation_file).unlink(missing_ok=True)
+
+    status = agent_result.get("status")
+    if status not in ("done", "blocked"):
+        run_logger.warning(f"coding-agent-review devolvio un status invalido ('{status}') para {ticket_id} -- se trata como 'no se pudo revisar'.")
+        return {"verdict": None, "reasoning": agent_result.get("summary"), "feedback": agent_result.get("review_feedback")}
+
+    verdict = "approve" if status == "done" else "request_changes"
+    run_logger.info(f"coding-agent-review: {verdict} para {ticket_id} — {agent_result.get('summary')}")
+    return {"verdict": verdict, "reasoning": agent_result.get("summary"), "feedback": agent_result.get("review_feedback")}
+
+
+def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_repo_dir: str, role: str = "") -> dict:
     """Camino B1: the real local coding agent (coding_agent.py) -- reasons
     over several turns, can read/write/list/grep the repo and query the same
     MCP tools the judge has, with human confirmation before every write or
     shell command. Same {"applied","branch","base_branch"} shape as
     run_coding_agent_local() so _deliver() doesn't need to know which ran.
+
+    role ("backend"/"frontend"/"" -- pedido explicito del usuario): rutea a
+    un sub-agente scoped a ese stack (coding_agent.py, mode="{role}_agent")
+    en vez del coding agent general. "" (default) preserva el comportamiento
+    de siempre para todo caller que no pasa role explicitamente.
     """
     base_branch = subprocess.run(
         ["git", "-C", target_repo_dir, "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True
@@ -1627,12 +1691,12 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
         sanitized_prompt = sanitized_prompt + _build_pr_feedback_section(pr_comments)
     pr_thread_ids_to_resolve = [c["thread_id"] for c in pr_comments]
 
+    payload = {"ticket_id": ticket_id, "sanitized_prompt": sanitized_prompt, "target_repo_dir": target_repo_dir}
+    if role in ("backend", "frontend"):
+        payload["mode"] = f"{role}_agent"
     payload_file = SCRIPT_DIR / "logs" / f".coding_agent_payload_{ticket_id}_{int(time.time())}.json"
     payload_file.parent.mkdir(parents=True, exist_ok=True)
-    payload_file.write_text(
-        json.dumps({"ticket_id": ticket_id, "sanitized_prompt": sanitized_prompt, "target_repo_dir": target_repo_dir}),
-        encoding="utf-8",
-    )
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
     try:
         # stdout=PIPE only (not capture_output=True): stdin/stderr stay
         # inherited from the terminal so the interactive confirmations in
@@ -1762,7 +1826,7 @@ def run_coding_agent_local_real(ticket_id: str, sanitized_prompt: str, target_re
 @task(retries=0, name="coding-agent-local-real-retry")
 def retry_coding_agent_local_real(
     ticket_id: str, feedback_text: str, target_repo_dir: str, conversation_file: str | None = None,
-    reset_investigation_state: bool = False,
+    reset_investigation_state: bool = False, role: str = "",
 ) -> dict:
     """Segundo pase de Camino B1 tras un veredicto FLAGGED retryable --
     reusa la rama que el primer intento ya dejo checked out (NO crea una
@@ -1784,8 +1848,16 @@ def retry_coding_agent_local_real(
     miro. read_file_hashes/consulted_risk_graph SI siguen siendo validos
     entre historias (son sobre contenido real del repo, no sobre "ya mire
     lo que hace falta para ESTE ticket puntual") -- no se tocan.
+
+    role ("backend"/"frontend"/"" -- pedido explicito del usuario): mismo
+    criterio que run_coding_agent_local_real -- el caller pasa el MISMO role
+    que uso en el intento inicial de este ticket, para que el system_prompt
+    (que no viaja en conversation_file) se mantenga consistente turno a
+    turno. "" preserva el coding agent general de siempre.
     """
     payload = {"ticket_id": ticket_id, "target_repo_dir": target_repo_dir}
+    if role in ("backend", "frontend"):
+        payload["mode"] = f"{role}_agent"
     if conversation_file and Path(conversation_file).exists():
         conversation_state = json.loads(Path(conversation_file).read_text(encoding="utf-8"))
         payload["sanitized_prompt"] = feedback_text
@@ -3572,8 +3644,13 @@ def _deliver_epic_sequential(
 
         checkpoint = _run(["git", "-C", target_repo_dir, "rev-parse", "HEAD"]).strip() if branch else None
 
+        # 2 sub-agentes, backend y frontend (pedido explicito del usuario) --
+        # se rutea segun el componente real del ticket, nunca los dos para el
+        # mismo ticket. Ver _stack_role_for_component.
+        stack_role = _stack_role_for_component(child["repository_origen"])
+
         if branch is None:
-            agent_result = run_coding_agent_local_real(epic_key, sanitized, target_repo_dir)
+            agent_result = run_coding_agent_local_real(epic_key, sanitized, target_repo_dir, role=stack_role)
             branch = agent_result.get("branch")
             base_branch = agent_result.get("base_branch")
         else:
@@ -3583,7 +3660,7 @@ def _deliver_epic_sequential(
             # archivos de la historia previa no dice nada sobre esta.
             agent_result = retry_coding_agent_local_real(
                 epic_key, sanitized, target_repo_dir, conversation_file=conversation_file,
-                reset_investigation_state=True,
+                reset_investigation_state=True, role=stack_role,
             )
         conversation_file = agent_result.get("conversation_file")
         backend = agent_result.get("backend") or backend
@@ -3629,6 +3706,33 @@ def _deliver_epic_sequential(
 
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
+
+        # "El coding agent sera el juez" (pedido explicito del usuario) --
+        # capa NUEVA, ANTES del juez independiente real (judge_agent.py, que
+        # sigue corriendo despues sin cambios). Best-effort: si pide cambios,
+        # UN reintento con su feedback antes de seguir -- nunca bloquea la
+        # epica por su cuenta, eso sigue siendo responsabilidad exclusiva del
+        # juez independiente.
+        review = run_coding_agent_review_task(epic_key, diff_text, stack_role, target_repo_dir)
+        if review.get("verdict") == "request_changes":
+            comment_jira(
+                f"🔎 Revision del coding agent en {child_id}: pide cambios antes del juez independiente -- "
+                f"{review.get('reasoning') or ''} Dandole un turno mas.",
+                ticket_key=child_id,
+            )
+            review_feedback = (
+                f"--- REVISION DEL CODING AGENT (corregir antes de continuar) ---\n"
+                f"{review.get('feedback') or review.get('reasoning') or ''}"
+            )
+            reviewed_retry = retry_coding_agent_local_real(
+                epic_key, review_feedback, target_repo_dir, conversation_file=conversation_file, role=stack_role,
+            )
+            conversation_file = reviewed_retry.get("conversation_file") or conversation_file
+            if reviewed_retry.get("applied"):
+                agent_result = reviewed_retry
+                backend = agent_result.get("backend") or backend
+                diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
+                    else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
 
         resumed_note = ""
         if agent_result.get("resumed_branch"):

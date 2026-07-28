@@ -1992,6 +1992,7 @@ def test_deliver_epic_sequential_skips_already_completed_child_but_processes_sib
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2145,6 +2146,7 @@ def test_deliver_epic_sequential_includes_epic_context_only_in_first_historia(mo
         lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}, "conversation_file": "/tmp/c2.json"},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2197,6 +2199,7 @@ def test_deliver_epic_sequential_passes_epic_context_to_judge(monkeypatch):
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main", "backend": "ollama", "conversation_file": "/tmp/c1.json", "self_review": {}},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2255,6 +2258,7 @@ def test_deliver_epic_sequential_passes_epic_context_to_test_plan_every_time(mon
         lambda *a, **k: {"applied": True, "backend": "ollama", "self_review": {}, "conversation_file": "/tmp/c2.json"},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2298,7 +2302,7 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
         return f"diff {cmd[-1]}"
     monkeypatch.setattr(orchestration, "_run", fake_run)
 
-    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+    def fake_run_first(ticket_id, sanitized, target_repo_dir, **kwargs):
         coding_calls.append(("first", sanitized))
         return {
             "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
@@ -2311,6 +2315,7 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
 
     monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
 
     def fake_guard(diff_text, jira_context):
         guard_diffs.append(diff_text)
@@ -2370,12 +2375,13 @@ def test_deliver_epic_sequential_surfaces_push_failure_reason_in_epic_summary(mo
 
     monkeypatch.setattr(
         orchestration, "run_coding_agent_local_real",
-        lambda ticket_id, sanitized, target_repo_dir: {
+        lambda ticket_id, sanitized, target_repo_dir, **kwargs: {
             "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
             "backend": "anthropic", "conversation_file": None, "self_review": {},
         },
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2416,7 +2422,7 @@ def test_deliver_epic_sequential_skips_rejected_child_and_continues(monkeypatch)
     monkeypatch.setattr(orchestration, "record_run_in_graph", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "hash\n")
 
-    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+    def fake_run_first(ticket_id, sanitized, target_repo_dir, **kwargs):
         coding_backend_calls.append("first")
         return {"applied": False, "branch": None, "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None}
 
@@ -2456,6 +2462,7 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2498,6 +2505,7 @@ def test_deliver_epic_sequential_posts_gap_classification_on_test_failure_block(
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "npm test fallo: capacitor no encontrado"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2558,6 +2566,7 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
         lambda *a, **k: {"applied": True, "backend": "anthropic", "self_review": None, "conversation_file": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2601,6 +2610,7 @@ def test_deliver_epic_sequential_pr_body_describes_real_changes_not_raw_epic_des
         lambda *a, **k: {"applied": True, "backend": "anthropic", "self_review": None, "conversation_file": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2645,6 +2655,7 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
@@ -2696,6 +2707,7 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
 
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2767,6 +2779,7 @@ def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_his
         },
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2823,6 +2836,7 @@ def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_chi
         },
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "==== 4 passed ===="})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2867,7 +2881,7 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
         lambda evidence: f"## Casos Negativos\n- caso negativo de {evidence['ticket']}",
     )
 
-    def fake_run_first(ticket_id, sanitized, target_repo_dir):
+    def fake_run_first(ticket_id, sanitized, target_repo_dir, **kwargs):
         captured_prompts.append(("first", sanitized))
         return {
             "applied": True, "branch": "copilot/EPIC-1-123", "base_branch": "main",
@@ -2881,6 +2895,7 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
     monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2921,6 +2936,7 @@ def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monke
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "anthropic", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2961,6 +2977,7 @@ def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypat
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3092,6 +3109,7 @@ def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monk
         lambda *a, **k: {"applied": True, "branch": "copilot/EPIC-1-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3133,6 +3151,7 @@ def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
         lambda *a, **k: {"applied": True, "branch": "copilot/T-1", "base_branch": "main", "backend": "ollama", "conversation_file": None, "self_review": None},
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
+    monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3410,6 +3429,162 @@ def test_run_test_writer_subagent_task_reports_not_applied_when_no_commit(monkey
     result = orchestration.run_test_writer_subagent_task("KAN-5", "diff real", "resumen", str(tmp_path))
 
     assert result["applied"] is False
+
+
+def test_stack_role_for_component_routes_frontend():
+    assert orchestration._stack_role_for_component("Frontend") == "frontend"
+    assert orchestration._stack_role_for_component("frontend") == "frontend"
+
+
+def test_stack_role_for_component_routes_everything_else_to_backend():
+    """Pedido explicito del usuario: 2 sub-agentes, backend y frontend --
+    nunca los dos para el mismo ticket."""
+    assert orchestration._stack_role_for_component("AuthService") == "backend"
+    assert orchestration._stack_role_for_component("DataWorker") == "backend"
+    assert orchestration._stack_role_for_component("") == "backend"
+    assert orchestration._stack_role_for_component(None) == "backend"
+
+
+def test_run_coding_agent_local_real_routes_backend_role_to_payload_mode(monkeypatch, tmp_path):
+    """Pedido explicito del usuario: run_coding_agent_local_real(role=...)
+    setea mode="{role}_agent" en el payload que coding_agent.py recibe."""
+    captured_payload = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "ok", "_meta": {"backend": "ollama"}, "files_changed": []})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = Path(cmd[2])
+            captured_payload.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            return FakeResult()
+        if "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout="main\n")
+        if "checkout" in cmd:
+            return _fake_subprocess_result()
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration, "_find_open_branch_for_ticket", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "_fetch_unresolved_pr_comments", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    orchestration.run_coding_agent_local_real("KAN-5", "hace algo", str(tmp_path), role="backend")
+
+    assert captured_payload["mode"] == "backend_agent"
+
+
+def test_run_coding_agent_local_real_omits_mode_for_default_role(monkeypatch, tmp_path):
+    captured_payload = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "ok", "_meta": {"backend": "ollama"}, "files_changed": []})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = Path(cmd[2])
+            captured_payload.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            return FakeResult()
+        if "rev-parse" in cmd:
+            return _fake_subprocess_result(stdout="main\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration, "_find_open_branch_for_ticket", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "_fetch_unresolved_pr_comments", lambda *a, **k: [])
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    orchestration.run_coding_agent_local_real("KAN-5", "hace algo", str(tmp_path))
+
+    assert "mode" not in captured_payload
+
+
+def test_retry_coding_agent_local_real_routes_frontend_role_to_payload_mode(monkeypatch, tmp_path):
+    captured_payload = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"status": "done", "summary": "ok", "_meta": {"backend": "ollama"}})
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            payload_path = Path(cmd[2])
+            captured_payload.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            return FakeResult()
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return _fake_subprocess_result(stdout="abc123\n")
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    orchestration.retry_coding_agent_local_real("KAN-5", "feedback", str(tmp_path), role="frontend")
+
+    assert captured_payload["mode"] == "frontend_agent"
+
+
+def test_run_coding_agent_review_task_returns_approve_verdict(monkeypatch, tmp_path):
+    """"El coding agent sera el juez" (pedido explicito del usuario) -- capa
+    nueva ANTES del juez independiente. status="done" del revisor mapea a
+    verdict="approve"."""
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "done", "summary": "se ve bien", "_meta": {"backend": "ollama"},
+            "review_feedback": "",
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    result = orchestration.run_coding_agent_review_task.fn("KAN-5", "diff real", "backend", str(tmp_path))
+
+    assert result["verdict"] == "approve"
+    assert result["reasoning"] == "se ve bien"
+
+
+def test_run_coding_agent_review_task_returns_request_changes_verdict(monkeypatch, tmp_path):
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({
+            "status": "blocked", "summary": "token hardcodeado", "_meta": {"backend": "ollama"},
+            "review_feedback": "quita el token",
+        })
+
+    def fake_run(cmd, **kwargs):
+        if cmd and cmd[0] == "python3":
+            return FakeResult()
+        return _fake_subprocess_result()
+
+    monkeypatch.setattr(orchestration.subprocess, "run", fake_run)
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    result = orchestration.run_coding_agent_review_task.fn("KAN-5", "diff real", "frontend", str(tmp_path))
+
+    assert result["verdict"] == "request_changes"
+    assert result["feedback"] == "quita el token"
+
+
+def test_run_coding_agent_review_task_handles_invalid_json_gracefully(monkeypatch, tmp_path):
+    """Best-effort: si la revision no devuelve JSON valido, verdict=None --
+    el caller sigue de largo, esta capa nunca bloquea la epica por su cuenta."""
+    class FakeResult:
+        returncode = 1
+        stdout = "no json aqui"
+
+    monkeypatch.setattr(orchestration.subprocess, "run", lambda cmd, **k: FakeResult())
+    monkeypatch.setattr(orchestration, "get_run_logger", lambda: MagicMock())
+
+    result = orchestration.run_coding_agent_review_task.fn("KAN-5", "diff real", "backend", str(tmp_path))
+
+    assert result["verdict"] is None
 
 
 def test_run_test_writer_subagent_task_flags_blocked_without_trying(monkeypatch, tmp_path):

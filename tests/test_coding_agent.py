@@ -10,6 +10,7 @@ real model backend or MCP server involved.
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -816,8 +817,122 @@ def test_run_test_writer_subagent_uses_test_writer_system_prompt(monkeypatch, tm
 
     assert captured["system_prompt"] == ca.TEST_WRITER_SYSTEM_PROMPT
     assert captured["system_prompt"] != ca.CODING_AGENT_SYSTEM_PROMPT
+
+
+def test_backend_and_frontend_prompts_are_scoped_variants_of_the_general_prompt():
+    """Pedido explicito del usuario: 2 sub-agentes, backend y frontend --
+    mismo agente de codigo general (mismas tools, mismo gate de
+    investigacion) pero con una restriccion de alcance explicita agregada."""
+    assert ca.CODING_AGENT_SYSTEM_PROMPT in ca.BACKEND_AGENT_SYSTEM_PROMPT
+    assert ca.CODING_AGENT_SYSTEM_PROMPT in ca.FRONTEND_AGENT_SYSTEM_PROMPT
+    assert "BACKEND" in ca.BACKEND_AGENT_SYSTEM_PROMPT
+    assert "FRONTEND" in ca.FRONTEND_AGENT_SYSTEM_PROMPT
+    assert ca.BACKEND_AGENT_SYSTEM_PROMPT != ca.FRONTEND_AGENT_SYSTEM_PROMPT
+
+
+def test_run_coding_agent_review_uses_review_system_prompt(monkeypatch, tmp_path):
+    """"El coding agent sera el juez" (pedido explicito del usuario): la
+    revision arranca una conversacion NUEVA con CODING_AGENT_REVIEW_SYSTEM_PROMPT,
+    no el prompt general ni el de test-writer."""
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+    captured = {}
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        captured["system_prompt"] = system_prompt
+        captured["user_prompt"] = messages[0]["content"]
+        content = [{"type": "text", "text": '{"status": "done", "summary": "se ve bien", "files_changed": [], "self_review": {"scope_matches_ticket": true, "no_secrets_introduced": true, "tests_adequate": true}, "review_feedback": ""}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    diff_text = "diff --git a/auth-service/src/Auth.java b/auth-service/src/Auth.java\n+ new code"
+    result = asyncio.run(ca.run_coding_agent_review("KAN-5", diff_text, "backend", str(tmp_path)))
+
+    assert captured["system_prompt"] == ca.CODING_AGENT_REVIEW_SYSTEM_PROMPT
     assert diff_text in captured["user_prompt"]
-    assert "KAN-5" in captured["user_prompt"]
+    assert result["status"] == "done"
+
+
+def test_run_coding_agent_review_reports_blocked_when_it_requests_changes(monkeypatch, tmp_path):
+    monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
+    monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
+
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        content = [{"type": "text", "text": '{"status": "blocked", "summary": "hardcoded secret found", "files_changed": [], "self_review": {"scope_matches_ticket": true, "no_secrets_introduced": false, "tests_adequate": true}, "review_feedback": "quita el token hardcodeado"}'}]
+        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+
+    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+
+    result = asyncio.run(ca.run_coding_agent_review("KAN-5", "diff real", "frontend", str(tmp_path)))
+
+    assert result["status"] == "blocked"
+    assert result["review_feedback"] == "quita el token hardcodeado"
+
+
+def test_main_dispatches_backend_agent_mode(monkeypatch, tmp_path):
+    payload = {"mode": "backend_agent", "ticket_id": "KAN-5", "sanitized_prompt": "hace algo", "target_repo_dir": str(tmp_path)}
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    captured = {}
+
+    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT):
+        captured["system_prompt"] = system_prompt
+        return {"status": "done", "summary": "ok", "files_changed": []}
+
+    monkeypatch.setattr(ca, "run_coding_agent", fake_run_coding_agent)
+    monkeypatch.setattr(sys, "argv", ["coding_agent.py", str(payload_file)])
+    monkeypatch.setattr(ca, "log_run", lambda *a, **k: None)
+
+    ca.main()
+
+    assert captured["system_prompt"] == ca.BACKEND_AGENT_SYSTEM_PROMPT
+
+
+def test_main_dispatches_frontend_agent_mode(monkeypatch, tmp_path):
+    payload = {"mode": "frontend_agent", "ticket_id": "KAN-6", "sanitized_prompt": "hace algo", "target_repo_dir": str(tmp_path)}
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    captured = {}
+
+    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT):
+        captured["system_prompt"] = system_prompt
+        return {"status": "done", "summary": "ok", "files_changed": []}
+
+    monkeypatch.setattr(ca, "run_coding_agent", fake_run_coding_agent)
+    monkeypatch.setattr(sys, "argv", ["coding_agent.py", str(payload_file)])
+    monkeypatch.setattr(ca, "log_run", lambda *a, **k: None)
+
+    ca.main()
+
+    assert captured["system_prompt"] == ca.FRONTEND_AGENT_SYSTEM_PROMPT
+
+
+def test_main_dispatches_coding_agent_review_mode(monkeypatch, tmp_path):
+    payload = {
+        "mode": "coding_agent_review", "ticket_id": "KAN-5", "target_repo_dir": str(tmp_path),
+        "diff_text": "diff real", "sub_agent_role": "backend",
+    }
+    payload_file = tmp_path / "payload.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    captured = {}
+
+    async def fake_review(ticket_id, diff_text, sub_agent_role, target_repo_dir):
+        captured["diff_text"] = diff_text
+        captured["sub_agent_role"] = sub_agent_role
+        return {"status": "done", "summary": "ok"}
+
+    monkeypatch.setattr(ca, "run_coding_agent_review", fake_review)
+    monkeypatch.setattr(sys, "argv", ["coding_agent.py", str(payload_file)])
+    monkeypatch.setattr(ca, "log_run", lambda *a, **k: None)
+
+    ca.main()
+
+    assert captured["diff_text"] == "diff real"
+    assert captured["sub_agent_role"] == "backend"
 
 
 def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(monkeypatch, tmp_path):
