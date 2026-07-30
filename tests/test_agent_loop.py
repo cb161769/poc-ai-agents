@@ -402,6 +402,42 @@ def test_call_model_turn_ollama_respects_num_ctx_env_override(monkeypatch):
     assert captured["json"]["options"]["num_ctx"] == 16384
 
 
+def test_call_model_turn_ollama_sends_keep_alive(monkeypatch):
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(client, "ollama", [{"role": "user", "content": "hola"}], [], "sys"))
+
+    assert captured["json"]["keep_alive"] == agent_loop.OLLAMA_KEEP_ALIVE
+
+
+def test_call_model_turn_ollama_uses_per_model_num_ctx_override(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_OLLAMA_NUM_CTX_OVERRIDES", {"devstral:24b": 32768})
+    captured = {}
+    client = MagicMock()
+    client.post = _fake_ollama_post_capturing(captured)
+
+    asyncio.run(agent_loop._call_model_turn(
+        client, "ollama", [{"role": "user", "content": "hola"}], [], "sys", ollama_model="devstral:24b",
+    ))
+
+    assert captured["json"]["options"]["num_ctx"] == 32768
+
+
+def test_resolve_ollama_num_ctx_returns_override_when_present(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_OLLAMA_NUM_CTX_OVERRIDES", {"devstral:24b": 32768})
+
+    assert agent_loop.resolve_ollama_num_ctx("devstral:24b") == 32768
+
+
+def test_resolve_ollama_num_ctx_falls_back_to_global_default(monkeypatch):
+    monkeypatch.setattr(agent_loop, "_OLLAMA_NUM_CTX_OVERRIDES", {"devstral:24b": 32768})
+    monkeypatch.setattr(agent_loop, "OLLAMA_NUM_CTX", 8192)
+
+    assert agent_loop.resolve_ollama_num_ctx("qwen3:8b") == 8192
+
+
 def test_call_model_turn_ollama_sends_temperature_zero_by_default(monkeypatch):
     captured = {}
     client = MagicMock()
@@ -892,6 +928,7 @@ def test_init_ollama_model_state_resolves_first_pulled_candidate(monkeypatch):
     resp = MagicMock()
     resp.json.return_value = {"models": [{"name": "llama3.1:latest"}]}
     monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda *a, **k: True)
     log = MagicMock()
 
     state = init_ollama_model_state(["qwen2.5-coder:7b", "llama3.1"], log, "coding agent")
@@ -905,11 +942,57 @@ def test_init_ollama_model_state_falls_back_to_first_candidate_with_warning(monk
         raise httpx.ConnectError("boom")
 
     monkeypatch.setattr(agent_loop.httpx, "get", fake_get)
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda *a, **k: True)
     log = MagicMock()
 
     state = init_ollama_model_state(["qwen2.5-coder:7b", "llama3.1"], log, "coding agent")
 
     assert state["active"] == "qwen2.5-coder:7b"
+    log.warning.assert_called_once()
+
+
+def test_init_ollama_model_state_skips_candidate_that_fails_preflight(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "mistral:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda model, log: model != "llama3.1")
+    log = MagicMock()
+
+    state = init_ollama_model_state(["llama3.1", "mistral"], log, "coding agent")
+
+    assert state["active"] == "mistral"
+    assert state["tried"] == set()  # tried es para maybe_switch_ollama_model, no se ensucia con el preflight
+
+
+def test_init_ollama_model_state_falls_back_when_all_candidates_fail_preflight(monkeypatch):
+    resp = MagicMock()
+    resp.json.return_value = {"models": [{"name": "llama3.1:latest"}, {"name": "mistral:latest"}]}
+    monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda *a, **k: False)
+    log = MagicMock()
+
+    state = init_ollama_model_state(["llama3.1", "mistral"], log, "coding agent")
+
+    assert state["active"] == "llama3.1"  # cae al primero de la lista igual (best-effort)
+    assert log.warning.called
+
+
+def test_verify_ollama_model_loads_true_on_success(monkeypatch):
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    monkeypatch.setattr(agent_loop.httpx, "post", lambda *a, **k: resp)
+
+    assert agent_loop.verify_ollama_model_loads("llama3.1", MagicMock()) is True
+
+
+def test_verify_ollama_model_loads_false_on_timeout(monkeypatch):
+    def fake_post(*a, **k):
+        raise httpx.ConnectTimeout("boom")
+
+    monkeypatch.setattr(agent_loop.httpx, "post", fake_post)
+    log = MagicMock()
+
+    assert agent_loop.verify_ollama_model_loads("llama3.1", log) is False
     log.warning.assert_called_once()
 
 

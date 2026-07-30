@@ -877,8 +877,9 @@ def test_main_dispatches_backend_agent_mode(monkeypatch, tmp_path):
 
     captured = {}
 
-    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT):
+    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT, ollama_candidates=None):
         captured["system_prompt"] = system_prompt
+        captured["ollama_candidates"] = ollama_candidates
         return {"status": "done", "summary": "ok", "files_changed": []}
 
     monkeypatch.setattr(ca, "run_coding_agent", fake_run_coding_agent)
@@ -888,6 +889,7 @@ def test_main_dispatches_backend_agent_mode(monkeypatch, tmp_path):
     ca.main()
 
     assert captured["system_prompt"] == ca.BACKEND_AGENT_SYSTEM_PROMPT
+    assert captured["ollama_candidates"] == ca.BACKEND_AGENT_OLLAMA_MODELS
 
 
 def test_main_dispatches_frontend_agent_mode(monkeypatch, tmp_path):
@@ -897,8 +899,9 @@ def test_main_dispatches_frontend_agent_mode(monkeypatch, tmp_path):
 
     captured = {}
 
-    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT):
+    async def fake_run_coding_agent(ticket_id, prompt, target_repo_dir, resume_messages=None, resume_state=None, system_prompt=ca.CODING_AGENT_SYSTEM_PROMPT, ollama_candidates=None):
         captured["system_prompt"] = system_prompt
+        captured["ollama_candidates"] = ollama_candidates
         return {"status": "done", "summary": "ok", "files_changed": []}
 
     monkeypatch.setattr(ca, "run_coding_agent", fake_run_coding_agent)
@@ -908,6 +911,7 @@ def test_main_dispatches_frontend_agent_mode(monkeypatch, tmp_path):
     ca.main()
 
     assert captured["system_prompt"] == ca.FRONTEND_AGENT_SYSTEM_PROMPT
+    assert captured["ollama_candidates"] == ca.FRONTEND_AGENT_OLLAMA_MODELS
 
 
 def test_main_dispatches_coding_agent_review_mode(monkeypatch, tmp_path):
@@ -1366,6 +1370,11 @@ def _mock_ollama_tags(monkeypatch, model_names):
     resp = MagicMock()
     resp.json.return_value = {"models": [{"name": n} for n in model_names]}
     monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    # Preflight de carga real (verify_ollama_model_loads) -- sin esto, cada
+    # test que llega a init_ollama_model_state con un modelo real resuelto
+    # dispararia un httpx.post real contra un Ollama que no existe en el
+    # entorno de tests.
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda *a, **k: True)
 
 
 def test_run_coding_agent_switches_ollama_model_when_json_invalid_persists(monkeypatch, tmp_path):

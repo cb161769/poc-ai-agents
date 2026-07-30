@@ -189,6 +189,7 @@ def _mock_ollama_tags(monkeypatch, model_names):
     resp = MagicMock()
     resp.json.return_value = {"models": [{"name": n} for n in model_names]}
     monkeypatch.setattr(agent_loop.httpx, "get", lambda *a, **k: resp)
+    monkeypatch.setattr(agent_loop, "verify_ollama_model_loads", lambda *a, **k: True)
 
 
 def test_plan_epic_switches_ollama_model_when_json_invalid_persists(monkeypatch):

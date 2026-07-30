@@ -72,6 +72,38 @@ OLLAMA_TIMEOUT_SECONDS = float(os.environ.get("OLLAMA_TIMEOUT_SECONDS", "300"))
 # Ollama como unico backend (Anthropic sin credito), el patron recurrente
 # fue JSON vacio/invalido en las respuestas finales.
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+# Override por modelo -- OLLAMA_NUM_CTX de arriba es un solo valor global
+# aplicado a TODOS los modelos Ollama sin importar cual este activo. Gap
+# real: modelos con ventana de contexto nativa mucho mayor (devstral:24b/
+# gpt-oss:20b, 128K real) corrian igual capados al mismo 8192 que un modelo
+# chico como qwen3:8b. Formato "modelo=valor,modelo=valor" (mismo espiritu
+# que las listas de candidatos de mas abajo, pero clave-valor). Sin entrada
+# para un modelo -> se usa OLLAMA_NUM_CTX sin cambios.
+_OLLAMA_NUM_CTX_OVERRIDES = {}
+for _pair in os.environ.get("OLLAMA_NUM_CTX_OVERRIDES", "").split(","):
+    _pair = _pair.strip()
+    if not _pair or "=" not in _pair:
+        continue
+    _model, _value = _pair.split("=", 1)
+    _model = _model.strip()
+    try:
+        _OLLAMA_NUM_CTX_OVERRIDES[_model] = int(_value.strip())
+    except ValueError:
+        continue
+
+
+def resolve_ollama_num_ctx(model: str) -> int:
+    return _OLLAMA_NUM_CTX_OVERRIDES.get(model, OLLAMA_NUM_CTX)
+
+
+# Ollama descarga un modelo de memoria tras 5 minutos de inactividad por
+# default -- costo de recarga chico con qwen3:8b (5.2GB), mucho mayor con
+# devstral:24b/gpt-oss:20b (14GB c/u). Una epica secuencial real tiene
+# huecos de inactividad reales entre historias (confirmaciones humanas,
+# llamadas a Jira, corridas de tests) que pueden superar los 5 minutos.
+# Formato: el mismo que Ollama ya acepta nativamente (docs.ollama.com),
+# ej. "30m", "-1" (nunca descargar).
+OLLAMA_KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "30m")
 # Sin esto, Ollama usa la temperatura default del modelo (tipicamente ~0.7-0.8,
 # pensada para charla natural) para TODO -- incluida la respuesta final que
 # coding_agent.py/judge_agent.py esperan como JSON estricto. Mas creatividad
@@ -229,22 +261,53 @@ def maybe_switch_ollama_model(model_state: dict, backend: str, candidates: list,
     return True
 
 
+def verify_ollama_model_loads(model: str, log) -> bool:
+    """Preflight real: 'ollama list' (resolve_ollama_model) solo confirma
+    que el modelo esta 'pulled' -- no que efectivamente carga en la memoria
+    disponible AHORA MISMO. Con modelos grandes (14GB+, ej. devstral:24b/
+    gpt-oss:20b) en una VM con presupuesto ajustado, un fallo de carga real
+    (OOM) recien se veia a mitad de una conversacion multi-turno ya en
+    curso -- esto lo atrapa ANTES de gastar turnos reales. POST /api/generate
+    con prompt vacio es el patron documentado por Ollama para forzar/
+    verificar la carga sin generar tokens reales. Timeout separado de
+    OLLAMA_TIMEOUT_SECONDS (esto es solo carga, no generacion real -- no
+    deberia tardar minutos si el modelo entra en memoria).
+    """
+    try:
+        resp = httpx.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": model, "prompt": "", "stream": False},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        return True
+    except httpx.HTTPError as exc:
+        log.warning(f"verify_ollama_model_loads: '{model}' no cargo (preflight) -- {exc}")
+        return False
+
+
 def init_ollama_model_state(candidates: list, log, agent_label: str) -> dict:
     """Resuelve el modelo activo inicial de la lista de candidatos (el
-    primero realmente descargado) y arma el dict de estado que
+    primero realmente descargado Y que carga de verdad, ver
+    verify_ollama_model_loads) y arma el dict de estado que
     maybe_switch_ollama_model() espera. Si ningun candidato aparece en
-    'ollama list' (servidor caido, o ninguno pulled todavia), cae al
-    primero de la lista igual -- mismo comportamiento best-effort que ya
-    tenia _ollama_model_available: se deja que la corrida real falle mas
-    adelante con un error concreto, en vez de bloquear aca sobre un
-    chequeo que puede tener falsos negativos.
+    'ollama list' (servidor caido, o ninguno pulled todavia) o ninguno pasa
+    el preflight de carga, cae al primero de la lista igual -- mismo
+    comportamiento best-effort que ya tenia _ollama_model_available: se deja
+    que la corrida real falle mas adelante con un error concreto, en vez de
+    bloquear aca sobre un chequeo que puede tener falsos negativos.
     """
-    active = resolve_ollama_model(candidates)
+    tried = set()
+    active = resolve_ollama_model(candidates, exclude=tried)
+    while active is not None and not verify_ollama_model_loads(active, log):
+        log.warning(f"{agent_label}: '{active}' fallo el preflight de carga -- probando el siguiente candidato.")
+        tried.add(active)
+        active = resolve_ollama_model(candidates, exclude=tried)
     if active is None:
         active = candidates[0]
         log.warning(
-            f"{agent_label}: ninguno de los modelos candidatos {candidates} aparece en 'ollama list' -- "
-            "probablemente falta 'ollama pull', la corrida va a fallar mas adelante si es asi."
+            f"{agent_label}: ninguno de los modelos candidatos {candidates} aparece en 'ollama list' o paso "
+            "el preflight de carga -- la corrida va a fallar mas adelante si es asi."
         )
     return {"active": active, "tried": set(), "switch_used": False}
 
@@ -544,9 +607,10 @@ async def _call_model_turn(
             "model": ollama_model,
             "messages": ollama_messages,
             "stream": False,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {
                 "num_predict": MODEL_LIMITS["ollama"]["max_tokens"],
-                "num_ctx": OLLAMA_NUM_CTX,
+                "num_ctx": resolve_ollama_num_ctx(ollama_model),
                 "temperature": OLLAMA_TEMPERATURE,
             },
         }

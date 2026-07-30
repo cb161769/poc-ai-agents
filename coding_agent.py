@@ -96,6 +96,23 @@ MIN_TURNS_AFTER_MODEL_SWITCH = int(os.environ.get("CODING_AGENT_MIN_TURNS_AFTER_
 # generico OLLAMA_MODEL) se comporta igual que antes de esto.
 CODING_AGENT_OLLAMA_MODELS = parse_ollama_model_candidates(os.environ.get("CODING_AGENT_OLLAMA_MODEL", ""), OLLAMA_MODEL)
 
+# Candidatos por rol para los 2 sub-agentes y el revisor (pedido explicito
+# del usuario) -- vacios por default, caen a CODING_AGENT_OLLAMA_MODELS
+# ENTERO (la lista completa, no un solo elemento -- por eso no se usa el
+# parametro "default" de parse_ollama_model_candidates aca, que arma una
+# lista de UN solo candidato) sin cambiar nada para quien no los setee. El
+# reviewer es de solo lectura -- no necesita el modelo mas grande, por eso
+# su default tambien es el general en vez de forzar algo mas chico sin que
+# el operador lo pida.
+def _role_ollama_candidates(env_var: str) -> list:
+    raw = os.environ.get(env_var, "").strip()
+    return parse_ollama_model_candidates(raw, OLLAMA_MODEL) if raw else CODING_AGENT_OLLAMA_MODELS
+
+
+BACKEND_AGENT_OLLAMA_MODELS = _role_ollama_candidates("BACKEND_AGENT_OLLAMA_MODEL")
+FRONTEND_AGENT_OLLAMA_MODELS = _role_ollama_candidates("FRONTEND_AGENT_OLLAMA_MODEL")
+CODING_AGENT_REVIEW_OLLAMA_MODELS = _role_ollama_candidates("CODING_AGENT_REVIEW_OLLAMA_MODEL")
+
 # Limites defensivos de las tools locales: un archivo/salida/listado gigante
 # no debe reventar el contexto del modelo ni colgar el loop. _MAX_READ_BYTES
 # bajo de 200_000 a 60_000 (~15k tokens estimados) -- el valor anterior
@@ -1893,6 +1910,7 @@ async def run_coding_agent(
     resume_messages: list = None,
     resume_state: dict = None,
     system_prompt: str = CODING_AGENT_SYSTEM_PROMPT,
+    ollama_candidates: list = None,
 ) -> dict:
     """Si resume_messages viene seteado (reintento tras un veredicto FLAGGED
     retryable del juez -- ver retry_coding_agent_with_feedback() en
@@ -1909,7 +1927,14 @@ async def run_coding_agent(
     con TEST_WRITER_SYSTEM_PROMPT en su lugar -- esos mecanismos son
     genericos (no dependen del texto del prompt), asi que no hace falta
     duplicar el loop para un agente con un objetivo mas acotado.
+
+    ollama_candidates: swappable igual que system_prompt (pedido explicito
+    del usuario) -- default None usa CODING_AGENT_OLLAMA_MODELS sin cambiar
+    nada para quien no lo pase. backend_agent/frontend_agent/coding_agent_review
+    (main(), mas abajo) resuelven su propia lista via BACKEND_AGENT_OLLAMA_MODEL/
+    FRONTEND_AGENT_OLLAMA_MODEL/CODING_AGENT_REVIEW_OLLAMA_MODEL.
     """
+    ollama_candidates = ollama_candidates or CODING_AGENT_OLLAMA_MODELS
     backend = _select_backend()
     logger.info(f"coding agent: usando backend '{backend}'")
     if backend == "none":
@@ -1920,9 +1945,9 @@ async def run_coding_agent(
     # el loop si Anthropic falla a mitad de corrida) pero sin gastar una
     # llamada de red de arranque que no aporta nada en el caso comun.
     if backend == "ollama":
-        ollama_model_state = init_ollama_model_state(CODING_AGENT_OLLAMA_MODELS, logger, "coding agent")
+        ollama_model_state = init_ollama_model_state(ollama_candidates, logger, "coding agent")
     else:
-        ollama_model_state = {"active": CODING_AGENT_OLLAMA_MODELS[0], "tried": set(), "switch_used": False}
+        ollama_model_state = {"active": ollama_candidates[0], "tried": set(), "switch_used": False}
 
     start_time = time.monotonic()
     total_input_tokens = 0
@@ -2045,7 +2070,7 @@ async def run_coding_agent(
                         tool_call_nudge_given
                         and _TOOL_CALL_REFUSAL_PATTERN.search(final_text)
                         and maybe_switch_ollama_model(
-                            ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                            ollama_model_state, backend, ollama_candidates, logger,
                             "coding agent", "se nego a llamar la tool incluso tras el nudge",
                         )
                     ):
@@ -2095,7 +2120,7 @@ async def run_coding_agent(
                                 raise json.JSONDecodeError("falta 'status' valido en el JSON", retry_text, 0)
                         except json.JSONDecodeError:
                             if maybe_switch_ollama_model(
-                                ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                                ollama_model_state, backend, ollama_candidates, logger,
                                 "coding agent", "JSON invalido incluso tras el reintento de correccion",
                             ):
                                 turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
@@ -2106,7 +2131,7 @@ async def run_coding_agent(
                         result.get("status") == "blocked"
                         and _JSON_CONFUSION_BLOCKED_PATTERN.search(result.get("summary", ""))
                         and maybe_switch_ollama_model(
-                            ollama_model_state, backend, CODING_AGENT_OLLAMA_MODELS, logger,
+                            ollama_model_state, backend, ollama_candidates, logger,
                             "coding agent",
                             "reporto 'blocked' citando su propia confusion sobre el formato JSON, no una ambiguedad real del ticket",
                         )
@@ -2320,6 +2345,7 @@ async def run_coding_agent_review(ticket_id: str, diff_text: str, sub_agent_role
     )
     return await run_coding_agent(
         ticket_id, prompt, target_repo_dir, system_prompt=CODING_AGENT_REVIEW_SYSTEM_PROMPT,
+        ollama_candidates=CODING_AGENT_REVIEW_OLLAMA_MODELS,
     )
 
 
@@ -2380,6 +2406,7 @@ def main():
                     resume_messages=payload.get("resume_messages"),
                     resume_state=payload.get("resume_state"),
                     system_prompt=BACKEND_AGENT_SYSTEM_PROMPT,
+                    ollama_candidates=BACKEND_AGENT_OLLAMA_MODELS,
                 )
             )
         elif payload.get("mode") == "frontend_agent":
@@ -2391,6 +2418,7 @@ def main():
                     resume_messages=payload.get("resume_messages"),
                     resume_state=payload.get("resume_state"),
                     system_prompt=FRONTEND_AGENT_SYSTEM_PROMPT,
+                    ollama_candidates=FRONTEND_AGENT_OLLAMA_MODELS,
                 )
             )
         # mode="coding_agent_review": "el coding agent sera el juez" (pedido
