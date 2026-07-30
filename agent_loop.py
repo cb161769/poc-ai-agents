@@ -21,6 +21,7 @@ import os
 import re
 from contextlib import AsyncExitStack
 
+import anyio
 import httpx
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
@@ -906,17 +907,29 @@ async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: 
     Cada conexion tiene un timeout real (MCP_CONNECT_TIMEOUT_SECONDS) -- sin
     esto, un servidor que se cuelga (no falla, no responde) bloquea toda la
     corrida sin limite.
+
+    Bug real confirmado en vivo (epica KAN-4, relanzamiento tras el fix de
+    timeout): asyncio.wait_for(stack.enter_async_context(...)) crasheaba
+    epic_planner.py con "RuntimeError: Attempted to exit cancel scope in a
+    different task than it was entered in". stdio_client()/ClientSession()
+    son context managers basados en cancel scopes de anyio -- anyio exige
+    que el mismo TASK que entra a un cancel scope sea el que lo cierra.
+    asyncio.wait_for() (en esta version de Python) ejecuta la corrutina
+    envuelta en un Task nuevo separado -- el __aenter__ corria ahi, pero
+    AsyncExitStack difiere el __aexit__ para mas adelante, cuando el "async
+    with AsyncExitStack()" del caller cierra -- en el Task ORIGINAL, no en
+    el Task temporal que wait_for creo. anyio.fail_after() no tiene este
+    problema: crea su cancel scope en el Task actual (sin Task nuevo), que
+    es exactamente el patron seguro que anyio documenta para timeouts sobre
+    sus propios context managers.
     """
     sessions = {}
     for name, params in mcp_servers.items():
         try:
-            read, write = await asyncio.wait_for(
-                stack.enter_async_context(stdio_client(params)), timeout=MCP_CONNECT_TIMEOUT_SECONDS
-            )
-            session = await asyncio.wait_for(
-                stack.enter_async_context(ClientSession(read, write)), timeout=MCP_CONNECT_TIMEOUT_SECONDS
-            )
-            await asyncio.wait_for(session.initialize(), timeout=MCP_CONNECT_TIMEOUT_SECONDS)
+            with anyio.fail_after(MCP_CONNECT_TIMEOUT_SECONDS):
+                read, write = await stack.enter_async_context(stdio_client(params))
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
             sessions[name] = session
         except Exception as exc:
             logger.warning(f"{label}: no se pudo conectar al MCP '{name}', se omite: {exc}")
