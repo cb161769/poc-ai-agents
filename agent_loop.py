@@ -908,28 +908,46 @@ async def _connect_mcp_servers(stack: AsyncExitStack, mcp_servers: dict, label: 
     esto, un servidor que se cuelga (no falla, no responde) bloquea toda la
     corrida sin limite.
 
-    Bug real confirmado en vivo (epica KAN-4, relanzamiento tras el fix de
-    timeout): asyncio.wait_for(stack.enter_async_context(...)) crasheaba
-    epic_planner.py con "RuntimeError: Attempted to exit cancel scope in a
-    different task than it was entered in". stdio_client()/ClientSession()
-    son context managers basados en cancel scopes de anyio -- anyio exige
-    que el mismo TASK que entra a un cancel scope sea el que lo cierra.
-    asyncio.wait_for() (en esta version de Python) ejecuta la corrutina
-    envuelta en un Task nuevo separado -- el __aenter__ corria ahi, pero
-    AsyncExitStack difiere el __aexit__ para mas adelante, cuando el "async
-    with AsyncExitStack()" del caller cierra -- en el Task ORIGINAL, no en
-    el Task temporal que wait_for creo. anyio.fail_after() no tiene este
-    problema: crea su cancel scope en el Task actual (sin Task nuevo), que
-    es exactamente el patron seguro que anyio documenta para timeouts sobre
-    sus propios context managers.
+    Segundo bug real confirmado en vivo (epica KAN-4, DOS relanzamientos
+    seguidos): ni asyncio.wait_for(stack.enter_async_context(...)) NI
+    anyio.fail_after(...) alrededor de ese mismo enter_async_context son
+    seguros cuando 'stack' es un AsyncExitStack de vida larga (la sesion
+    tiene que seguir usable el resto del turno completo, no solo durante la
+    conexion). stdio_client()/ClientSession() son context managers basados
+    en cancel scopes de anyio, que exigen nesting ESTRICTO tipo LIFO: un
+    scope entrado DENTRO de otro scope tiene que cerrar ANTES de que el
+    scope exterior cierre. Un "with anyio.fail_after(...):" que envuelve
+    solo la ENTRADA (no toda la vida util de la sesion) cierra su propio
+    scope apenas termina ese bloque -- pero AsyncExitStack.enter_async_context
+    difiere el __aexit__ real para mucho mas adelante (cuando el "async with
+    AsyncExitStack()" del CALLER cierra, potencialmente turnos despues) --
+    violando ese nesting LIFO en el momento en que esa salida diferida
+    finalmente corre. Confirmado en vivo con mcp-server-qdrant real (no un
+    mock): con fail_after, CADA conexion fallaba con "Attempted to exit a
+    cancel scope that isn't the current task's current cancel scope"; sin
+    ningun wrapper, la misma conexion funciona bien (probado directo).
+
+    Fix real: probar la conexion en un AsyncExitStack PROPIO, chico, que
+    entra Y sale DENTRO del mismo bloque fail_after (nesting LIFO respetado
+    -- todo lo que entra ahi tambien sale ahi) -- si eso no tira excepcion
+    ni tarda de mas, el servidor esta sano. Recien ahi se hace la conexion
+    REAL en el 'stack' del caller (de vida larga), sin ningun wrapper de
+    timeout -- ya sabemos que conecta rapido por el probe, así que un
+    cuelgue genuino aca (mismo servidor, milisegundos despues) es un caso
+    mucho mas raro que el bug original (un uvx colgado por un blip de red).
     """
     sessions = {}
     for name, params in mcp_servers.items():
         try:
             with anyio.fail_after(MCP_CONNECT_TIMEOUT_SECONDS):
-                read, write = await stack.enter_async_context(stdio_client(params))
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
+                async with AsyncExitStack() as probe_stack:
+                    probe_read, probe_write = await probe_stack.enter_async_context(stdio_client(params))
+                    probe_session = await probe_stack.enter_async_context(ClientSession(probe_read, probe_write))
+                    await probe_session.initialize()
+
+            read, write = await stack.enter_async_context(stdio_client(params))
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
             sessions[name] = session
         except Exception as exc:
             logger.warning(f"{label}: no se pudo conectar al MCP '{name}', se omite: {exc}")

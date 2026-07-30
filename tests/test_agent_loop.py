@@ -5,6 +5,7 @@ httpx.AsyncClient.post and _call_model_turn are mocked.
 """
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1330,6 +1331,43 @@ def test_normalize_tool_schema_does_not_exclude_unrelated_tools():
     assert [t["name"] for t in tools] == ["qdrant-rag__qdrant-find"]
 
 
+class _HangingAsyncCM:
+    """Simula stdio_client(params) colgado -- __aenter__ nunca vuelve, igual
+    que el proceso <defunct> real confirmado con 'docker top' (uvx colgado
+    por un blip de red)."""
+
+    async def __aenter__(self):
+        await asyncio.sleep(999)
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FakeAsyncCM:
+    """stdio_client(params)/ClientSession(read, write) real son context
+    managers de verdad (__aenter__/__aexit__) -- _connect_mcp_servers ahora
+    los entra en un AsyncExitStack REAL (ver el bug de nesting LIFO de
+    cancel scopes documentado ahi), asi que los mocks tienen que comportarse
+    como context managers reales tambien, no solo devolver un valor plano."""
+
+    def __init__(self, value):
+        self._value = value
+
+    async def __aenter__(self):
+        return self._value
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+class _FailingAsyncCM:
+    async def __aenter__(self):
+        raise ConnectionError("no se pudo conectar")
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
 def test_connect_mcp_servers_times_out_instead_of_hanging_forever(monkeypatch):
     """Gap real confirmado en vivo (epica KAN-4): un blip transitorio de red
     (PyPI timeout) al buscar un paquete MCP via uvx dejo al proceso hijo en
@@ -1339,13 +1377,9 @@ def test_connect_mcp_servers_times_out_instead_of_hanging_forever(monkeypatch):
     indefinidamente. Con timeout, se degrada a 'servidor omitido' -- mismo
     comportamiento que cualquier otro servidor no disponible."""
     monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: _HangingAsyncCM())
 
-    class HangingStack:
-        async def enter_async_context(self, cm):
-            await asyncio.sleep(999)  # nunca vuelve -- simula el proceso colgado real
-
-    result = asyncio.run(_connect_mcp_servers(HangingStack(), {"qdrant-rag": object()}, label="test"))
+    result = asyncio.run(_connect_mcp_servers(AsyncExitStack(), {"qdrant-rag": object()}, label="test"))
 
     assert result == {}
 
@@ -1354,31 +1388,65 @@ def test_connect_mcp_servers_still_connects_when_fast(monkeypatch):
     """El timeout no deberia romper el camino feliz -- una conexion real y
     rapida sigue funcionando igual que antes."""
     monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 5.0)
-    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: _FakeAsyncCM(("read", "write")))
     fake_session = MagicMock()
     fake_session.initialize = AsyncMock(return_value=None)
+    monkeypatch.setattr(agent_loop, "ClientSession", lambda read, write: _FakeAsyncCM(fake_session))
 
-    class FastStack:
-        async def enter_async_context(self, cm):
-            if cm is fake_session:
-                return fake_session
-            return ("read", "write")
-
-    monkeypatch.setattr(agent_loop, "ClientSession", lambda read, write: fake_session)
-
-    result = asyncio.run(_connect_mcp_servers(FastStack(), {"qdrant-rag": object()}, label="test"))
+    result = asyncio.run(_connect_mcp_servers(AsyncExitStack(), {"qdrant-rag": object()}, label="test"))
 
     assert result == {"qdrant-rag": fake_session}
 
 
 def test_connect_mcp_servers_skips_server_that_fails_immediately(monkeypatch):
     monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 5.0)
-    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: object())
+    monkeypatch.setattr(agent_loop, "stdio_client", lambda params: _FailingAsyncCM())
 
-    class FailingStack:
-        async def enter_async_context(self, cm):
-            raise ConnectionError("no se pudo conectar")
-
-    result = asyncio.run(_connect_mcp_servers(FailingStack(), {"qdrant-rag": object()}, label="test"))
+    result = asyncio.run(_connect_mcp_servers(AsyncExitStack(), {"qdrant-rag": object()}, label="test"))
 
     assert result == {}
+
+
+def test_connect_mcp_servers_probe_and_real_connection_stay_in_lifo_order(monkeypatch):
+    """Bug real confirmado en vivo (epica KAN-4, relanzamiento con mcp-server-
+    qdrant real, no un mock): envolver stack.enter_async_context(...) en un
+    timeout que cierra su cancel scope ANTES de que el recurso realmente
+    entrado se cierre (diferido al AsyncExitStack de vida larga del caller)
+    viola el nesting LIFO que anyio exige -- crasheaba con 'Attempted to
+    exit a cancel scope that isn't the current task's current cancel scope'
+    en CADA conexion real, no solo cuando de verdad se cuelga. El fix prueba
+    la conexion en un AsyncExitStack propio que entra Y sale DENTRO del
+    mismo bloque de timeout, y solo despues hace la conexion real sin
+    ningun wrapper -- confirmado que stdio_client/ClientSession se llaman
+    una vez para el probe y otra vez para la conexion real que sobrevive
+    al retorno de la funcion."""
+    monkeypatch.setattr(agent_loop, "MCP_CONNECT_TIMEOUT_SECONDS", 5.0)
+    stdio_client_calls = []
+    client_session_calls = []
+
+    def fake_stdio_client(params):
+        stdio_client_calls.append(params)
+        return _FakeAsyncCM(("read", "write"))
+
+    def fake_client_session(read, write):
+        client_session_calls.append((read, write))
+        fake_session = MagicMock()
+        fake_session.initialize = AsyncMock(return_value=None)
+        return _FakeAsyncCM(fake_session)
+
+    monkeypatch.setattr(agent_loop, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(agent_loop, "ClientSession", fake_client_session)
+
+    async def run():
+        async with AsyncExitStack() as stack:
+            sessions = await _connect_mcp_servers(stack, {"qdrant-rag": object()}, label="test")
+            assert "qdrant-rag" in sessions
+        return sessions
+
+    result = asyncio.run(run())
+
+    assert "qdrant-rag" in result
+    # probe + conexion real -- 2 llamadas cada uno, no 1 (el probe se cierra
+    # solo, la conexion real queda viva hasta que el stack del caller cierra).
+    assert len(stdio_client_calls) == 2
+    assert len(client_session_calls) == 2
