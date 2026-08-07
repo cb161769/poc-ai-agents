@@ -1658,15 +1658,18 @@ def _blast_radius(component: str, files_touched: list) -> int:
     return 5
 
 
-def decide_policy(risk_score: float, blast_radius: int, trust: float, judge_verdict: dict | None, consecutive_ok: int = 0) -> str:
+OPA_URL = os.environ.get("OPA_URL", "http://localhost:8181")
+
+
+def _decide_policy_python(risk_score: float, blast_radius: int, trust: float, judge_verdict: dict | None, consecutive_ok: int = 0) -> str:
     """AUTO_SHIP / AUTO_WITH_CHECKS / REQUIRES_REVIEW / HUMAN_APPROVAL / BLOCK
     -- pseudocodigo del artefacto "Autonomy Is Earned" §17. Orden de
     precedencia real: el veto del juez (BLOCK) y el blast radius/keywords
     criticos (HUMAN_APPROVAL) SIEMPRE ganan sobre trust -- un componente con
     trust alto en un cambio de blast radius 9+ nunca llega a AUTO_SHIP.
-    Se llama ANTES de tener judge_verdict tambien (pasando None) para decidir
-    si saltear el turno extra de coding-agent-review -- ver
-    _deliver_epic_sequential.
+
+    Misma logica exacta que policies/autonomy.rego -- este Python es el
+    FALLBACK de decide_policy() cuando OPA no responde, nunca al reves.
     """
     if (
         judge_verdict is not None
@@ -1681,6 +1684,39 @@ def decide_policy(risk_score: float, blast_radius: int, trust: float, judge_verd
     if trust >= 0.85 and risk_score < 0.2 and consecutive_ok >= 20:
         return "AUTO_SHIP"
     return "AUTO_WITH_CHECKS"
+
+
+_VALID_POLICY_DECISIONS = {"BLOCK", "HUMAN_APPROVAL", "REQUIRES_REVIEW", "AUTO_SHIP", "AUTO_WITH_CHECKS"}
+
+
+def decide_policy(risk_score: float, blast_radius: int, trust: float, judge_verdict: dict | None, consecutive_ok: int = 0) -> str:
+    """Policy as Code (pedido explicito del usuario) -- intenta OPA primero
+    (policies/autonomy.rego, la misma logica expresada en Rego para que sea
+    auditable/cambiable sin redeploy), cae a _decide_policy_python() si OPA
+    no responde o devuelve algo invalido. Mismo criterio best-effort que ya
+    usa _backend_available/Falco/MCP en todo este pipeline -- un OPA caido
+    nunca bloquea la epica, solo pierde la ventaja de policy-as-code por esa
+    corrida.
+    """
+    payload = {
+        "input": {
+            "risk_score": risk_score,
+            "blast_radius": blast_radius,
+            "trust": trust,
+            "consecutive_ok": consecutive_ok,
+            "judge_verdict": judge_verdict,
+            "retryable_policy_references": list(RETRYABLE_POLICY_REFERENCES),
+        }
+    }
+    try:
+        resp = httpx.post(f"{OPA_URL}/v1/data/autonomy/decision", json=payload, timeout=3.0)
+        resp.raise_for_status()
+        result = resp.json().get("result")
+        if result in _VALID_POLICY_DECISIONS:
+            return result
+    except (httpx.HTTPError, ValueError) as exc:
+        _log_best_effort("warning", f"decide_policy: OPA no disponible/invalido ({OPA_URL}) -- cae al fallback Python: {exc}")
+    return _decide_policy_python(risk_score, blast_radius, trust, judge_verdict, consecutive_ok=consecutive_ok)
 
 
 @task(retries=0, name="coding-agent-review")

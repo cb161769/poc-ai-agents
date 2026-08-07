@@ -2004,6 +2004,14 @@ def test_deliver_epic_sequential_skips_already_completed_child_but_processes_sib
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2169,6 +2177,14 @@ def test_deliver_epic_sequential_includes_epic_context_only_in_first_historia(mo
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2233,6 +2249,14 @@ def test_deliver_epic_sequential_passes_epic_context_to_judge(monkeypatch):
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2303,6 +2327,14 @@ def test_deliver_epic_sequential_passes_epic_context_to_test_plan_every_time(mon
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2371,6 +2403,14 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
 
     def fake_guard(diff_text, jira_context):
         guard_diffs.append(diff_text)
@@ -2448,6 +2488,14 @@ def test_deliver_epic_sequential_surfaces_push_failure_reason_in_epic_summary(mo
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2540,6 +2588,14 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2594,6 +2650,14 @@ def test_deliver_epic_sequential_posts_gap_classification_on_test_failure_block(
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "npm test fallo: capacitor no encontrado"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2666,6 +2730,14 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2721,6 +2793,14 @@ def test_deliver_epic_sequential_pr_body_describes_real_changes_not_raw_epic_des
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2777,6 +2857,14 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
@@ -2840,6 +2928,14 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2923,6 +3019,14 @@ def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_his
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2991,6 +3095,14 @@ def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_chi
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "==== 4 passed ===="})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3061,6 +3173,14 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3113,6 +3233,14 @@ def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monke
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -3165,6 +3293,14 @@ def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypat
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3308,6 +3444,14 @@ def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monk
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3361,6 +3505,14 @@ def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
     # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
     monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
     monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
+    # decide_policy() real intenta OPA por HTTP primero (Policy as Code) --
+    # sin este mock, CADA historia de CADA test de este archivo dispara un
+    # httpx.post real a un OPA que no esta corriendo en el entorno de tests,
+    # inflando el tiempo de la corrida entera con timeouts de conexion.
+    # AUTO_WITH_CHECKS = mismo comportamiento de siempre (nunca saltea el
+    # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
+    # aserción existente de estos tests.
+    monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3718,7 +3870,7 @@ def test_blast_radius_infra_config_is_max(monkeypatch):
 def test_decide_policy_judge_flagged_terminal_always_blocks(monkeypatch):
     verdict = {"verdict": "FLAGGED", "policy_reference": "not-a-real-policy-ref"}
 
-    result = orchestration.decide_policy(0.05, 1, 0.99, verdict, consecutive_ok=100)
+    result = orchestration._decide_policy_python(0.05, 1, 0.99, verdict, consecutive_ok=100)
 
     assert result == "BLOCK"
 
@@ -3727,7 +3879,7 @@ def test_decide_policy_judge_flagged_retryable_does_not_block(monkeypatch):
     from pipeline_shared import RETRYABLE_POLICY_REFERENCES
     verdict = {"verdict": "FLAGGED", "policy_reference": next(iter(RETRYABLE_POLICY_REFERENCES))}
 
-    result = orchestration.decide_policy(0.05, 1, 0.99, verdict, consecutive_ok=100)
+    result = orchestration._decide_policy_python(0.05, 1, 0.99, verdict, consecutive_ok=100)
 
     assert result != "BLOCK"
 
@@ -3735,25 +3887,25 @@ def test_decide_policy_judge_flagged_retryable_does_not_block(monkeypatch):
 def test_decide_policy_critical_blast_radius_forces_human_approval_even_with_high_trust(monkeypatch):
     """El caso de precedencia central del policy engine: trust alto y riesgo
     bajo NUNCA alcanzan para saltear un blast radius critico."""
-    result = orchestration.decide_policy(0.05, 9, 0.99, {"verdict": "OK"}, consecutive_ok=500)
+    result = orchestration._decide_policy_python(0.05, 9, 0.99, {"verdict": "OK"}, consecutive_ok=500)
 
     assert result == "HUMAN_APPROVAL"
 
 
 def test_decide_policy_low_trust_requires_review(monkeypatch):
-    result = orchestration.decide_policy(0.1, 2, 0.3, {"verdict": "OK"}, consecutive_ok=0)
+    result = orchestration._decide_policy_python(0.1, 2, 0.3, {"verdict": "OK"}, consecutive_ok=0)
 
     assert result == "REQUIRES_REVIEW"
 
 
 def test_decide_policy_high_risk_requires_review_even_with_high_trust(monkeypatch):
-    result = orchestration.decide_policy(0.6, 2, 0.95, {"verdict": "OK"}, consecutive_ok=50)
+    result = orchestration._decide_policy_python(0.6, 2, 0.95, {"verdict": "OK"}, consecutive_ok=50)
 
     assert result == "REQUIRES_REVIEW"
 
 
 def test_decide_policy_auto_ship_needs_trust_low_risk_and_streak(monkeypatch):
-    result = orchestration.decide_policy(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=20)
+    result = orchestration._decide_policy_python(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=20)
 
     assert result == "AUTO_SHIP"
 
@@ -3761,15 +3913,66 @@ def test_decide_policy_auto_ship_needs_trust_low_risk_and_streak(monkeypatch):
 def test_decide_policy_auto_ship_denied_without_streak(monkeypatch):
     """Trust y riesgo alcanzan, pero sin las 20 corridas limpias seguidas
     todavia no se gano AUTO_SHIP."""
-    result = orchestration.decide_policy(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=3)
+    result = orchestration._decide_policy_python(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=3)
 
     assert result == "AUTO_WITH_CHECKS"
 
 
 def test_decide_policy_default_is_auto_with_checks(monkeypatch):
-    result = orchestration.decide_policy(0.3, 4, 0.6, None, consecutive_ok=0)
+    result = orchestration._decide_policy_python(0.3, 4, 0.6, None, consecutive_ok=0)
 
     assert result == "AUTO_WITH_CHECKS"
+
+
+def test_decide_policy_uses_opa_result_when_opa_responds(monkeypatch):
+    """Policy as Code (pedido explicito del usuario): decide_policy() usa OPA
+    como evaluador PRIMARIO -- si responde con una decision valida, esa es
+    la que se usa, no el fallback Python."""
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": "AUTO_SHIP"}
+        return resp
+
+    monkeypatch.setattr(orchestration.httpx, "post", fake_post)
+
+    result = orchestration.decide_policy(0.9, 9, 0.1, {"verdict": "OK"}, consecutive_ok=0)
+
+    # El resultado es el de OPA (AUTO_SHIP), aunque el fallback Python para
+    # estos mismos numeros daria HUMAN_APPROVAL (blast_radius=9) -- confirma
+    # que de verdad se esta usando la respuesta de OPA, no coincidencia.
+    assert result == "AUTO_SHIP"
+    assert captured["url"] == f"{orchestration.OPA_URL}/v1/data/autonomy/decision"
+    assert captured["json"]["input"]["blast_radius"] == 9
+
+
+def test_decide_policy_falls_back_to_python_when_opa_unreachable(monkeypatch):
+    def fake_post(url, json=None, timeout=None):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(orchestration.httpx, "post", fake_post)
+
+    result = orchestration.decide_policy(0.05, 1, 0.99, {"verdict": "OK"}, consecutive_ok=100)
+
+    assert result == "AUTO_SHIP"  # mismo resultado que _decide_policy_python daria
+
+
+def test_decide_policy_falls_back_to_python_when_opa_returns_invalid_decision(monkeypatch):
+    def fake_post(url, json=None, timeout=None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"result": "NOT_A_REAL_DECISION"}
+        return resp
+
+    monkeypatch.setattr(orchestration.httpx, "post", fake_post)
+
+    result = orchestration.decide_policy(0.3, 4, 0.6, None, consecutive_ok=0)
+
+    assert result == "AUTO_WITH_CHECKS"  # fallback Python, no el valor invalido de OPA
 
 
 def test_run_coding_agent_local_real_routes_backend_role_to_payload_mode(monkeypatch, tmp_path):

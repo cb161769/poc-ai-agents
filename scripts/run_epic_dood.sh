@@ -167,6 +167,7 @@ DOCKER_RUN=(docker run -i --rm --name "epic-run-${EPIC_KEY,,}-$(date +%s)"
   -e "FIREWALL_URL=http://poc-ai-firewall:8080"
   -e "OLLAMA_URL=http://poc-ollama:11434"
   -e "PREFECT_API_URL=http://poc-prefect-server:4200/api"
+  -e "OPA_URL=http://poc-opa:8181"
   --network poc-ai-agents_poc-net
   -w /target-repo
   poc-ai-agents-testrunner

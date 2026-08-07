@@ -319,6 +319,29 @@ services:
     networks:
       - poc-net
 
+  opa:
+    # Policy as Code ("Autonomy Is Earned", pedido explicito del usuario) --
+    # evaluador primario de decide_policy() (orchestration.py), con el
+    # Python de esa funcion como fallback si OPA no responde -- mismo
+    # criterio best-effort que ya rige Falco/MCP en este pipeline. Los
+    # umbrales reales viven en policies/autonomy.rego, montado read-only.
+    image: openpolicyagent/opa:latest
+    container_name: poc-opa
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./policies:/policies:ro
+    command: ["run", "--server", "--addr", "0.0.0.0:8181", "/policies"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8181/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - poc-net
+
 networks:
   poc-net:
     driver: bridge
