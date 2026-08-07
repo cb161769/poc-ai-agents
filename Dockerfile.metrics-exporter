@@ -1,0 +1,14 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY metrics_exporter.py trust_score.py log_utils.py ./
+
+RUN mkdir -p /app/logs
+
+EXPOSE 9105
+
+CMD ["uvicorn", "metrics_exporter:app", "--host", "0.0.0.0", "--port", "9105"]

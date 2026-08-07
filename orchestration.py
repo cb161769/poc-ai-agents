@@ -452,6 +452,42 @@ def rescan_sonar(target_repo_dir: str, component: str) -> list:
     return result.get("new_issues", [])
 
 
+@task(retries=0, name="scan-dependencies")
+def scan_dependencies_task(target_repo_dir: str) -> dict:
+    """SBOM + dependency scan + IaC scan (pedido explicito del usuario,
+    DevSecOps adicional) via trivy -- una sola herramienta para las 3 cosas,
+    ver scripts/scan_dependencies.sh. Best-effort real: un trivy caido o sin
+    Docker disponible nunca bloquea la epica, solo pierde esta evidencia
+    para esa corrida (mismo criterio que rescan_sonar/check_falco_correlation).
+    """
+    try:
+        result = json.loads(
+            _run(["bash", str(SCRIPT_DIR / "scripts" / "scan_dependencies.sh"), target_repo_dir], check=False)
+        )
+    except (json.JSONDecodeError, RuntimeError):
+        return {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": "scan_dependencies.sh fallo"}
+    return result
+
+
+def run_dast_scan(preview_url: str | None = None) -> dict:
+    """DAST real (pedido explicito del usuario) -- alcance honesto: este
+    pipeline no despliega un preview real de la app (no hay ambiente vivo
+    para atacar con OWASP ZAP u otra herramienta de DAST), asi que no hay
+    contra que correr un scan hoy. No-op por default (preview_url=None via
+    PREVIEW_URL en .env, que hoy no existe en ningun .env real de este repo)
+    -- documentado como inactivo en vez de fingir cobertura que no existe.
+    Se activa solo el dia que este pipeline despliegue un preview real:
+    quedaria wireado a "docker run --rm owasp/zap2docker-stable zap-baseline.py
+    -t {preview_url}" siguiendo el mismo patron que scan_dependencies.sh.
+    """
+    if not preview_url:
+        return {"scanned": False, "reason": "PREVIEW_URL no configurada -- este pipeline no despliega un preview real todavia, DAST queda inactivo por diseno"}
+    raise NotImplementedError(
+        "DAST real requiere un preview desplegado -- PREVIEW_URL esta seteada pero este pipeline "
+        "todavia no tiene el paso de deploy que lo generaria. Ver el docstring de run_dast_scan()."
+    )
+
+
 @task(retries=1, retry_delay_seconds=5, name="query-figma")
 def query_figma(figma_link: dict | None) -> dict | None:
     """Optional: only runs if the ticket's description carried a Figma link
@@ -1619,13 +1655,21 @@ def _files_touched_from_diff(diff_text: str) -> list:
     return [m.group(2) for m in _DIFF_HEADER_PATTERN.finditer(diff_text or "")]
 
 
-def _compute_risk_score(component: str, child: dict, files_touched: list, sonar_issues_count: int = 0) -> float:
+def _compute_risk_score(
+    component: str, child: dict, files_touched: list, sonar_issues_count: int = 0, critical_cve_count: int = 0,
+) -> float:
     """Tabla de pesos del artefacto "Autonomy Is Earned" §04, adaptada a los
     3 componentes reales de este repo -- 0.30 criticidad + 0.25 nodos :Risk
     previos + 0.15 hallazgos Sonar nuevos + 0.15 superficie de cambio + 0.15
     tipo de ticket. Un keyword critico en el ticket fuerza 1.0 de una, sin
     promediar con el resto (misma logica que blast radius mas abajo: algunas
     señales son un techo duro, no un factor mas).
+
+    critical_cve_count > 0 (scan_dependencies_task/trivy, DevSecOps
+    adicional pedido explicito del usuario) fuerza un PISO de 0.6 -- justo
+    por encima del umbral de REQUIRES_REVIEW (>0.5) de decide_policy(), sin
+    llegar al 1.0 de un keyword critico (una CVE conocida es real pero no
+    necesariamente tan grave como tocar auth/secrets directo).
     """
     ticket_text = f"{child.get('summary', '')} {child.get('description', '')}"
     if _CRITICAL_KEYWORDS.search(ticket_text):
@@ -1638,7 +1682,10 @@ def _compute_risk_score(component: str, child: dict, files_touched: list, sonar_
     type_score = _TICKET_TYPE_RISK_WEIGHT.get((child.get("issue_type") or "").lower(), 0.3)
 
     score = 0.30 * criticality + 0.25 * risk_node_score + 0.15 * sonar_score + 0.15 * surface_score + 0.15 * type_score
-    return max(0.0, min(1.0, score))
+    score = max(0.0, min(1.0, score))
+    if critical_cve_count > 0:
+        score = max(score, 0.6)
+    return score
 
 
 def _blast_radius(component: str, files_touched: list) -> int:
@@ -4000,6 +4047,19 @@ def _deliver_epic_sequential(
         )
 
         new_sonar_issues = rescan_sonar(target_repo_dir, child["repository_origen"])
+        # DevSecOps adicional (pedido explicito del usuario) -- SBOM +
+        # dependency + IaC scan via trivy, ver scan_dependencies_task.
+        # Best-effort: nunca bloquea la epica, solo alimenta risk_score mas
+        # abajo (ver el piso de 0.6 en _compute_risk_score si hay CVEs
+        # criticas nuevas).
+        dependency_scan = scan_dependencies_task(target_repo_dir)
+        # DAST -- inactivo por default (ver docstring de run_dast_scan), se
+        # activa solo si el operador configuro PREVIEW_URL en .env.
+        if os.environ.get("PREVIEW_URL"):
+            try:
+                run_dast_scan(os.environ.get("PREVIEW_URL"))
+            except NotImplementedError as exc:
+                _log_best_effort("warning", f"{child_id}: DAST configurado pero no implementado todavia -- {exc}")
         judge_verdict = _run_judge_safe(
             jira_context, firewall_result, "local_diff", diff_text, test_result["output"],
             self_review=agent_result.get("self_review"), falco_since=falco_since,
@@ -4062,7 +4122,10 @@ def _deliver_epic_sequential(
         # Best-effort total, igual que el calculo pre-juez de mas arriba.
         try:
             final_policy = decide_policy(
-                _compute_risk_score(component, child, _files_touched_from_diff(diff_text), len(new_sonar_issues or [])),
+                _compute_risk_score(
+                    component, child, _files_touched_from_diff(diff_text), len(new_sonar_issues or []),
+                    critical_cve_count=dependency_scan.get("critical_count", 0),
+                ),
                 _blast_radius(component, _files_touched_from_diff(diff_text)),
                 compute_trust_score(component), judge_verdict,
                 consecutive_ok=consecutive_ok_runs(component),

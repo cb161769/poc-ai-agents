@@ -342,6 +342,56 @@ services:
     networks:
       - poc-net
 
+  metrics-exporter:
+    # Observabilidad (pedido explicito del usuario) -- /metrics de Prometheus
+    # sobre los 4 logs JSONL de este pipeline (ver metrics_exporter.py).
+    build:
+      context: .
+      dockerfile: Dockerfile.metrics-exporter
+    container_name: poc-metrics-exporter
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    ports:
+      - "9105:9105"
+    networks:
+      - poc-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: poc-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - metrics-exporter
+    networks:
+      - poc-net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: poc-grafana
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # Solo para el demo local -- cambiar antes de exponer esto fuera de
+      # localhost (ver seccion "Riesgos aceptados" del README).
+      GF_SECURITY_ADMIN_PASSWORD: "LocalPoc_Admin_2026!"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - poc-net
+
 networks:
   poc-net:
     driver: bridge
@@ -354,3 +404,5 @@ volumes:
   sonar_bootstrap_state:
   ollama_models:
   prefect_data:
+  prometheus_data:
+  grafana_data:

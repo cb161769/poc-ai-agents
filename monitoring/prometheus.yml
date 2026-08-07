@@ -1,0 +1,16 @@
+# Config minima -- 2 targets reales, la unica infra de observabilidad que
+# este pipeline necesita hoy (Loki/Promtail serian mucho mas pesados para
+# lo que hace falta: 4 logs JSONL append-only, no logs de alto volumen).
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: poc-ai-agents-metrics-exporter
+    static_configs:
+      - targets: ["metrics-exporter:9105"]
+
+  - job_name: poc-ai-firewall
+    # El firewall ya expone /metrics en vivo (firewall_proxy.py) -- se
+    # scrapea directo, sin pasar por el exporter.
+    static_configs:
+      - targets: ["ai-firewall:8080"]

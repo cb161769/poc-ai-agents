@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: autonomy
+    folder: ""
+    type: file
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

@@ -100,16 +100,12 @@ def _recent_signals(component: str, limit: int = _TRUST_WINDOW) -> list:
     return signals[-limit:]
 
 
-def compute_trust_score(component: str) -> float:
-    """Sin corridas previas para este componente: 0.5 (prior neutral, tier
-    Unproven en el policy engine -- ver decide_policy en orchestration.py).
-    Nunca lanza -- un log corrupto/inaccesible degrada al mismo prior neutral,
-    mismo criterio best-effort que el resto de este modulo.
-    """
-    signals = _recent_signals(component)
-    if not signals:
-        return 0.5
-
+def _score_from_signals(signals: list) -> float:
+    """El calculo real de la formula, separado de compute_trust_score() para
+    que metrics_exporter.py (Fase 4, /metrics de Prometheus) pueda
+    reusarlo sobre TODOS los componentes de una sola lectura del log en vez
+    de re-leer el archivo entero una vez por componente via
+    compute_trust_score(). Misma formula, una sola fuente de verdad."""
     success_rate = sum(1 for s in signals if s.get("judge_verdict") == "OK") / len(signals)
 
     def _verification_clean(s: dict) -> bool:
@@ -132,6 +128,18 @@ def compute_trust_score(component: str) -> float:
         + _WEIGHT_TOOL_RELIABILITY * (1 - tool_fail_rate)
     )
     return max(0.0, min(1.0, score))
+
+
+def compute_trust_score(component: str) -> float:
+    """Sin corridas previas para este componente: 0.5 (prior neutral, tier
+    Unproven en el policy engine -- ver decide_policy en orchestration.py).
+    Nunca lanza -- un log corrupto/inaccesible degrada al mismo prior neutral,
+    mismo criterio best-effort que el resto de este modulo.
+    """
+    signals = _recent_signals(component)
+    if not signals:
+        return 0.5
+    return _score_from_signals(signals)
 
 
 def consecutive_ok_runs(component: str) -> int:

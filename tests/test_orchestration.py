@@ -2012,6 +2012,11 @@ def test_deliver_epic_sequential_skips_already_completed_child_but_processes_sib
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2185,6 +2190,11 @@ def test_deliver_epic_sequential_includes_epic_context_only_in_first_historia(mo
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2257,6 +2267,11 @@ def test_deliver_epic_sequential_passes_epic_context_to_judge(monkeypatch):
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2335,6 +2350,11 @@ def test_deliver_epic_sequential_passes_epic_context_to_test_plan_every_time(mon
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2411,6 +2431,11 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
 
     def fake_guard(diff_text, jira_context):
         guard_diffs.append(diff_text)
@@ -2496,6 +2521,11 @@ def test_deliver_epic_sequential_surfaces_push_failure_reason_in_epic_summary(mo
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2596,6 +2626,11 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2658,6 +2693,11 @@ def test_deliver_epic_sequential_posts_gap_classification_on_test_failure_block(
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "npm test fallo: capacitor no encontrado"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2738,6 +2778,11 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2801,6 +2846,11 @@ def test_deliver_epic_sequential_pr_body_describes_real_changes_not_raw_epic_des
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2865,6 +2915,11 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
@@ -2936,6 +2991,11 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3027,6 +3087,11 @@ def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_his
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -3103,6 +3168,11 @@ def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_chi
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "==== 4 passed ===="})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3181,6 +3251,11 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3241,6 +3316,11 @@ def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monke
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -3301,6 +3381,11 @@ def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypat
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3452,6 +3537,11 @@ def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monk
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3513,6 +3603,11 @@ def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
     # reviewer, nunca marca HUMAN_APPROVAL) para no cambiar ninguna
     # aserción existente de estos tests.
     monkeypatch.setattr(orchestration, "decide_policy", lambda *a, **k: "AUTO_WITH_CHECKS")
+    # scan_dependencies_task (Fase 4, DevSecOps adicional) es un @task nuevo
+    # -- sin mock, correria el subprocess/bash real (scripts/scan_dependencies.sh,
+    # que a su vez invoca "docker run ... aquasec/trivy") en cada historia
+    # de cada test de este archivo.
+    monkeypatch.setattr(orchestration, "scan_dependencies_task", lambda *a, **k: {"scanned": False, "critical_count": 0, "high_count": 0, "cves": [], "reason": None})
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -5550,6 +5645,73 @@ def test_rescan_sonar_returns_new_issues_from_script(monkeypatch):
     result = orchestration.rescan_sonar.fn("/repo", "AuthService")
 
     assert result == ["[MAJOR] rule:S1: x (linea 1)"]
+
+
+def test_scan_dependencies_task_returns_safe_default_when_script_fails(monkeypatch):
+    """scan_dependencies.sh es best-effort -- si falla o devuelve algo
+    invalido, nunca debe propagar la excepcion ni bloquear la epica."""
+    monkeypatch.setattr(orchestration, "_run", lambda *a, **k: "esto no es json")
+
+    result = orchestration.scan_dependencies_task.fn("/repo")
+
+    assert result["scanned"] is False
+    assert result["critical_count"] == 0
+
+
+def test_scan_dependencies_task_returns_cve_counts_from_script(monkeypatch):
+    monkeypatch.setattr(
+        orchestration, "_run",
+        lambda *a, **k: json.dumps({
+            "scanned": True, "critical_count": 2, "high_count": 5,
+            "cves": [{"id": "CVE-2026-1", "severity": "CRITICAL", "pkg": "left-pad", "target": "package.json"}],
+            "reason": None,
+        }),
+    )
+
+    result = orchestration.scan_dependencies_task.fn("/repo")
+
+    assert result["critical_count"] == 2
+    assert result["high_count"] == 5
+    assert len(result["cves"]) == 1
+
+
+def test_compute_risk_score_critical_cve_forces_floor_of_0_6(monkeypatch):
+    """Piso, no techo -- distinto de un keyword critico (que fuerza 1.0).
+    Una CVE real es una señal seria pero no automaticamente el maximo."""
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 0)
+    child = {"summary": "agregar un boton", "description": "", "issue_type": "Story"}
+
+    score = orchestration._compute_risk_score("Frontend", child, [], sonar_issues_count=0, critical_cve_count=1)
+
+    assert score >= 0.6
+
+
+def test_compute_risk_score_no_critical_cve_does_not_force_floor(monkeypatch):
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 0)
+    child = {"summary": "agregar un boton", "description": "", "issue_type": "Story"}
+
+    score = orchestration._compute_risk_score("Frontend", child, [], sonar_issues_count=0, critical_cve_count=0)
+
+    assert score < 0.6
+
+
+def test_run_dast_scan_is_a_documented_noop_without_preview_url():
+    """Alcance honesto (pedido explicito del usuario): sin un preview real
+    desplegado, DAST queda inactivo -- nunca finge cobertura que no existe."""
+    result = orchestration.run_dast_scan(None)
+
+    assert result["scanned"] is False
+    assert "PREVIEW_URL" in result["reason"]
+
+
+def test_run_dast_scan_raises_not_implemented_when_preview_url_is_set():
+    """Configurar PREVIEW_URL sin el paso de deploy real que lo genere debe
+    fallar RUIDOSAMENTE (NotImplementedError), no fingir un scan que nunca
+    corrio."""
+    import pytest
+
+    with pytest.raises(NotImplementedError):
+        orchestration.run_dast_scan("https://preview.example.com")
 
 
 def test_push_and_open_pr_skips_without_remote(monkeypatch):

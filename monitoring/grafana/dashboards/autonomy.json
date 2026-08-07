@@ -1,0 +1,58 @@
+{
+  "title": "Autonomy Is Earned",
+  "uid": "autonomy-is-earned",
+  "timezone": "browser",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Trust score by component",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "trust_score", "legendFormat": "{{component}}" }
+      ],
+      "fieldConfig": {
+        "defaults": { "min": 0, "max": 1, "unit": "percentunit" }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Judge verdicts (cumulative)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "judge_verdicts_total", "legendFormat": "{{verdict}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Coding agent runs by status",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "coding_agent_runs_total", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "AI Firewall — approved vs rejected (live)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "firewall_approved_total", "legendFormat": "approved" },
+        { "expr": "firewall_rejected_total", "legendFormat": "rejected" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Firewall redactions applied (total, from audit log)",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "firewall_redactions_total_from_audit_log" }
+      ]
+    }
+  ]
+}
