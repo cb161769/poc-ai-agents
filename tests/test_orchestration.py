@@ -1993,6 +1993,17 @@ def test_deliver_epic_sequential_skips_already_completed_child_but_processes_sib
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2147,6 +2158,17 @@ def test_deliver_epic_sequential_includes_epic_context_only_in_first_historia(mo
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2200,6 +2222,17 @@ def test_deliver_epic_sequential_passes_epic_context_to_judge(monkeypatch):
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2259,6 +2292,17 @@ def test_deliver_epic_sequential_passes_epic_context_to_test_plan_every_time(mon
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2316,6 +2360,17 @@ def test_deliver_epic_sequential_chains_conversation_across_children(monkeypatch
     monkeypatch.setattr(orchestration, "run_coding_agent_local_real", fake_run_first)
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
 
     def fake_guard(diff_text, jira_context):
         guard_diffs.append(diff_text)
@@ -2382,6 +2437,17 @@ def test_deliver_epic_sequential_surfaces_push_failure_reason_in_epic_summary(mo
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2463,6 +2529,17 @@ def test_deliver_epic_sequential_blocks_on_test_failure_and_skips_remaining_chil
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2506,6 +2583,17 @@ def test_deliver_epic_sequential_posts_gap_classification_on_test_failure_block(
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "npm test fallo: capacitor no encontrado"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2567,6 +2655,17 @@ def test_deliver_epic_sequential_transitions_epic_to_review_when_all_children_ok
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2611,6 +2710,17 @@ def test_deliver_epic_sequential_pr_body_describes_real_changes_not_raw_epic_des
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2656,6 +2766,17 @@ def test_deliver_epic_sequential_child_no_verdict_transitions_to_blocked(monkeyp
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: None)
@@ -2708,6 +2829,17 @@ def test_deliver_epic_sequential_retries_child_when_self_review_flags_inadequate
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2780,6 +2912,17 @@ def test_deliver_epic_sequential_retries_judge_flagged_child_after_the_first_his
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
 
@@ -2837,6 +2980,17 @@ def test_deliver_epic_sequential_comments_real_test_output_and_report_for_ok_chi
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "==== 4 passed ===="})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2896,6 +3050,17 @@ def test_deliver_epic_sequential_injects_test_plan_per_child(monkeypatch):
     monkeypatch.setattr(orchestration, "retry_coding_agent_local_real", fake_retry)
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -2937,6 +3102,17 @@ def test_deliver_epic_sequential_comment_names_untouched_siblings_on_block(monke
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": False, "output": "fallo"})
     monkeypatch.setattr(orchestration, "post_alert_webhook", lambda *a, **k: None)
     monkeypatch.setattr(orchestration, "check_falco_correlation", lambda *a, **k: None)
@@ -2978,6 +3154,17 @@ def test_deliver_epic_sequential_posts_technical_report_when_generated(monkeypat
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3110,6 +3297,17 @@ def test_deliver_epic_sequential_skips_report_comment_when_generation_fails(monk
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3152,6 +3350,17 @@ def test_deliver_posts_technical_report_for_single_ticket_run(monkeypatch):
     )
     monkeypatch.setattr(orchestration, "run_output_guard", lambda *a, **k: {"redactions_applied": 0, "jailbreak_reason": None, "clean": True})
     monkeypatch.setattr(orchestration, "run_coding_agent_review_task", lambda *a, **k: {"verdict": None, "reasoning": None, "feedback": None})
+    monkeypatch.setattr(orchestration, "get_falco_summary", lambda *a, **k: None)
+    monkeypatch.setattr(orchestration, "record_trust_signal", lambda *a, **k: None)
+    # Determinismo real (no solo "no crashea"): sin esto, decide_policy()
+    # (policy engine, "Autonomy Is Earned") leeria logs/trust_scores.jsonl
+    # DE VERDAD -- vacio hoy, pero una corrida real de la epica lo puebla, y
+    # estos tests empezarian a depender del estado del filesystem del repo
+    # en vez de ser deterministicos. 0.5 (prior neutral) + 0 corridas limpias
+    # nunca alcanza AUTO_SHIP (requiere trust>=0.85), asi que preserva el
+    # comportamiento de siempre (corre coding-agent-review) en todos estos tests.
+    monkeypatch.setattr(orchestration, "compute_trust_score", lambda component: 0.5)
+    monkeypatch.setattr(orchestration, "consecutive_ok_runs", lambda component: 0)
     monkeypatch.setattr(orchestration, "run_tests", lambda *a, **k: {"passed": True, "output": "ok"})
     monkeypatch.setattr(orchestration, "rescan_sonar", lambda *a, **k: [])
     monkeypatch.setattr(orchestration, "_run_judge_safe", lambda *a, **k: {"verdict": "OK", "reasoning": "todo bien"})
@@ -3443,6 +3652,124 @@ def test_stack_role_for_component_routes_everything_else_to_backend():
     assert orchestration._stack_role_for_component("DataWorker") == "backend"
     assert orchestration._stack_role_for_component("") == "backend"
     assert orchestration._stack_role_for_component(None) == "backend"
+
+
+def test_compute_risk_score_critical_keyword_forces_max_regardless_of_other_factors(monkeypatch):
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 0)
+    child = {"summary": "rotar credenciales de auth", "description": "", "issue_type": "Story"}
+
+    assert orchestration._compute_risk_score("Frontend", child, [], sonar_issues_count=0) == 1.0
+
+
+def test_compute_risk_score_low_for_routine_frontend_story(monkeypatch):
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 0)
+    child = {"summary": "agregar un Header", "description": "cambio de copy", "issue_type": "Story"}
+
+    score = orchestration._compute_risk_score("Frontend", child, ["frontend/src/header.tsx"], sonar_issues_count=0)
+
+    assert score < 0.3
+
+
+def test_compute_risk_score_higher_for_authservice_than_frontend_same_ticket(monkeypatch):
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 0)
+    child = {"summary": "agregar endpoint nuevo", "description": "", "issue_type": "Task"}
+
+    auth_score = orchestration._compute_risk_score("AuthService", child, ["x.py"], sonar_issues_count=0)
+    frontend_score = orchestration._compute_risk_score("Frontend", child, ["x.py"], sonar_issues_count=0)
+
+    assert auth_score > frontend_score
+
+
+def test_compute_risk_score_rises_with_prior_risk_nodes_and_sonar_issues(monkeypatch):
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 3)
+    child = {"summary": "cambio", "description": "", "issue_type": "Task"}
+
+    clean_score = orchestration._compute_risk_score("Frontend", dict(child), [], sonar_issues_count=0)
+    monkeypatch.setattr(orchestration, "_count_risk_nodes", lambda component: 3)
+    dirty_score = orchestration._compute_risk_score("Frontend", child, [], sonar_issues_count=5)
+
+    assert dirty_score > clean_score
+
+
+def test_blast_radius_frontend_css_is_low(monkeypatch):
+    assert orchestration._blast_radius("Frontend", ["frontend/src/styles.css"]) == 2
+
+
+def test_blast_radius_frontend_new_route_is_higher(monkeypatch):
+    assert orchestration._blast_radius("Frontend", ["frontend/src/routes/new.tsx"]) == 4
+
+
+def test_blast_radius_authservice_auth_paths_is_critical(monkeypatch):
+    assert orchestration._blast_radius("AuthService", ["auth-service/src/token/Session.java"]) == 9
+
+
+def test_blast_radius_authservice_non_auth_paths_is_moderate(monkeypatch):
+    assert orchestration._blast_radius("AuthService", ["auth-service/src/health/Health.java"]) == 5
+
+
+def test_blast_radius_dataworker_migration_is_critical(monkeypatch):
+    assert orchestration._blast_radius("DataWorker", ["data-worker/migrations/0001_init.sql"]) == 9
+
+
+def test_blast_radius_infra_config_is_max(monkeypatch):
+    assert orchestration._blast_radius("Frontend", ["docker-compose.yml"]) == 10
+
+
+def test_decide_policy_judge_flagged_terminal_always_blocks(monkeypatch):
+    verdict = {"verdict": "FLAGGED", "policy_reference": "not-a-real-policy-ref"}
+
+    result = orchestration.decide_policy(0.05, 1, 0.99, verdict, consecutive_ok=100)
+
+    assert result == "BLOCK"
+
+
+def test_decide_policy_judge_flagged_retryable_does_not_block(monkeypatch):
+    from pipeline_shared import RETRYABLE_POLICY_REFERENCES
+    verdict = {"verdict": "FLAGGED", "policy_reference": next(iter(RETRYABLE_POLICY_REFERENCES))}
+
+    result = orchestration.decide_policy(0.05, 1, 0.99, verdict, consecutive_ok=100)
+
+    assert result != "BLOCK"
+
+
+def test_decide_policy_critical_blast_radius_forces_human_approval_even_with_high_trust(monkeypatch):
+    """El caso de precedencia central del policy engine: trust alto y riesgo
+    bajo NUNCA alcanzan para saltear un blast radius critico."""
+    result = orchestration.decide_policy(0.05, 9, 0.99, {"verdict": "OK"}, consecutive_ok=500)
+
+    assert result == "HUMAN_APPROVAL"
+
+
+def test_decide_policy_low_trust_requires_review(monkeypatch):
+    result = orchestration.decide_policy(0.1, 2, 0.3, {"verdict": "OK"}, consecutive_ok=0)
+
+    assert result == "REQUIRES_REVIEW"
+
+
+def test_decide_policy_high_risk_requires_review_even_with_high_trust(monkeypatch):
+    result = orchestration.decide_policy(0.6, 2, 0.95, {"verdict": "OK"}, consecutive_ok=50)
+
+    assert result == "REQUIRES_REVIEW"
+
+
+def test_decide_policy_auto_ship_needs_trust_low_risk_and_streak(monkeypatch):
+    result = orchestration.decide_policy(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=20)
+
+    assert result == "AUTO_SHIP"
+
+
+def test_decide_policy_auto_ship_denied_without_streak(monkeypatch):
+    """Trust y riesgo alcanzan, pero sin las 20 corridas limpias seguidas
+    todavia no se gano AUTO_SHIP."""
+    result = orchestration.decide_policy(0.1, 2, 0.9, {"verdict": "OK"}, consecutive_ok=3)
+
+    assert result == "AUTO_WITH_CHECKS"
+
+
+def test_decide_policy_default_is_auto_with_checks(monkeypatch):
+    result = orchestration.decide_policy(0.3, 4, 0.6, None, consecutive_ok=0)
+
+    assert result == "AUTO_WITH_CHECKS"
 
 
 def test_run_coding_agent_local_real_routes_backend_role_to_payload_mode(monkeypatch, tmp_path):

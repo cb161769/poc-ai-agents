@@ -81,6 +81,7 @@ from coding_agent import _STACK_MARKERS
 from tech_doc_agent import generate_technical_report, generate_test_plan
 from firewall_proxy import _redact
 from log_utils import get_logger
+from trust_score import compute_trust_score, consecutive_ok_runs, record_trust_signal
 from pipeline_shared import (
     REMEDIATION_HINTS,
     RETRYABLE_POLICY_REFERENCES,
@@ -1560,6 +1561,126 @@ def _stack_role_for_component(repository_origen: str) -> str:
     ticket.
     """
     return "frontend" if "frontend" in (repository_origen or "").lower() else "backend"
+
+
+# --- Policy engine ("Autonomy Is Earned", pedido explicito del usuario) ---
+#
+# Criticidad fija por componente real de este repo (JIRA_KNOWN_COMPONENTS) --
+# no una escala generica, los unicos 3 componentes que este pipeline conoce.
+_COMPONENT_CRITICALITY = {"authservice": 0.9, "dataworker": 0.6, "frontend": 0.3}
+
+# Keywords que fuerzan risk_score=1.0 sin importar ningun otro factor -- el
+# mismo criterio que ya usa el policy engine documentado en el artefacto
+# "Autonomy Is Earned": blast radius/palabras clave criticas SIEMPRE ganan
+# sobre trust, nunca al reves.
+_CRITICAL_KEYWORDS = re.compile(
+    r"\b(auth|secret|credential|token|session|password|iam|migrat|eliminar|delete|payment|pago)\b",
+    re.IGNORECASE,
+)
+
+_TICKET_TYPE_RISK_WEIGHT = {"bug": 0.6, "epic": 0.6, "task": 0.4, "story": 0.2}
+
+
+def _count_risk_nodes(component: str) -> int:
+    """Cuenta real de nodos :Risk que ya afectaron este componente en
+    corridas anteriores (graph_writer.py ya escribe Risk-[:AFFECTS]->Service
+    cuando el juez cita un policy_reference real -- ver _query_component_risk_history,
+    que ya lee esto para texto de prompt; esto es la misma relacion pero como
+    conteo numerico). Best-effort: 0 si Neo4j no esta alcanzable o la query
+    falla -- mismo criterio que el resto de las queries a Neo4j de este
+    pipeline, nunca bloquea la corrida.
+    """
+    if not component:
+        return 0
+    neo4j_uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.environ.get("NEO4J_USERNAME", "neo4j")
+    neo4j_pass = os.environ.get("NEO4J_PASSWORD", "test_password_local")
+    try:
+        output = _run(
+            [
+                "cypher-shell", "-a", neo4j_uri, "-u", neo4j_user, "-p", neo4j_pass,
+                "--format", "plain",
+                f"MATCH (r:Risk)-[:AFFECTS]->(svc:Service {{name: '{component}'}}) RETURN count(r)",
+            ]
+        )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        return int(lines[1]) if len(lines) > 1 else 0
+    except (RuntimeError, ValueError, IndexError):
+        return 0
+
+
+_DIFF_HEADER_PATTERN = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
+
+
+def _files_touched_from_diff(diff_text: str) -> list:
+    """Extrae los paths tocados de un 'git diff' real (no --stat) leyendo
+    las lineas 'diff --git a/X b/Y' -- usa el path b/ (destino), que es el
+    real tras el cambio incluso para un rename."""
+    return [m.group(2) for m in _DIFF_HEADER_PATTERN.finditer(diff_text or "")]
+
+
+def _compute_risk_score(component: str, child: dict, files_touched: list, sonar_issues_count: int = 0) -> float:
+    """Tabla de pesos del artefacto "Autonomy Is Earned" §04, adaptada a los
+    3 componentes reales de este repo -- 0.30 criticidad + 0.25 nodos :Risk
+    previos + 0.15 hallazgos Sonar nuevos + 0.15 superficie de cambio + 0.15
+    tipo de ticket. Un keyword critico en el ticket fuerza 1.0 de una, sin
+    promediar con el resto (misma logica que blast radius mas abajo: algunas
+    señales son un techo duro, no un factor mas).
+    """
+    ticket_text = f"{child.get('summary', '')} {child.get('description', '')}"
+    if _CRITICAL_KEYWORDS.search(ticket_text):
+        return 1.0
+
+    criticality = _COMPONENT_CRITICALITY.get((component or "").lower(), 0.5)
+    risk_node_score = min(1.0, _count_risk_nodes(component) / 3)
+    sonar_score = min(1.0, sonar_issues_count / 5)
+    surface_score = min(1.0, len(files_touched or []) / 10)
+    type_score = _TICKET_TYPE_RISK_WEIGHT.get((child.get("issue_type") or "").lower(), 0.3)
+
+    score = 0.30 * criticality + 0.25 * risk_node_score + 0.15 * sonar_score + 0.15 * surface_score + 0.15 * type_score
+    return max(0.0, min(1.0, score))
+
+
+def _blast_radius(component: str, files_touched: list) -> int:
+    """Tabla del artefacto §09, adaptada a los paths reales de este repo
+    (frontend/, auth-service/, data-worker/, config de infra)."""
+    component_l = (component or "").lower()
+    joined = " ".join(files_touched or []).lower()
+
+    if any(marker in joined for marker in ("docker-compose.yml", ".env", ".github/workflows")):
+        return 10
+    if "authservice" in component_l:
+        return 9 if re.search(r"token|session|credential|password|/auth", joined) else 5
+    if "dataworker" in component_l:
+        return 9 if re.search(r"migrat|schema", joined) else 5
+    if "frontend" in component_l:
+        return 2 if joined and re.search(r"\.(css|scss|md)$", joined) else 4
+    return 5
+
+
+def decide_policy(risk_score: float, blast_radius: int, trust: float, judge_verdict: dict | None, consecutive_ok: int = 0) -> str:
+    """AUTO_SHIP / AUTO_WITH_CHECKS / REQUIRES_REVIEW / HUMAN_APPROVAL / BLOCK
+    -- pseudocodigo del artefacto "Autonomy Is Earned" §17. Orden de
+    precedencia real: el veto del juez (BLOCK) y el blast radius/keywords
+    criticos (HUMAN_APPROVAL) SIEMPRE ganan sobre trust -- un componente con
+    trust alto en un cambio de blast radius 9+ nunca llega a AUTO_SHIP.
+    Se llama ANTES de tener judge_verdict tambien (pasando None) para decidir
+    si saltear el turno extra de coding-agent-review -- ver
+    _deliver_epic_sequential.
+    """
+    if (
+        judge_verdict is not None
+        and judge_verdict.get("verdict") == "FLAGGED"
+        and judge_verdict.get("policy_reference") not in RETRYABLE_POLICY_REFERENCES
+    ):
+        return "BLOCK"
+    if blast_radius >= 9:
+        return "HUMAN_APPROVAL"
+    if trust < 0.5 or risk_score > 0.5:
+        return "REQUIRES_REVIEW"
+    if trust >= 0.85 and risk_score < 0.2 and consecutive_ok >= 20:
+        return "AUTO_SHIP"
+    return "AUTO_WITH_CHECKS"
 
 
 @task(retries=0, name="coding-agent-review")
@@ -3648,6 +3769,10 @@ def _deliver_epic_sequential(
         # se rutea segun el componente real del ticket, nunca los dos para el
         # mismo ticket. Ver _stack_role_for_component.
         stack_role = _stack_role_for_component(child["repository_origen"])
+        # Contador real de reintentos de ESTA historia puntual (coding-agent-
+        # review + judge FLAGGED retryable, los 2 puntos de reintento reales
+        # mas abajo) -- alimenta trust_score.record_trust_signal().
+        retries_used = 0
 
         if branch is None:
             agent_result = run_coding_agent_local_real(epic_key, sanitized, target_repo_dir, role=stack_role)
@@ -3707,13 +3832,37 @@ def _deliver_epic_sequential(
         diff_text = _run(["git", "-C", target_repo_dir, "diff", f"{checkpoint}..HEAD"]) if checkpoint \
             else _run(["git", "-C", target_repo_dir, "diff", f"{base_branch}..HEAD"])
 
+        # Policy engine ("Autonomy Is Earned", pedido explicito del usuario)
+        # -- se calcula ANTES del turno extra de coding-agent-review (sin
+        # judge_verdict todavia, se pasa None) para decidir si un componente
+        # con suficiente historial limpio puede saltearlo. Best-effort total:
+        # si algo de esto falla, se comporta como hoy (corre el reviewer
+        # igual) -- nunca bloquea la epica por un calculo de politica.
+        component = child["repository_origen"]
+        files_touched = _files_touched_from_diff(diff_text)
+        try:
+            pre_judge_trust = compute_trust_score(component)
+            pre_judge_risk = _compute_risk_score(component, child, files_touched)
+            pre_judge_blast = _blast_radius(component, files_touched)
+            pre_judge_policy = decide_policy(
+                pre_judge_risk, pre_judge_blast, pre_judge_trust, None,
+                consecutive_ok=consecutive_ok_runs(component),
+            )
+        except Exception as exc:
+            _log_best_effort("warning", f"{child_id}: no se pudo calcular la policy pre-juez -- {exc}")
+            pre_judge_policy = "AUTO_WITH_CHECKS"
+
         # "El coding agent sera el juez" (pedido explicito del usuario) --
         # capa NUEVA, ANTES del juez independiente real (judge_agent.py, que
         # sigue corriendo despues sin cambios). Best-effort: si pide cambios,
         # UN reintento con su feedback antes de seguir -- nunca bloquea la
         # epica por su cuenta, eso sigue siendo responsabilidad exclusiva del
-        # juez independiente.
-        review = run_coding_agent_review_task(epic_key, diff_text, stack_role, target_repo_dir)
+        # juez independiente. AUTO_SHIP (componente con 20+ corridas limpias,
+        # trust alto, riesgo bajo) saltea este turno extra -- ya se lo gano.
+        if pre_judge_policy == "AUTO_SHIP":
+            review = {"verdict": None, "reasoning": "policy AUTO_SHIP -- se salteo coding-agent-review", "feedback": None}
+        else:
+            review = run_coding_agent_review_task(epic_key, diff_text, stack_role, target_repo_dir)
         if review.get("verdict") == "request_changes":
             comment_jira(
                 f"🔎 Revision del coding agent en {child_id}: pide cambios antes del juez independiente -- "
@@ -3727,6 +3876,7 @@ def _deliver_epic_sequential(
             reviewed_retry = retry_coding_agent_local_real(
                 epic_key, review_feedback, target_repo_dir, conversation_file=conversation_file, role=stack_role,
             )
+            retries_used += 1
             conversation_file = reviewed_retry.get("conversation_file") or conversation_file
             if reviewed_retry.get("applied"):
                 agent_result = reviewed_retry
@@ -3837,10 +3987,53 @@ def _deliver_epic_sequential(
                 False, None, falco_since, conflicts=conflicts, diff_text=diff_text,
                 branch=branch, base_branch=base_branch,
             )
+            retries_used += 1
             if retried_verdict is not None:
                 judge_verdict = retried_verdict
 
         last_judge_verdict = judge_verdict
+
+        # Trust ledger (pedido explicito del usuario, "Autonomy Is Earned") --
+        # un registro por outcome real, no solo por OK, para que
+        # compute_trust_score() vea tambien los FLAGGED/no-verdict al
+        # calcular la tasa de exito real de este componente. Best-effort por
+        # diseno (record_trust_signal nunca lanza) -- nunca bloquea la epica.
+        record_trust_signal(
+            component=child["repository_origen"],
+            ticket_id=child_id,
+            change_type=(child.get("issue_type") or "story").lower(),
+            verification={
+                "output_guard_clean": guard_result["clean"],
+                "tests_passed": test_result["passed"],
+                "new_sonar_issues": len(new_sonar_issues or []),
+                "coding_agent_review_verdict": review.get("verdict"),
+                "tests_adequate": (agent_result.get("self_review") or {}).get("tests_adequate"),
+                # get_falco_summary(), no check_falco_correlation() -- esa
+                # ultima postea un comentario Jira + webhook por su cuenta
+                # (efecto secundario real), y esto solo necesita saber SI
+                # hubo alertas, no volver a anunciarlas.
+                "falco_correlated": bool((get_falco_summary(falco_since) or {}).get("count")),
+            },
+            judge_verdict=judge_verdict,
+            retries_used=retries_used,
+        )
+
+        # Policy final (con el veredicto real del juez esta vez) -- solo
+        # cambia el TEXTO del comentario/reporte cuando el outcome es OK (ver
+        # mas abajo): este repo no tiene un estado Jira distinto para
+        # "aprobacion humana obligatoria" vs "revision normal", asi que la
+        # señal real hoy es explicitarlo, no un camino de ejecucion nuevo.
+        # Best-effort total, igual que el calculo pre-juez de mas arriba.
+        try:
+            final_policy = decide_policy(
+                _compute_risk_score(component, child, _files_touched_from_diff(diff_text), len(new_sonar_issues or [])),
+                _blast_radius(component, _files_touched_from_diff(diff_text)),
+                compute_trust_score(component), judge_verdict,
+                consecutive_ok=consecutive_ok_runs(component),
+            )
+        except Exception as exc:
+            _log_best_effort("warning", f"{child_id}: no se pudo calcular la policy final -- {exc}")
+            final_policy = "AUTO_WITH_CHECKS"
 
         if judge_verdict is None:
             # Decision de diseno explicita (TicketState.PARTIAL_FAILURE,
@@ -3882,16 +4075,25 @@ def _deliver_epic_sequential(
             blocked_at = child_id
             break
         else:
-            comment_jira(f"🧑‍⚖️ Agente juez (Prefect): OK en {child_id}. {judge_verdict['reasoning']}", ticket_key=child_id)
+            human_approval_note = (
+                " ⚠️ Requiere aprobacion humana explicita (alcance critico -- ver policy engine), "
+                "no alcanza con la revision normal." if final_policy == "HUMAN_APPROVAL" else ""
+            )
+            comment_jira(
+                f"🧑‍⚖️ Agente juez (Prefect): OK en {child_id}. {judge_verdict['reasoning']}{human_approval_note}",
+                ticket_key=child_id,
+            )
             transition_jira(JIRA_REVIEW_STATUS, ticket_key=child_id, blocked=False)
             _post_child_technical_report(
-                epic_key, child_id, backend, "OK -- listo para revision humana",
+                epic_key, child_id, backend,
+                "OK -- requiere aprobacion humana (alcance critico)" if final_policy == "HUMAN_APPROVAL" else "OK -- listo para revision humana",
                 {
                     "veredicto_juez": judge_verdict["reasoning"], "rama_git": branch,
                     "salida_tests": test_result["output"][:2000],
                     "self_verified": agent_result.get("self_verified"),
                     "consulto_grafo_de_riesgo": agent_result.get("consulted_risk_graph"),
                     "sprint": (jira_context.get("sprint") or {}).get("name"),
+                    "policy": final_policy,
                 },
             )
             completed.append({"ticket_id": child_id, "outcome": "ok"})
