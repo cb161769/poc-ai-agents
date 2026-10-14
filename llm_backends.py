@@ -1,7 +1,7 @@
 """Registry of LLM backends -- the extension point for adding a new model
 provider (OpenAI, Gemini, etc.) without editing agent_loop.py's call sites.
 
-Today only "anthropic" and "ollama" are registered (the only two backends
+Today "anthropic", "claude_cli" (Claude Code CLI headless) and "ollama" are registered (the only two backends
 actually implemented and exercised end-to-end, consistent with this
 project's no-mocks philosophy: a backend only gets added here once it's
 been wired up and tested against the real provider, not speculatively).
@@ -31,7 +31,7 @@ from pathlib import Path
 # Ollama como fallback gratuito/local. Configurable via LLM_BACKEND_PRIORITY
 # ("anthropic,ollama" por defecto, mismo comportamiento que antes de este
 # refactor) para poder reordenar sin tocar codigo.
-BACKEND_PRIORITY_DEFAULT = ["anthropic", "ollama"]
+BACKEND_PRIORITY_DEFAULT = ["anthropic", "claude_cli", "ollama"]
 
 
 def get_backend_priority() -> list:
@@ -51,6 +51,9 @@ PRICING_PER_MILLION = {
         "claude-opus-4-8": {"input": 15.0, "output": 75.0},
         "claude-haiku-4-5-20251001": {"input": 0.8, "output": 4.0},
     },
+    # claude_cli usa la suscripcion del CLI de Claude Code, no facturacion por
+    # token de API -- sin tabla de precios, igual que Ollama (costo 0.0).
+    "claude_cli": {},
     "ollama": {},
 }
 
@@ -70,6 +73,9 @@ def estimate_cost_usd(backend: str, model: str, input_tokens: int, output_tokens
 RETRY_POLICY_PER_BACKEND = {
     "anthropic": {"retryable_status_codes": {429, 500, 502, 503, 504, 529}, "max_retries": 2, "backoff_seconds": [1, 2]},
     "ollama": {"retryable_status_codes": {429, 500, 502, 503, 504}, "max_retries": 2, "backoff_seconds": [1, 2]},
+    # Subprocess, no HTTP: no hay status codes que reintentar aca -- los
+    # fallos reales los absorbe el fallback EN VIVO entre backends.
+    "claude_cli": {"retryable_status_codes": set(), "max_retries": 0, "backoff_seconds": []},
 }
 
 # max_tokens por backend/modelo -- antes hardcodeado (1536) solo en la rama
@@ -86,6 +92,7 @@ MODEL_LIMITS = {
     # Anthropic (ventana real ~200k tokens) recibia el mismo umbral chico
     # pensado para Ollama (8192 tokens default), o viceversa.
     "anthropic": {"max_tokens": 1536, "context_window_tokens": 200_000},
+    "claude_cli": {"max_tokens": 1536, "context_window_tokens": 200_000},
     # Ollama es local/gratis (sin tradeoff de costo, a diferencia de
     # Anthropic) -- mas alto para que un JSON con format:"json" forzado no
     # se corte antes de cerrar el objeto, que es JSON invalido igual aunque

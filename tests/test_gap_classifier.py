@@ -4,6 +4,7 @@ estos tests verifican el envoltorio: que se arme el prompt con la evidencia
 real, que el resultado se parsee/valide, y que cualquier fallo se trague en
 silencio (best-effort, nunca bloquea la corrida real).
 """
+import adk_bridge
 import pytest
 
 import gap_classifier
@@ -24,7 +25,7 @@ def test_classify_gap_returns_none_when_disabled(monkeypatch):
 
     async def boom(*a, **k):
         pytest.fail("no deberia llamar al backend si esta deshabilitado")
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", boom)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", boom)
 
     assert _real_classify_gap({"motivo_del_bloqueo": "tests fallaron"}) is None
 
@@ -45,7 +46,7 @@ def test_classify_gap_parses_infra_bug_with_proposal(monkeypatch):
         )
         return [{"type": "text", "text": text}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = _real_classify_gap({"motivo_del_bloqueo": "comando 'capacitor' no encontrado"})
 
@@ -71,7 +72,7 @@ def test_classify_gap_forces_proposal_null_for_non_infra_buckets(monkeypatch):
         )
         return [{"type": "text", "text": text}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = _real_classify_gap({"motivo_del_bloqueo": "insufficient-test-coverage tras agotar reintentos"})
 
@@ -95,7 +96,7 @@ def test_classify_gap_flags_ungrounded_reasoning(monkeypatch):
         text = '{"bucket": "infra_bug", "reasoning": "la imagen X no esta disponible (esto es falso)", "proposal": null}'
         return [{"type": "text", "text": text}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = _real_classify_gap({"motivo_del_bloqueo": "x"})
 
@@ -115,7 +116,7 @@ def test_classify_gap_does_not_flag_reasoning_when_grounding_uncertain(monkeypat
         text = '{"bucket": "content_gap", "reasoning": "razonamiento normal", "proposal": null}'
         return [{"type": "text", "text": text}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = _real_classify_gap({"motivo_del_bloqueo": "x"})
 
@@ -129,7 +130,7 @@ def test_classify_gap_returns_none_on_invalid_json(monkeypatch):
     async def fake_call_with_fallback(client, messages, tools, system_prompt, ollama_model=None, force_json=False, json_schema=None):
         return [{"type": "text", "text": "no puedo ayudar con eso"}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     assert _real_classify_gap({"motivo_del_bloqueo": "x"}) is None
 
@@ -140,7 +141,7 @@ def test_classify_gap_returns_none_on_invalid_bucket_value(monkeypatch):
     async def fake_call_with_fallback(client, messages, tools, system_prompt, ollama_model=None, force_json=False, json_schema=None):
         return [{"type": "text", "text": '{"bucket": "not_a_real_bucket", "reasoning": "x"}'}], "end_turn", {}, "ollama"
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     assert _real_classify_gap({"motivo_del_bloqueo": "x"}) is None
 
@@ -151,6 +152,6 @@ def test_classify_gap_returns_none_when_backend_call_fails(monkeypatch):
     async def boom(*a, **k):
         raise RuntimeError("ollama no disponible")
 
-    monkeypatch.setattr(gap_classifier, "call_with_fallback", boom)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", boom)
 
     assert _real_classify_gap({"motivo_del_bloqueo": "x"}) is None

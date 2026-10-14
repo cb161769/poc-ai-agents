@@ -29,9 +29,9 @@ import json
 import logging
 import os
 
-import httpx
 
-from agent_loop import OLLAMA_MODEL, call_with_fallback, parse_ollama_model_candidates, resolve_ollama_model
+from adk_bridge import adk_generate
+from agent_loop import OLLAMA_MODEL, parse_ollama_model_candidates, resolve_ollama_model
 from grounding_check import verify_claim_grounded
 
 logger = logging.getLogger("gap_classifier")
@@ -104,22 +104,20 @@ def _format_evidence(evidence: dict) -> str:
 
 
 async def _classify_async(evidence: dict) -> dict | None:
-    async with httpx.AsyncClient() as client:
-        try:
-            blocks, _stop_reason, _usage, _backend_used = await call_with_fallback(
-                client,
-                messages=[{"role": "user", "content": _format_evidence(evidence)}],
-                tools=[],
-                system_prompt=GAP_CLASSIFIER_SYSTEM_PROMPT,
-                ollama_model=resolve_ollama_model(GAP_CLASSIFIER_OLLAMA_MODELS) or GAP_CLASSIFIER_OLLAMA_MODELS[0],
-                force_json=True,
-                json_schema=GAP_CLASSIFIER_RESULT_SCHEMA,
-            )
-        except Exception as exc:
-            logger.warning(f"gap_classifier: no se pudo clasificar el bloqueo: {exc}")
-            return None
+    try:
+        text, _backend_used = await adk_generate(
+            "gap_classifier",
+            GAP_CLASSIFIER_SYSTEM_PROMPT,
+            _format_evidence(evidence),
+            ollama_model=resolve_ollama_model(GAP_CLASSIFIER_OLLAMA_MODELS) or GAP_CLASSIFIER_OLLAMA_MODELS[0],
+            force_json=True,
+            json_schema=GAP_CLASSIFIER_RESULT_SCHEMA,
+        )
+    except Exception as exc:
+        logger.warning(f"gap_classifier: no se pudo clasificar el bloqueo: {exc}")
+        return None
 
-    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+    text = text.strip()
     if not text:
         return None
     try:

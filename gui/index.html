@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents Console</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #667085; --line: #dfe3ea;
+    --accent: #2f5bea; --accent-ink: #ffffff; --ok: #1a7f4b; --warn: #b26a00; --bad: #c0362c;
+    --code-bg: #f0f2f6; --call: #e8eefc; --res: #e9f6ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --panel: #171c25; --ink: #e6e9ef; --muted: #8b95a7; --line: #2a3140;
+      --accent: #6b8cff; --accent-ink: #0b0f18; --ok: #4cc38a; --warn: #e5a23a; --bad: #ff7b72;
+      --code-bg: #0f131a; --call: #1d2a4a; --res: #16301f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --panel: #171c25; --ink: #e6e9ef; --muted: #8b95a7; --line: #2a3140;
+    --accent: #6b8cff; --accent-ink: #0b0f18; --ok: #4cc38a; --warn: #e5a23a; --bad: #ff7b72;
+    --code-bg: #0f131a; --call: #1d2a4a; --res: #16301f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.running { color: var(--accent); border-color: var(--accent); }
+  .pill.done { color: var(--ok); border-color: var(--ok); }
+  .pill.error, .pill.cancelled { color: var(--bad); border-color: var(--bad); }
+  .spacer { flex: 1; }
+  main { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea {
+    width: 100%; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 10px; font: inherit;
+  }
+  textarea { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; resize: vertical; min-height: 90px; }
+  input:focus, select:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 4px; }
+  .tab { flex: 1; padding: 8px; text-align: center; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--ink); cursor: pointer; font: inherit; }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .row { display: flex; gap: 8px; margin-top: 14px; }
+  button.btn { flex: 1; padding: 9px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; font: inherit; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button.danger { color: var(--bad); border-color: var(--bad); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #feed { display: flex; flex-direction: column; gap: 8px; min-height: 240px; max-height: calc(100vh - 220px); overflow: auto; }
+  .ev { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel); }
+  .ev .tag { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; display: flex; gap: 8px; }
+  .ev.tool_call { background: var(--call); }
+  .ev.tool_result { background: var(--res); }
+  .ev.error { border-color: var(--bad); }
+  .ev.log { opacity: .75; }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; background: var(--code-bg); border-radius: 6px; padding: 8px; max-height: 280px; overflow: auto; }
+  .ev.model_text .body { white-space: pre-wrap; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 0; }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); width: min(680px, calc(100vw - 32px)); padding: 16px; }
+  dialog::backdrop { background: rgba(0, 0, 0, .5); }
+  dialog h2 { margin: 0 0 8px; font-size: 16px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agents Console</h1>
+  <span id="state" class="pill">inactivo</span>
+  <span id="conn" class="pill">desconectado</span>
+  <span class="spacer"></span>
+  <button class="btn" id="theme" style="flex:none;padding:4px 10px" aria-label="Cambiar tema">Tema</button>
+</header>
+
+<main>
+  <section class="panel" aria-label="Configuración de la corrida">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" data-agent="coding" aria-selected="true">Coding</button>
+      <button class="tab" role="tab" data-agent="judge" aria-selected="false">Juez</button>
+      <button class="tab" role="tab" data-agent="epic" aria-selected="false">Epic</button>
+    </div>
+
+    <label for="backend">Backend de modelo</label>
+    <select id="backend"></select>
+
+    <div data-form="coding">
+      <label for="repo_dir">Repo objetivo (directorio)</label>
+      <input id="repo_dir" autocomplete="off">
+      <label for="ticket_id">Ticket</label>
+      <input id="ticket_id" value="GUI-1" autocomplete="off">
+      <label for="prompt">Tarea</label>
+      <textarea id="prompt" rows="6" placeholder="Describí el cambio que debe hacer el agente…"></textarea>
+      <div class="hint">Escribir archivos y correr comandos pide tu aprobación en un diálogo.</div>
+    </div>
+
+    <div data-form="judge" hidden>
+      <label for="payload_json">Payload del juez (JSON)</label>
+      <textarea id="payload_json" rows="14"></textarea>
+    </div>
+
+    <div data-form="epic" hidden>
+      <label for="epic_json">Epic (JSON)</label>
+      <textarea id="epic_json" rows="4"></textarea>
+      <label for="children_json">Historias hijas (JSON)</label>
+      <textarea id="children_json" rows="10"></textarea>
+    </div>
+
+    <div class="row">
+      <button class="btn primary" id="start">Ejecutar</button>
+      <button class="btn danger" id="cancel" disabled>Cancelar</button>
+    </div>
+    <div class="row" style="margin-top:8px"><button class="btn" id="clear">Limpiar salida</button></div>
+  </section>
+
+  <section class="panel" aria-label="Salida en vivo">
+    <div id="feed" aria-live="polite"><div class="empty">Elegí un agente y ejecutalo: acá vas a ver cada herramienta que llama, sus resultados y el veredicto final.</div></div>
+  </section>
+</main>
+
+<dialog id="confirm">
+  <h2>El agente pide confirmación</h2>
+  <pre id="confirmText"></pre>
+  <div class="row">
+    <button class="btn primary" id="approve">Aprobar</button>
+    <button class="btn danger" id="reject">Rechazar</button>
+  </div>
+</dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const feed = $("feed");
+let ws = null, agent = "coding", running = false, pendingConfirm = null;
+
+const TEMPLATES = {
+  payload_json: JSON.stringify({
+    ticket: {ticket_id: "T-1", summary: "Fix login", description: "descripción", repository_origen: "AuthService"},
+    firewall: {status: "APPROVED", reason: null, redactions_applied: 0},
+    change_source: "local_diff",
+    change_description: "diff --git a/auth.py b/auth.py\n...",
+    test_summary: "3 tests pasaron"
+  }, null, 2),
+  epic_json: JSON.stringify({key: "EPIC-1", summary: "Resumen de la épica", description: "Detalle"}, null, 2),
+  children_json: JSON.stringify([
+    {ticket_id: "JIRA-1", summary: "Historia 1", description: "desc 1", repository_origen: "AuthService"},
+    {ticket_id: "JIRA-2", summary: "Historia 2", description: "desc 2", repository_origen: "Frontend"}
+  ], null, 2)
+};
+for (const [id, v] of Object.entries(TEMPLATES)) $(id).value = v;
+
+function setState(state, label) {
+  const el = $("state");
+  el.className = "pill " + state;
+  el.textContent = label || state;
+  running = state === "running";
+  $("start").disabled = running;
+  $("cancel").disabled = !running;
+}
+
+function add(kind, tag, content, isCode) {
+  const empty = feed.querySelector(".empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = "ev " + kind;
+  const t = document.createElement("div");
+  t.className = "tag";
+  t.textContent = tag;
+  div.appendChild(t);
+  const body = document.createElement(isCode ? "pre" : "div");
+  body.className = "body";
+  body.textContent = content;
+  div.appendChild(body);
+  feed.appendChild(div);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+let consoleBlock = null;
+function addConsole(text) {
+  if (!consoleBlock || consoleBlock !== feed.lastElementChild) {
+    add("console", "consola", "", true);
+    consoleBlock = feed.lastElementChild;
+  }
+  consoleBlock.querySelector(".body").textContent += text;
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function handle(ev) {
+  switch (ev.type) {
+    case "status":
+      if (ev.state === "running") setState("running", "ejecutando · " + ev.agent);
+      else if (ev.state === "done") setState("done", "terminado");
+      else if (ev.state === "cancelled") setState("cancelled", "cancelado");
+      else setState("error", "error");
+      break;
+    case "model_text": add("model_text", ev.final ? "modelo · respuesta" : "modelo", ev.text); break;
+    case "tool_call": add("tool_call", "herramienta · " + ev.name, JSON.stringify(ev.args, null, 2), true); break;
+    case "tool_result": add("tool_result", "resultado · " + ev.name, ev.output, true); break;
+    case "console": addConsole(ev.text); break;
+    case "log": add("log", ev.level.toLowerCase() + " · " + ev.logger, ev.text); break;
+    case "error": add("error", "error", ev.text); break;
+    case "result": add("result", "resultado final", JSON.stringify(ev.data, null, 2), true); break;
+    case "confirm":
+      pendingConfirm = ev.id;
+      $("confirmText").textContent = ev.prompt;
+      $("confirm").showModal();
+      break;
+  }
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { $("conn").textContent = "conectado"; $("conn").className = "pill done"; };
+  ws.onclose = () => { $("conn").textContent = "desconectado"; $("conn").className = "pill error"; setTimeout(connect, 1500); };
+  ws.onmessage = (m) => handle(JSON.parse(m.data));
+}
+
+function params() {
+  if (agent === "coding") return {repo_dir: $("repo_dir").value.trim(), ticket_id: $("ticket_id").value.trim(), prompt: $("prompt").value.trim()};
+  if (agent === "judge") return {payload_json: $("payload_json").value};
+  return {epic_json: $("epic_json").value, children_json: $("children_json").value};
+}
+
+function validate(p) {
+  if (agent === "coding" && (!p.repo_dir || !p.prompt)) return "Completá el repo y la tarea.";
+  try {
+    if (agent === "judge") JSON.parse(p.payload_json);
+    if (agent === "epic") { JSON.parse(p.epic_json); JSON.parse(p.children_json); }
+  } catch (e) { return "JSON inválido: " + e.message; }
+  return null;
+}
+
+$("start").onclick = () => {
+  const p = params(), err = validate(p);
+  if (err) { add("error", "validación", err); return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) { add("error", "conexión", "Sin conexión con el servidor."); return; }
+  consoleBlock = null;
+  ws.send(JSON.stringify({action: "start", agent, backend: $("backend").value, params: p}));
+};
+$("cancel").onclick = () => ws.send(JSON.stringify({action: "cancel"}));
+$("clear").onclick = () => { feed.innerHTML = '<div class="empty">Salida limpia.</div>'; };
+
+function answer(approve) {
+  if (pendingConfirm) ws.send(JSON.stringify({action: "confirm", id: pendingConfirm, approve}));
+  pendingConfirm = null;
+  $("confirm").close();
+}
+$("approve").onclick = () => answer(true);
+$("reject").onclick = () => answer(false);
+$("confirm").addEventListener("cancel", (e) => { e.preventDefault(); answer(false); });
+
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.onclick = () => {
+    agent = tab.dataset.agent;
+    document.querySelectorAll(".tab").forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+    document.querySelectorAll("[data-form]").forEach((f) => { f.hidden = f.dataset.form !== agent; });
+  };
+});
+
+$("theme").onclick = () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+};
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  $("backend").innerHTML = info.backends.map((b) => `<option value="${b}">${b === "auto" ? "auto (prioridad por defecto)" : b}</option>`).join("");
+  $("repo_dir").value = info.default_repo;
+}).catch(() => {});
+connect();
+</script>
+</body>
+</html>

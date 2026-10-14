@@ -29,23 +29,19 @@ import os
 import sys
 from contextlib import AsyncExitStack
 
-import httpx
 from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
+from adk_bridge import AdkConversation, AgentLoopLlm, build_adk_agent, mcp_tools
 from agent_loop import (
+    JSON_CORRECTION_MESSAGE,
     OLLAMA_MODEL,
-    _call_mcp_tool,
     _connect_mcp_servers,
-    _final_text_with_json_retry,
     _normalize_tool_schema,
     _select_backend,
-    call_with_fallback,
-    compact_old_tool_results,
     init_ollama_model_state,
     maybe_switch_ollama_model,
     parse_ollama_model_candidates,
-    warn_if_context_large,
 )
 from log_utils import get_logger
 
@@ -199,54 +195,49 @@ async def plan_epic(epic: dict, children: list) -> dict:
             except Exception as exc:
                 logger.warning(f"epic planner: no se pudieron listar tools de '{name}': {exc}")
 
-        # Gap real (usuario, "hay gaps en el context window"): la unica tool
-        # que se le ofrece al planificador es neo4j-cypher (solo lectura),
-        # asi que compact_old_tool_results() puede compactar cualquiera.
-        read_only_tool_names = {t["name"] for t in tools}
+        adk_tools = mcp_tools(tools, sessions)
+        user_prompt = _build_user_prompt(epic, children)
 
-        messages = [{"role": "user", "content": _build_user_prompt(epic, children)}]
+        # ADK corre el loop de tools (el Runner ejecuta cada tool_use via los
+        # McpSessionTool y reenvia el resultado). Gap real (usuario, "hay gaps
+        # en el context window"): la unica tool que se le ofrece al
+        # planificador es neo4j-cypher (solo lectura), asi que el
+        # context_guard puede compactar cualquiera.
+        llm = AgentLoopLlm(ollama_model=ollama_model_state["active"], force_json=True)
+        agent = build_adk_agent(
+            "epic_planner", EPIC_PLANNER_SYSTEM_PROMPT, llm, adk_tools,
+            read_only_tool_names={t.name for t in adk_tools},
+        )
+        conversation = AdkConversation(agent)
 
-        async with httpx.AsyncClient() as client:
-            for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT,
-                    ollama_model=ollama_model_state["active"], force_json=True,
-                )
-                messages.append({"role": "assistant", "content": content})
+        async def say(text: str, final_answer: bool = False) -> str:
+            llm.ollama_model = ollama_model_state["active"]
+            llm.tools_disabled = final_answer  # el reintento pide texto corregido, no otra tool-call
+            return await conversation.say(text, max_llm_calls=None if final_answer else MAX_TOOL_TURNS)
 
-                if stop_reason != "tool_use":
-                    final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
-                    try:
-                        result = _extract_json(final_text)
-                    except json.JSONDecodeError:
-                        try:
-                            retry_text, _usage = await _final_text_with_json_retry(
-                                client, backend, messages, tools, EPIC_PLANNER_SYSTEM_PROMPT,
-                                ollama_model=ollama_model_state["active"],
-                            )
-                            result = _extract_json(retry_text)
-                        except json.JSONDecodeError:
-                            if maybe_switch_ollama_model(
-                                ollama_model_state, backend, EPIC_PLANNER_OLLAMA_MODELS, logger,
-                                "epic planner", "JSON invalido incluso tras el reintento de correccion",
-                            ):
-                                continue
-                            logger.warning("epic planner: el modelo no devolvio JSON valido, cae al orden mecanico")
-                            return _fallback_result(children)
-                    return _validate_result(result, children)
-
-                tool_results = []
-                for block in content:
-                    if block.get("type") != "tool_use":
+        try:
+            text = await say(user_prompt)
+            while True:
+                try:
+                    return _validate_result(_extract_json(text), children)
+                except json.JSONDecodeError:
+                    pass
+                # Un solo reintento de correccion (sin loop infinito).
+                text = await say(JSON_CORRECTION_MESSAGE, final_answer=True)
+                try:
+                    return _validate_result(_extract_json(text), children)
+                except json.JSONDecodeError:
+                    if maybe_switch_ollama_model(
+                        ollama_model_state, llm.last_backend, EPIC_PLANNER_OLLAMA_MODELS, logger,
+                        "epic planner", "JSON invalido incluso tras el reintento de correccion",
+                    ):
+                        text = await say(JSON_CORRECTION_MESSAGE, final_answer=True)
                         continue
-                    try:
-                        output = await _call_mcp_tool(sessions, block["name"], block.get("input", {}))
-                    except Exception as exc:
-                        output = f"error llamando a la herramienta: {exc}"
-                    tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
-                messages.append({"role": "user", "content": tool_results})
-                compact_old_tool_results(messages, read_only_tool_names)
-                warn_if_context_large(messages, logger, "epic planner", backend=backend, system_prompt=EPIC_PLANNER_SYSTEM_PROMPT)
+                    logger.warning("epic planner: el modelo no devolvio JSON valido, cae al orden mecanico")
+                    return _fallback_result(children)
+        except RuntimeError as exc:
+            logger.warning(f"epic planner: {exc}, cae al orden mecanico")
+            return _fallback_result(children)
 
     logger.warning("epic planner: agoto los turnos sin un resultado final, cae al orden mecanico")
     return _fallback_result(children)

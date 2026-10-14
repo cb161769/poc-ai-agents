@@ -42,3 +42,13 @@ def _default_no_grounding_check(monkeypatch):
     probar el grounding real lo sobreescribe con monkeypatch.setattr."""
     import judge_agent
     monkeypatch.setattr(judge_agent, "verify_claim_grounded", lambda *a, **k: None)
+
+
+@pytest.fixture(autouse=True)
+def _default_no_claude_cli(monkeypatch):
+    """El backend claude_cli se auto-detecta (PATH / extension de VS Code),
+    asi que en una maquina con Claude Code instalado cambiaria el backend
+    elegido en tests que asumen solo anthropic/ollama (y haria llamadas
+    reales al CLI). CLAUDE_CLI_PATH apuntando a un archivo inexistente lo
+    marca como no disponible; un test del backend lo sobreescribe."""
+    monkeypatch.setenv("CLAUDE_CLI_PATH", "/nonexistent/claude")

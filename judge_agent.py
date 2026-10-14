@@ -53,8 +53,10 @@ from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
 import sonar_client
+from adk_bridge import AdkConversation, AgentLoopLlm, build_adk_agent, mcp_tools, python_function_tool
 from agent_loop import (  # noqa: F401 -- _messages_to_ollama/_ollama_response_to_blocks/_estimate_cost_usd
     ANTHROPIC_MODEL,       # re-exported so existing imports/tests of judge_agent keep working
+    JSON_CORRECTION_MESSAGE,
     OLLAMA_MODEL,
     _call_mcp_tool,
     _call_model_turn,
@@ -677,180 +679,122 @@ async def judge_with_tools(payload: dict) -> dict:
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="juez")
 
-        tools = list(_local_tools_to_anthropic_format())
+        mcp_specs = []
         for name, session in sessions.items():
             try:
                 listed = await session.list_tools()
-                tools.extend(_normalize_tool_schema(name, listed.tools))
+                mcp_specs.extend(_normalize_tool_schema(name, listed.tools))
             except Exception as exc:
                 logger.warning(f"juez: no se pudieron listar tools de '{name}': {exc}")
 
-        # Gap real (usuario, "hay gaps en el context window"): todas las
-        # tools que se le ofrecen al juez son de solo lectura (query_sonar,
-        # neo4j-cypher, qdrant-rag -- el juez nunca escribe nada), asi que
-        # compact_old_tool_results() puede compactar cualquiera de ellas.
-        read_only_tool_names = {t["name"] for t in tools}
+        # Tools = funciones Python reales (FunctionTool de ADK, schema derivado
+        # de la firma) + tools MCP sobre las sesiones vivas (McpSessionTool).
+        adk_tools = [
+            python_function_tool(spec["fn"], name=name, description=spec["description"])
+            for name, spec in JUDGE_LOCAL_TOOLS.items()
+        ] + mcp_tools(mcp_specs, sessions)
 
-        messages = [{"role": "user", "content": _build_user_prompt(payload)}]
+        def note_tool_use(tool, args, tool_context, tool_response):
+            nonlocal consulted_risk_graph
+            if tool.name.startswith("neo4j-cypher__"):
+                consulted_risk_graph = True
+            return None
 
-        async with httpx.AsyncClient() as client:
-            for _ in range(MAX_TOOL_TURNS):
-                content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, JUDGE_SYSTEM_PROMPT, ollama_model=ollama_model_state["active"], force_json=True,
-                )
-                total_input_tokens += usage.get("input_tokens", 0)
-                total_output_tokens += usage.get("output_tokens", 0)
-                messages.append({"role": "assistant", "content": content})
+        llm = AgentLoopLlm(ollama_model=ollama_model_state["active"], force_json=True)
+        # Gap real (usuario, "hay gaps en el context window"): todas las tools
+        # que se le ofrecen al juez son de solo lectura (query_sonar,
+        # neo4j-cypher, qdrant-rag -- el juez nunca escribe nada), asi que el
+        # context_guard puede compactar cualquiera de ellas.
+        agent = build_adk_agent(
+            "judge", JUDGE_SYSTEM_PROMPT, llm, adk_tools,
+            read_only_tool_names={t.name for t in adk_tools}, after_tool_callback=note_tool_use,
+        )
+        conversation = AdkConversation(agent)
 
-                if stop_reason != "tool_use":
-                    final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
-                    try:
-                        verdict = _extract_json(final_text)
-                        if verdict.get("verdict") not in ("OK", "FLAGGED"):
-                            # Bug real confirmado esta sesion (mismo patron
-                            # que coding_agent.py con ornith:9b): un modelo
-                            # puede devolver JSON sintacticamente valido pero
-                            # SIN la clave "verdict" (o con un valor
-                            # invalido) -- sin este chequeo, orchestration.py
-                            # revienta con KeyError('verdict') al leer el
-                            # resultado. Se trata igual que JSON invalido:
-                            # dispara el mismo reintento de correccion.
-                            raise json.JSONDecodeError("falta 'verdict' valido (OK/FLAGGED) en el JSON", final_text, 0)
-                        verdict = _normalize_policy_reference(verdict)
-                    except json.JSONDecodeError:
-                        # Un solo reintento acotado -- si el modelo tampoco
-                        # devuelve JSON valido esta vez, se deja propagar y
-                        # main() lo maneja como error, sin loop infinito.
-                        retry_text, retry_usage = await _final_text_with_json_retry(
-                            client, backend, messages, tools, JUDGE_SYSTEM_PROMPT,
-                            ollama_model=ollama_model_state["active"], json_schema=JUDGE_RESULT_SCHEMA,
-                        )
-                        total_input_tokens += retry_usage.get("input_tokens", 0)
-                        total_output_tokens += retry_usage.get("output_tokens", 0)
-                        retry_verdict = _extract_json(retry_text)
-                        if retry_verdict.get("verdict") not in ("OK", "FLAGGED"):
-                            if maybe_switch_ollama_model(
-                                ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
-                                "juez", "JSON sin 'verdict' valido incluso tras el reintento de correccion",
-                            ):
-                                continue
-                            raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {retry_text[:500]!r}")
-                        retry_verdict = _normalize_policy_reference(retry_verdict)
-                        # Bug real confirmado esta sesion (investigacion KAN-5,
-                        # dos vueltas): este camino (JSON invalido en el primer
-                        # turno) devolvia el veredicto del reintento SIN pasar
-                        # nunca por los chequeos de auto-contradiccion/
-                        # alucinacion de abajo -- un bypass completo. La
-                        # primera correccion (solo loguear y aceptar) seguia
-                        # posteando el veredicto contradictorio real a Jira
-                        # sin darle al modelo ninguna chance de corregirse --
-                        # confirmado en vivo (KAN-5: "FLAGGED" con reasoning
-                        # 100% positivo, logueado pero igual publicado). Ahora
-                        # se le da UN empujon real aca tambien (mismo
-                        # presupuesto que el camino normal: una sola
-                        # correccion extra, nunca bloqueo infinito) antes de
-                        # aceptar.
-                        nudge_message = None
-                        if _verdict_is_self_contradictory(retry_verdict):
-                            nudge_message = JUDGE_CONSISTENCY_NUDGE_MESSAGE
-                        elif _reasoning_ignores_real_diff_files(payload, retry_verdict):
-                            nudge_message = JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE
+        async def say(text: str, final_answer: bool = False) -> str:
+            """final_answer=True: sin tools en este turno y con el esquema JSON
+            del veredicto (reintento de correccion/nudges piden texto
+            corregido, no otra tool-call)."""
+            nonlocal backend, total_input_tokens, total_output_tokens
+            llm.ollama_model = ollama_model_state["active"]
+            llm.tools_disabled = final_answer
+            llm.json_schema = JUDGE_RESULT_SCHEMA if final_answer else None
+            try:
+                return await conversation.say(text, max_llm_calls=None if final_answer else MAX_TOOL_TURNS)
+            finally:
+                backend = llm.last_backend or backend
+                total_input_tokens, total_output_tokens = llm.total_input_tokens, llm.total_output_tokens
 
-                        if nudge_message is not None:
-                            messages.append({"role": "user", "content": nudge_message})
-                            nudge_content, _nudge_stop, nudge_usage = await _call_model_turn(
-                                client, backend, messages, [], JUDGE_SYSTEM_PROMPT,
-                                ollama_model=ollama_model_state["active"], force_json=True,
-                            )
-                            messages.append({"role": "assistant", "content": nudge_content})
-                            total_input_tokens += nudge_usage.get("input_tokens", 0)
-                            total_output_tokens += nudge_usage.get("output_tokens", 0)
-                            nudge_text = next((b["text"] for b in nudge_content if b.get("type") == "text"), "")
-                            try:
-                                corrected_verdict = _extract_json(nudge_text)
-                                if corrected_verdict.get("verdict") in ("OK", "FLAGGED"):
-                                    retry_verdict = _normalize_policy_reference(corrected_verdict)
-                                elif maybe_switch_ollama_model(
-                                    ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
-                                    "juez", "la correccion post-reintento tampoco trajo un 'verdict' valido",
-                                ):
-                                    continue
-                                else:
-                                    logger.warning(
-                                        f"juez: la correccion post-reintento tampoco trajo un 'verdict' valido -- "
-                                        f"se acepta el veredicto anterior igual: {nudge_text[:500]!r}"
-                                    )
-                            except json.JSONDecodeError:
-                                if maybe_switch_ollama_model(
-                                    ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
-                                    "juez", "la correccion post-reintento no fue JSON valido",
-                                ):
-                                    continue
-                                logger.warning(
-                                    f"juez: la correccion post-reintento no fue JSON valido -- se acepta el "
-                                    f"veredicto anterior igual: {nudge_text[:500]!r}"
-                                )
-                        return _finalize(retry_verdict)
+        def parse_verdict(text: str) -> dict:
+            verdict = _extract_json(text)
+            if verdict.get("verdict") not in ("OK", "FLAGGED"):
+                # Bug real confirmado (mismo patron que coding_agent.py con
+                # ornith:9b): JSON valido SIN "verdict" (o invalido) hacia
+                # reventar orchestration.py con KeyError('verdict') -- se trata
+                # igual que JSON invalido.
+                raise json.JSONDecodeError("falta 'verdict' valido (OK/FLAGGED) en el JSON", text, 0)
+            return _normalize_policy_reference(verdict)
 
-                    if not consistency_nudge_given and _verdict_is_self_contradictory(verdict):
-                        # Confirmado real (KAN-15): verdict=FLAGGED con
-                        # reasoning/change_assessment que describen el
-                        # cambio como inofensivo/OK -- un solo empujon, si
-                        # en el reintento sigue contradictorio se acepta
-                        # igual (mismo criterio que el resto de los nudges
-                        # de esta sesion, nunca bloquea infinito).
-                        consistency_nudge_given = True
-                        messages.append({"role": "user", "content": JUDGE_CONSISTENCY_NUDGE_MESSAGE})
-                        continue
+        text = await say(_build_user_prompt(payload))
+        correction_given = False
+        last_valid_verdict = None
 
-                    if not consistency_nudge_given and _reasoning_ignores_real_diff_files(payload, verdict):
-                        # Confirmado real (KAN-5): reasoning sintacticamente
-                        # coherente pero que describe un cambio que no
-                        # existe en el diff real -- mismo presupuesto de un
-                        # solo empujon que el chequeo de arriba (comparten
-                        # la bandera para no encadenar nudges sin limite).
-                        consistency_nudge_given = True
-                        messages.append({"role": "user", "content": JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE})
-                        continue
+        while True:
+            try:
+                verdict = parse_verdict(text)
+            except json.JSONDecodeError:
+                if consistency_nudge_given and last_valid_verdict is not None:
+                    logger.warning(
+                        f"juez: la correccion posterior al nudge no fue JSON valido con 'verdict' -- se acepta "
+                        f"el veredicto anterior igual: {text[:500]!r}"
+                    )
+                    return _finalize(last_valid_verdict)
+                if not correction_given:
+                    # Un solo reintento acotado de JSON (sin loop infinito).
+                    correction_given = True
+                    text = await say(JSON_CORRECTION_MESSAGE, final_answer=True)
+                    continue
+                if maybe_switch_ollama_model(
+                    ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                    "juez", "JSON sin 'verdict' valido incluso tras el reintento de correccion",
+                ):
+                    correction_given = False
+                    text = await say(JSON_CORRECTION_MESSAGE, final_answer=True)
+                    continue
+                raise RuntimeError(f"el juez no devolvio un 'verdict' valido tras el reintento: {text[:500]!r}")
 
-                    if consistency_nudge_given and (
-                        _verdict_is_self_contradictory(verdict) or _reasoning_ignores_real_diff_files(payload, verdict)
-                    ):
-                        # El empujon de arriba ya se gasto y el veredicto
-                        # SIGUE alucinado -- antes de aceptarlo igual, un
-                        # ultimo intento: probar con otro modelo candidato
-                        # (presupuesto de un solo cambio por corrida, ver
-                        # maybe_switch_ollama_model).
-                        if maybe_switch_ollama_model(
-                            ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
-                            "juez", "veredicto sigue auto-contradictorio/alucinado incluso tras el nudge",
-                        ):
-                            continue
+            last_valid_verdict = verdict
+            contradictory = _verdict_is_self_contradictory(verdict)
+            nudge_message = None
+            if contradictory:
+                # Confirmado real (KAN-15): FLAGGED con reasoning que describe
+                # el cambio como inofensivo/OK.
+                nudge_message = JUDGE_CONSISTENCY_NUDGE_MESSAGE
+            elif _reasoning_ignores_real_diff_files(payload, verdict):
+                # Confirmado real (KAN-5): reasoning coherente pero sobre un
+                # cambio que no existe en el diff real.
+                nudge_message = JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE
 
-                    return _finalize(verdict)
+            if nudge_message is None:
+                return _finalize(verdict)
 
-                tool_results = []
-                for block in content:
-                    if block.get("type") == "tool_use":
-                        name = block["name"]
-                        tool_input = block.get("input", {})
-                        try:
-                            if name in JUDGE_LOCAL_TOOLS:
-                                output = JUDGE_LOCAL_TOOLS[name]["fn"](**tool_input)
-                            else:
-                                if name.startswith("neo4j-cypher__"):
-                                    consulted_risk_graph = True
-                                output = await _call_mcp_tool(sessions, name, tool_input)
-                        except Exception as exc:
-                            output = f"error llamando a la herramienta: {exc}"
-                        tool_results.append(
-                            {"type": "tool_result", "tool_use_id": block["id"], "content": str(output)}
-                        )
-                messages.append({"role": "user", "content": tool_results})
-                compact_old_tool_results(messages, read_only_tool_names)
-                warn_if_context_large(messages, logger, "juez", backend=backend, system_prompt=JUDGE_SYSTEM_PROMPT)
+            # Un solo empujon por corrida, nunca bloqueo infinito (mismo
+            # presupuesto que antes para todos los caminos).
+            if not consistency_nudge_given:
+                consistency_nudge_given = True
+                text = await say(nudge_message, final_answer=True)
+                continue
 
-    raise RuntimeError("el juez agoto los turnos de herramientas sin dar un veredicto final")
+            # El empujon ya se gasto y el veredicto SIGUE alucinado -- ultimo
+            # intento antes de aceptarlo: otro modelo candidato (un cambio por
+            # corrida, ver maybe_switch_ollama_model).
+            if maybe_switch_ollama_model(
+                ollama_model_state, backend, JUDGE_OLLAMA_MODELS, logger,
+                "juez", "veredicto sigue auto-contradictorio/alucinado incluso tras el nudge",
+            ):
+                text = await say(nudge_message, final_answer=True)
+                continue
+            return _finalize(verdict)
 
 
 def _redact_payload_for_logging(payload: dict) -> dict:

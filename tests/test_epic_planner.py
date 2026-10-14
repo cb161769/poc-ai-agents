@@ -3,6 +3,7 @@ _validate_result) directly, and plan_epic() with call_with_fallback/MCP
 mocked -- same pattern already used in tests/test_judge_agent.py for the
 equivalent dual-backend agent loop.
 """
+import adk_bridge
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -113,7 +114,7 @@ def test_plan_epic_uses_model_reorder(monkeypatch):
         ]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 
@@ -139,7 +140,7 @@ def test_plan_epic_compacts_old_tool_results(monkeypatch):
         epic_planner, "_normalize_tool_schema",
         lambda name, tools: [{"name": "neo4j-cypher__query", "description": "d", "input_schema": {}}],
     )
-    monkeypatch.setattr(epic_planner, "_call_mcp_tool", AsyncMock(return_value="resultado"))
+    monkeypatch.setattr(adk_bridge, "_call_mcp_tool", AsyncMock(return_value="resultado"))
 
     call_count = {"n": 0}
 
@@ -151,10 +152,16 @@ def test_plan_epic_compacts_old_tool_results(monkeypatch):
         content = [{"type": "text", "text": '{"ordered_children": ["JIRA-1", "JIRA-2"], "coordination_notes": "", "conflicts": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     compact_calls = []
-    monkeypatch.setattr(epic_planner, "compact_old_tool_results", lambda messages, names: compact_calls.append(names))
+    real_build_adk_agent = epic_planner.build_adk_agent
+
+    def spy_build_adk_agent(*args, **kwargs):
+        compact_calls.append(kwargs.get("read_only_tool_names"))
+        return real_build_adk_agent(*args, **kwargs)
+
+    monkeypatch.setattr(epic_planner, "build_adk_agent", spy_build_adk_agent)
 
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 
@@ -174,11 +181,7 @@ def test_plan_epic_falls_back_when_model_returns_invalid_json(monkeypatch):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(epic_planner, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 
@@ -213,11 +216,7 @@ def test_plan_epic_switches_ollama_model_when_json_invalid_persists(monkeypatch)
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(epic_planner, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 
@@ -243,11 +242,7 @@ def test_plan_epic_still_falls_back_when_only_one_ollama_candidate(monkeypatch):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(epic_planner, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(epic_planner, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(plan_epic({"key": "EPIC-1", "summary": "s", "description": "d"}, _children()))
 

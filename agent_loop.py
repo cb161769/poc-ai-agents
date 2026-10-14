@@ -2,7 +2,9 @@
 machinery -- used by judge_agent.py (independent auditor) and coding_agent.py
 (the real local coding agent, Camino B1 of run_poc_loop.sh/orchestration.py).
 
-Neither caller reimplements backend switching, message-format adapters, or
+Los agents corren sobre Google ADK (adk_bridge.py): LlmAgent/Runner con tools
+como funciones Python reales (FunctionTool) y un BaseLlm propio que delega en
+call_with_fallback() de este modulo. Neither caller reimplements backend switching, message-format adapters, or
 MCP plumbing: they each bring their own system prompt, their own tools
 (MCP and/or local), and their own loop-termination logic (a judge verdict
 vs. a coding agent's done/blocked status), and call _call_model_turn() /
@@ -10,9 +12,11 @@ _connect_mcp_servers() / _call_mcp_tool() from here.
 
 Model backend, in order of preference (same for both callers):
   1. Anthropic API (ANTHROPIC_API_KEY set) — best quality.
-  2. Local Ollama container (OLLAMA_URL reachable) — free, offline fallback
+  2. Claude Code CLI headless (`claude -p`, backend "claude_cli" -- usa la
+     sesion/suscripcion del CLI, ver claude_cli_backend.py) si esta instalado.
+  3. Local Ollama container (OLLAMA_URL reachable) — free, offline fallback
      with a tool-calling capable model (OLLAMA_MODEL, default "llama3.1").
-  3. Neither available — caller decides what "none" means for it (the judge
+  4. None available — caller decides what "none" means for it (the judge
      skips the run; the coding agent falls back to gh copilot suggest).
 """
 import asyncio
@@ -34,6 +38,7 @@ from llm_backends import (
     get_backend_priority,
     is_within_budget,
 )
+from claude_cli_backend import call_claude_cli, claude_cli_available
 from log_utils import get_logger
 
 load_dotenv()
@@ -163,6 +168,8 @@ def _backend_available(backend: str) -> bool:
     reachable = False
     if backend == "anthropic":
         reachable = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    elif backend == "claude_cli":
+        reachable = claude_cli_available()
     elif backend == "ollama":
         try:
             httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3.0)
@@ -518,6 +525,11 @@ async def _call_model_turn(
     """
     anthropic_model = anthropic_model or ANTHROPIC_MODEL
     ollama_model = ollama_model or OLLAMA_MODEL
+
+    if backend == "claude_cli":
+        return await call_claude_cli(
+            messages, tools, system_prompt, force_json=force_json, json_schema=json_schema,
+        )
 
     if backend == "anthropic":
         # Prompt caching: system_prompt y tools son estaticos dentro de una

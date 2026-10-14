@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import adk_bridge
 import agent_loop
 import coding_agent as ca
 
@@ -703,7 +704,7 @@ def test_run_coding_agent_blocks_write_before_investigation(monkeypatch, tmp_pat
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -731,7 +732,7 @@ def test_run_coding_agent_allows_write_after_investigation(monkeypatch, tmp_path
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo y verificado", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -780,7 +781,7 @@ def test_run_test_writer_subagent_strips_lockfile_noise_from_prompt(monkeypatch,
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     diff_text = (
         "diff --git a/frontend/src/x.ts b/frontend/src/x.ts\n+ real code\n"
@@ -810,7 +811,7 @@ def test_run_test_writer_subagent_uses_test_writer_system_prompt(monkeypatch, tm
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     diff_text = "diff --git a/frontend/src/auth-guard.ts b/frontend/src/auth-guard.ts\n+ new code"
     asyncio.run(ca.run_test_writer_subagent("KAN-5", diff_text, "Montar AuthGuard", str(tmp_path)))
@@ -844,7 +845,7 @@ def test_run_coding_agent_review_uses_review_system_prompt(monkeypatch, tmp_path
         content = [{"type": "text", "text": '{"status": "done", "summary": "se ve bien", "files_changed": [], "self_review": {"scope_matches_ticket": true, "no_secrets_introduced": true, "tests_adequate": true}, "review_feedback": ""}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     diff_text = "diff --git a/auth-service/src/Auth.java b/auth-service/src/Auth.java\n+ new code"
     result = asyncio.run(ca.run_coding_agent_review("KAN-5", diff_text, "backend", str(tmp_path)))
@@ -862,7 +863,7 @@ def test_run_coding_agent_review_reports_blocked_when_it_requests_changes(monkey
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "hardcoded secret found", "files_changed": [], "self_review": {"scope_matches_ticket": true, "no_secrets_introduced": false, "tests_adequate": true}, "review_feedback": "quita el token hardcodeado"}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent_review("KAN-5", "diff real", "frontend", str(tmp_path)))
 
@@ -964,7 +965,7 @@ def test_run_coding_agent_does_not_count_trivial_shell_command_as_verification(m
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -986,7 +987,7 @@ def test_run_coding_agent_reports_wrote_any_file_false_when_blocked_without_writ
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "el path es un archivo, no un directorio", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1012,7 +1013,7 @@ def test_run_coding_agent_reports_wrote_any_file_true_when_a_write_succeeded(mon
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": ["new.ts"]}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1049,7 +1050,7 @@ def test_run_coding_agent_blocks_scaffold_command_without_listing_target_dir(mon
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     def fail_if_called(*a, **k):
@@ -1088,7 +1089,7 @@ def test_run_coding_agent_allows_scaffold_command_after_listing_target_dir(monke
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     class FakeCompleted:
@@ -1115,7 +1116,7 @@ def test_run_coding_agent_nudges_for_verification_before_accepting_done(monkeypa
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1131,15 +1132,22 @@ def test_run_coding_agent_retries_on_malformed_final_json(monkeypatch, tmp_path)
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "blocked", "summary": "recuperado", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1158,15 +1166,22 @@ def test_run_coding_agent_retries_when_final_json_has_wrong_schema(monkeypatch, 
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": '{"plan": "Detectar el stack del proyecto."}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "blocked", "summary": "recuperado del esquema invalido", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1178,7 +1193,7 @@ def test_run_coding_agent_degrades_to_blocked_when_retry_also_has_wrong_schema(m
     monkeypatch.setattr(ca, "_select_backend", lambda: "anthropic")
     monkeypatch.setattr(ca, "_connect_mcp_servers", _fake_connect_mcp)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": '{"plan": "primer intento"}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
@@ -1187,8 +1202,15 @@ def test_run_coding_agent_degrades_to_blocked_when_retry_also_has_wrong_schema(m
         # blocked igual que con JSON directamente invalido, no queda colgado.
         return '{"plan": "segundo intento, sigue mal"}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1239,7 +1261,7 @@ def test_run_coding_agent_nudges_to_investigate_first_when_refusal_comes_before_
         captured_messages.append(messages[-1])
         return await fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
 
-    monkeypatch.setattr(ca, "call_with_fallback", spying_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", spying_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1279,7 +1301,7 @@ def test_run_coding_agent_blocks_cleanly_after_repeated_eof_on_confirmation(monk
         content = [{"type": "tool_use", "id": f"call_{call_count['n']}", "name": "write_file", "input": {"path": f"f{call_count['n']}.txt", "content": "x"}}]
         return content, "tool_use", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1325,7 +1347,7 @@ def test_run_coding_agent_nudges_when_model_refuses_to_call_tool(monkeypatch, tm
         }]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1343,7 +1365,7 @@ def test_run_coding_agent_only_nudges_tool_call_refusal_once(monkeypatch, tmp_pa
     call_count = {"n": 0}
     refusal_text = "No puedo crear ese archivo sin confirmación humana."
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             content = [{"type": "tool_use", "id": "call_1", "name": "read_file", "input": {"path": "existing.txt"}}]
@@ -1356,8 +1378,15 @@ def test_run_coding_agent_only_nudges_tool_call_refusal_once(monkeypatch, tmp_pa
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "blocked", "summary": "no se animo a llamar la tool", "files_changed": []}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1391,7 +1420,7 @@ def test_run_coding_agent_switches_ollama_model_when_json_invalid_persists(monke
 
     call_count = {"n": 0}
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         call_count["n"] += 1
         if kwargs.get("ollama_model") == "modelo-b":
             content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el segundo modelo", "files_changed": []}'}]
@@ -1402,8 +1431,15 @@ def test_run_coding_agent_switches_ollama_model_when_json_invalid_persists(monke
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1421,15 +1457,22 @@ def test_run_coding_agent_still_blocks_when_json_invalid_and_only_one_ollama_can
     monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a"])
     _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1454,7 +1497,7 @@ def test_run_coding_agent_extends_turn_budget_on_model_switch(monkeypatch, tmp_p
     monkeypatch.setattr(ca, "MIN_TURNS_AFTER_MODEL_SWITCH", 5)
     _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         if kwargs.get("ollama_model") == "modelo-b":
             content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el modelo nuevo", "files_changed": []}'}]
             return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
@@ -1464,8 +1507,15 @@ def test_run_coding_agent_extends_turn_budget_on_model_switch(monkeypatch, tmp_p
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1485,7 +1535,7 @@ def test_run_coding_agent_passes_real_json_schema_to_retry(monkeypatch, tmp_path
     monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a"])
     _mock_ollama_tags(monkeypatch, ["modelo-a:latest"])
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         content = [{"type": "text", "text": "esto no es json"}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
@@ -1495,8 +1545,15 @@ def test_run_coding_agent_passes_real_json_schema_to_retry(monkeypatch, tmp_path
         captured.update(kwargs)
         return "sigue sin ser json", {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1521,7 +1578,7 @@ def test_run_coding_agent_switches_ollama_model_when_blocked_cites_own_json_conf
     monkeypatch.setattr(ca, "CODING_AGENT_OLLAMA_MODELS", ["modelo-a", "modelo-b"])
     _mock_ollama_tags(monkeypatch, ["modelo-a:latest", "modelo-b:latest"])
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+    async def _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         if kwargs.get("ollama_model") == "modelo-b":
             content = [{"type": "text", "text": '{"status": "done", "summary": "listo con el segundo modelo", "files_changed": []}'}]
             return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
@@ -1535,8 +1592,15 @@ def test_run_coding_agent_switches_ollama_model_when_blocked_cites_own_json_conf
             {"input_tokens": 1, "output_tokens": 1},
         )
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(ca, "_final_text_with_json_retry", fake_json_retry)
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        # El reintento de correccion de JSON ahora es un turno mas de la conversacion ADK (mensaje
+        # JSON_CORRECTION_MESSAGE), no una llamada aparte a _final_text_with_json_retry.
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE and not tools:  # turno "respuesta final" (sin tools)
+            text, usage = await fake_json_retry(client, "anthropic", messages, tools, system_prompt, **kwargs)
+            return [{"type": "text", "text": text}], "end_turn", usage, ("ollama" if kwargs.get("ollama_model") else "anthropic")
+        return await _base_fake_call_with_fallback(client, messages, tools, system_prompt, exclude=exclude, **kwargs)
+
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1566,7 +1630,7 @@ def test_run_coding_agent_does_not_switch_model_on_legitimate_ticket_ambiguity_b
         }]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1603,7 +1667,7 @@ def test_run_coding_agent_nudges_when_done_claims_files_changed_but_never_wrote(
         # incluso despues del nudge.
         return [{"type": "text", "text": json.dumps(fabricated)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1654,7 +1718,7 @@ def test_run_coding_agent_accepts_done_immediately_when_write_file_really_ran(mo
         }
         return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     # has_investigated=True (seed) para que write_file corra de verdad en
     # vez de chocar con el gate de "investiga antes de escribir" -- eso no
@@ -1702,7 +1766,7 @@ def test_run_coding_agent_forces_reverification_after_writing_a_new_file(monkeyp
         }
         return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     # Semilla realista de un reintento: ya investigo Y ya verifico en un
     # turno ANTERIOR (misma conversacion continuada) -- pero esta corrida
@@ -1737,7 +1801,7 @@ def test_run_coding_agent_does_not_force_reverification_when_nothing_new_was_wri
         }
         return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent(
         "T-1", "hace algo", str(tmp_path),
@@ -1777,7 +1841,7 @@ def test_run_coding_agent_switches_ollama_model_when_tool_refusal_persists_after
         content = [{"type": "text", "text": refusal_text}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1811,7 +1875,7 @@ def test_run_coding_agent_resume_skips_reinvestigation(monkeypatch, tmp_path):
         }
         return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     prior_messages = [
         {"role": "user", "content": "Ticket: T-1\n\narregla el boton"},
@@ -1841,7 +1905,7 @@ def test_run_coding_agent_writes_conversation_file_for_resume(monkeypatch, tmp_p
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1876,7 +1940,7 @@ def test_run_coding_agent_captures_initial_plan(monkeypatch, tmp_path):
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 
@@ -1896,7 +1960,7 @@ def test_run_coding_agent_initial_plan_survives_resume(monkeypatch, tmp_path):
         content = [{"type": "text", "text": '{"status": "done", "summary": "corregido", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(
         ca.run_coding_agent(
@@ -1943,7 +2007,7 @@ def test_run_coding_agent_accepts_done_with_valid_self_review_no_extra_nudge(mon
         }
         return [{"type": "text", "text": json.dumps(final)}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -1976,7 +2040,7 @@ def test_run_coding_agent_nudges_once_for_missing_self_review(monkeypatch, tmp_p
         content = [{"type": "text", "text": '{"status": "done", "summary": "listo", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr("builtins.input", lambda: "s")
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
@@ -2759,7 +2823,7 @@ def test_run_coding_agent_blocks_edit_before_investigation(monkeypatch, tmp_path
         content = [{"type": "text", "text": '{"status": "blocked", "summary": "no pude", "files_changed": []}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(ca, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(ca.run_coding_agent("T-1", "hace algo", str(tmp_path)))
 

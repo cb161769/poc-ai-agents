@@ -31,6 +31,7 @@ Prints to stdout: {"status": "done"|"blocked", "summary": "...",
 Every call is appended to logs/coding_agent_runs.jsonl.
 """
 import asyncio
+import contextvars
 import difflib
 import hashlib
 import json
@@ -50,22 +51,25 @@ from dotenv import load_dotenv
 from mcp import StdioServerParameters
 
 import sonar_client
+from adk_bridge import (
+    AdkConversation,
+    AgentLoopLlm,
+    AgentTurnsExhausted,
+    build_adk_agent,
+    mcp_tools,
+    python_function_tool,
+)
 from agent_loop import (
     ANTHROPIC_MODEL,
+    JSON_CORRECTION_MESSAGE,
     OLLAMA_MODEL,
-    _call_mcp_tool,
-    _call_model_turn,
     _connect_mcp_servers,
     _estimate_cost_usd,
-    _final_text_with_json_retry,
     _normalize_tool_schema,
     _select_backend,
-    call_with_fallback,
-    compact_old_tool_results,
     init_ollama_model_state,
     maybe_switch_ollama_model,
     parse_ollama_model_candidates,
-    warn_if_context_large,
 )
 from log_utils import get_logger
 
@@ -761,10 +765,28 @@ def tool_grep_search(target_repo_dir: str, pattern: str, path: str = ".") -> str
     return "\n".join(matches) if matches else "(sin resultados)"
 
 
-def _confirm(prompt_text: str) -> bool:
+async def _default_confirm_hook(prompt_text: str) -> bool:
+    """Comportamiento de siempre -- input() real sobre la terminal heredada
+    (funciona porque run_coding_agent_local_real corre este modulo como
+    subprocess con stdin heredado de "docker run -i", ver orchestration.py).
+    """
     print(prompt_text, file=sys.stderr)
     answer = input().strip().lower()
     return answer == "s"
+
+
+# ContextVar (no un parametro hilvanado a mano por cada tool) porque
+# tool_write_file/tool_edit_file/tool_run_shell_command se llaman desde
+# LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input) -- una firma fija
+# que no tiene lugar para pasar un hook extra sin romper las otras tools
+# que no confirman nada. run_coding_agent() setea esto UNA vez por corrida
+# (ver confirm_hook mas abajo) -- pedido explicito del usuario, chat_server.py
+# (nuevo) lo usa para relayar la confirmacion a un WebSocket en vez de stdin.
+_confirm_hook: contextvars.ContextVar = contextvars.ContextVar("_confirm_hook", default=_default_confirm_hook)
+
+
+async def _confirm(prompt_text: str) -> bool:
+    return await _confirm_hook.get()(prompt_text)
 
 
 _COMMON_CODE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx")
@@ -878,7 +900,7 @@ def _looks_like_directory_placeholder(path: str, content: str) -> bool:
     return not re.search(r"[{}();=<>]", stripped)
 
 
-def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
+async def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     try:
         full_path = _safe_path(target_repo_dir, path)
     except ValueError as exc:
@@ -923,7 +945,7 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
         print(content, file=sys.stderr)
         print("---", file=sys.stderr)
 
-    if not _confirm("¿Aplicar este cambio? [s/n]: "):
+    if not await _confirm("¿Aplicar este cambio? [s/n]: "):
         return "el usuario rechazo este cambio, no se escribio nada"
 
     full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -932,7 +954,7 @@ def tool_write_file(target_repo_dir: str, path: str, content: str) -> str:
     return f"escrito ok: {path}{warning}"
 
 
-def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string: str) -> str:
+async def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string: str) -> str:
     """str_replace-style edit: old_string must match EXACTLY ONCE in the
     file, same discipline as the Edit tool this session already uses --
     cheaper in tokens and produces a much more reviewable diff than
@@ -991,7 +1013,7 @@ def tool_edit_file(target_repo_dir: str, path: str, old_string: str, new_string:
     print("---", file=sys.stderr)
     print("".join(diff_lines) if diff_lines else "(sin cambios)", file=sys.stderr)
     print("---", file=sys.stderr)
-    if not _confirm("¿Aplicar este cambio? [s/n]: "):
+    if not await _confirm("¿Aplicar este cambio? [s/n]: "):
         return "el usuario rechazo este cambio, no se edito nada"
 
     full_path.write_text(new_content, encoding="utf-8")
@@ -1574,7 +1596,7 @@ def _run_command_in_stack_container(image: str, command: str, target_repo_dir: s
         return "error: el comando (containerizado, imagen real) supero el timeout de 600s"
 
 
-def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") -> str:
+async def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") -> str:
     """cwd (opcional, relativo a target_repo_dir): en que subcarpeta correr
     el comando -- sin esto, siempre corria en la RAIZ del repo, lo que
     rompe cualquier comando (npm test, mvn test, pytest) en un monorepo con
@@ -1596,7 +1618,7 @@ def tool_run_shell_command(target_repo_dir: str, command: str, cwd: str = "") ->
     if _DANGEROUS_COMMAND_PATTERN.search(command):
         print("⚠️  COMANDO POTENCIALMENTE DESTRUCTIVO ⚠️  (ej. borra archivos, reescribe historial de git, o similar)", file=sys.stderr)
         prompt = "¿Ejecutar este comando POTENCIALMENTE DESTRUCTIVO igual? [s/n]: "
-    if not _confirm(prompt):
+    if not await _confirm(prompt):
         return "el usuario rechazo ejecutar este comando"
 
     stack_image = _resolve_stack_image_if_needed(command, work_dir)
@@ -1911,6 +1933,7 @@ async def run_coding_agent(
     resume_state: dict = None,
     system_prompt: str = CODING_AGENT_SYSTEM_PROMPT,
     ollama_candidates: list = None,
+    confirm_hook=None,
 ) -> dict:
     """Si resume_messages viene seteado (reintento tras un veredicto FLAGGED
     retryable del juez -- ver retry_coding_agent_with_feedback() en
@@ -1933,7 +1956,15 @@ async def run_coding_agent(
     nada para quien no lo pase. backend_agent/frontend_agent/coding_agent_review
     (main(), mas abajo) resuelven su propia lista via BACKEND_AGENT_OLLAMA_MODEL/
     FRONTEND_AGENT_OLLAMA_MODEL/CODING_AGENT_REVIEW_OLLAMA_MODEL.
+
+    confirm_hook: pedido explicito del usuario (chat UI) -- default None
+    preserva el _default_confirm_hook (input() real sobre la terminal
+    heredada, el camino CLI/subprocess de siempre). chat_server.py pasa un
+    hook que relaya la misma confirmacion a un WebSocket -- ver
+    _confirm_hook (ContextVar) mas arriba.
     """
+    if confirm_hook is not None:
+        _confirm_hook.set(confirm_hook)
     ollama_candidates = ollama_candidates or CODING_AGENT_OLLAMA_MODELS
     backend = _select_backend()
     logger.info(f"coding agent: usando backend '{backend}'")
@@ -1997,7 +2028,10 @@ async def run_coding_agent(
     wrote_any_file = False
     no_write_nudge_given = False
 
-    def _finalize(result: dict) -> dict:
+    conversation = None
+    resumed_messages: list = []
+
+    async def _finalize(result: dict) -> dict:
         result["self_verified"] = has_run_verification
         result["initial_plan"] = initial_plan
         result["consulted_risk_graph"] = consulted_risk_graph
@@ -2013,7 +2047,7 @@ async def run_coding_agent(
         # no inflar logs/coding_agent_runs.jsonl con la conversacion
         # completa en cada corrida normal -- solo un reintento la necesita.
         conversation_state = {
-            "messages": messages,
+            "messages": await conversation.export_messages() if conversation is not None else resumed_messages,
             "has_investigated": has_investigated,
             "has_run_verification": has_run_verification,
             "initial_plan": initial_plan,
@@ -2028,242 +2062,248 @@ async def run_coding_agent(
             result["_conversation_file"] = f.name
         return result
 
+    class _EofAbort(Exception):
+        """Segundo EOF seguido al pedir confirmacion: no hay terminal interactiva."""
+
     async with AsyncExitStack() as stack:
         sessions = await _connect_mcp_servers(stack, MCP_SERVERS, label="coding agent")
 
-        tools = list(_local_tools_to_anthropic_format())
+        mcp_specs = []
         for name, session in sessions.items():
             try:
                 listed = await session.list_tools()
-                tools.extend(_normalize_tool_schema(name, listed.tools))
+                mcp_specs.extend(_normalize_tool_schema(name, listed.tools))
             except Exception as exc:
                 logger.warning(f"coding agent: no se pudieron listar tools de '{name}': {exc}")
 
-        if resume_messages:
-            messages = list(resume_messages)
-            messages.append({"role": "user", "content": sanitized_prompt})
-        else:
-            messages = [{"role": "user", "content": _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)}]
-
-        async with httpx.AsyncClient() as client:
-            # while + contador mutable (turn_budget), no "for _ in range(MAX_TOOL_TURNS)":
-            # un cambio real de modelo (maybe_switch_ollama_model) extiende
-            # turn_budget en el momento -- ver MIN_TURNS_AFTER_MODEL_SWITCH
-            # arriba y cada sitio que llama a maybe_switch_ollama_model mas
-            # abajo. range() no se puede extender una vez arrancado el loop.
-            turn_budget = MAX_TOOL_TURNS
-            turns_used = 0
-            while turns_used < turn_budget:
-                turns_used += 1
-                content, stop_reason, usage, backend = await call_with_fallback(
-                    client, messages, tools, system_prompt,
-                    ollama_model=ollama_model_state["active"], force_json=True,
+        # --- gates y tracking de efectos de cada tool local -------------------
+        # Antes vivian inline en el loop manual de tool_use; ahora son hooks de
+        # python_function_tool (corren DENTRO del lock, en orden, porque ADK
+        # ejecuta los tool-calls de un turno en paralelo y las confirmaciones
+        # por stdin / el estado "ya investigue" dependen de ese orden).
+        def pre_hook(name: str, tool_input: dict):
+            if name in ("write_file", "edit_file", "run_shell_command") and not has_investigated:
+                return (
+                    "Todavia no investigaste el repo. Usa read_file, list_directory, o "
+                    "grep_search antes de escribir o ejecutar algo."
                 )
-                total_input_tokens += usage.get("input_tokens", 0)
-                total_output_tokens += usage.get("output_tokens", 0)
-                messages.append({"role": "assistant", "content": content})
+            if (
+                name == "run_shell_command"
+                and _SCAFFOLD_COMMAND_PATTERN.search(str(tool_input.get("command", "")))
+                and _normalize_listed_dir(tool_input.get("cwd", "")) not in listed_dirs
+            ):
+                scaffold_dir = tool_input.get("cwd") or "."
+                return (
+                    f"Este comando crea estructura de proyecto NUEVA (scaffolding) en '{scaffold_dir}' -- "
+                    f"antes de correrlo, usa list_directory con path=\"{scaffold_dir}\" para confirmar si "
+                    "ya existe estructura real ahi (ej. un src/ existente) que deberias extender en vez "
+                    "de duplicar."
+                )
+            return None
 
-                if stop_reason != "tool_use":
-                    final_text = next((b["text"] for b in content if b.get("type") == "text"), "")
+        def post_hook(name: str, tool_input: dict, output):
+            nonlocal has_investigated, wrote_any_file, dirty_since_verification
+            nonlocal verification_nudge_given, has_run_verification
+            if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
+                has_investigated = True
+            if name in ("write_file", "edit_file") and not str(output).startswith("error:"):
+                wrote_any_file = True
+                dirty_since_verification = True
+                verification_nudge_given = False
+            if name == "list_directory":
+                listed_dirs.add(_normalize_listed_dir(tool_input.get("path", ".")))
+            if name == "run_shell_command" and _VERIFICATION_COMMAND_PATTERN.search(str(tool_input.get("command", ""))):
+                has_run_verification = True
+                dirty_since_verification = False
 
-                    if (
-                        tool_call_nudge_given
-                        and _TOOL_CALL_REFUSAL_PATTERN.search(final_text)
-                        and maybe_switch_ollama_model(
-                            ollama_model_state, backend, ollama_candidates, logger,
-                            "coding agent", "se nego a llamar la tool incluso tras el nudge",
-                        )
-                    ):
-                        turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
-                        continue
+        def on_exception(exc: Exception) -> str:
+            nonlocal consecutive_eof_errors
+            if isinstance(exc, EOFError):
+                consecutive_eof_errors += 1
+                if consecutive_eof_errors >= 2:
+                    raise _EofAbort() from exc
+                return "error: no se pudo leer la confirmacion (EOF) -- reintentando"
+            return f"error llamando a la herramienta: {exc}"
 
-                    if not tool_call_nudge_given and _TOOL_CALL_REFUSAL_PATTERN.search(final_text):
-                        # El modelo anuncio una negativa a llamar la tool en
-                        # vez de llamarla -- un nudge especifico ataca la
-                        # causa real, a diferencia del reintento generico de
-                        # "dame JSON valido" (que solo le pide reformatear la
-                        # misma negativa como JSON, no que actue). No
-                        # depende de has_investigated -- confirmado real que
-                        # el modelo puede rendirse ANTES de investigar con
-                        # exito (ej. adivino mal una ruta), y en ese caso el
-                        # nudge tiene que mandarlo a investigar bien primero,
-                        # no solo repetirle "llama la tool ya".
-                        tool_call_nudge_given = True
-                        nudge = TOOL_CALL_NUDGE_MESSAGE if has_investigated else TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION
-                        messages.append({"role": "user", "content": nudge})
-                        continue
+        tool_lock = asyncio.Lock()
+        # Tools locales = funciones Python REALES (tool_read_file, tool_write_file...)
+        # envueltas como FunctionTool de ADK con target_repo_dir ya bindeado;
+        # tools MCP = McpSessionTool sobre las sesiones vivas.
+        adk_tools = [
+            python_function_tool(
+                spec["fn"], name=name, bind_first_arg=target_repo_dir, description=spec["description"],
+                lock=tool_lock, pre_hook=pre_hook, post_hook=post_hook, on_exception=on_exception,
+            )
+            for name, spec in LOCAL_TOOLS.items()
+        ] + mcp_tools(mcp_specs, sessions)
 
-                    try:
-                        result = _extract_json(final_text)
-                        if result.get("status") not in ("done", "blocked"):
-                            # Real: ornith:9b devolvio JSON sintacticamente
-                            # valido pero con el esquema equivocado
-                            # ({"plan": "..."} en vez de {"status":...,
-                            # "summary":...}) -- sin este chequeo, el parseo
-                            # "exitoso" hacia que este resultado ambiguo (sin
-                            # status) se aceptara tal cual como final,
-                            # dejando el ticket en un estado indefinido en
-                            # vez de disparar el mismo reintento de
-                            # correccion que ya existe para JSON invalido.
-                            raise json.JSONDecodeError("falta 'status' valido en el JSON", final_text, 0)
-                    except json.JSONDecodeError:
-                        # Un solo reintento acotado antes de degradar a blocked.
-                        retry_text, retry_usage = await _final_text_with_json_retry(
-                            client, backend, messages, tools, system_prompt,
-                            ollama_model=ollama_model_state["active"], json_schema=CODING_AGENT_RESULT_SCHEMA,
-                        )
-                        total_input_tokens += retry_usage.get("input_tokens", 0)
-                        total_output_tokens += retry_usage.get("output_tokens", 0)
-                        try:
-                            result = _extract_json(retry_text)
-                            if result.get("status") not in ("done", "blocked"):
-                                raise json.JSONDecodeError("falta 'status' valido en el JSON", retry_text, 0)
-                        except json.JSONDecodeError:
-                            if maybe_switch_ollama_model(
-                                ollama_model_state, backend, ollama_candidates, logger,
-                                "coding agent", "JSON invalido incluso tras el reintento de correccion",
-                            ):
-                                turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
-                                continue
-                            return _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
+        def note_mcp_tool_use(tool, args, tool_context, tool_response):
+            nonlocal consulted_risk_graph
+            if tool.name.startswith("neo4j-cypher__"):
+                consulted_risk_graph = True
+            return None
 
-                    if (
-                        result.get("status") == "blocked"
-                        and _JSON_CONFUSION_BLOCKED_PATTERN.search(result.get("summary", ""))
-                        and maybe_switch_ollama_model(
-                            ollama_model_state, backend, ollama_candidates, logger,
-                            "coding agent",
-                            "reporto 'blocked' citando su propia confusion sobre el formato JSON, no una ambiguedad real del ticket",
-                        )
-                    ):
-                        turn_budget = max(turn_budget, turns_used + MIN_TURNS_AFTER_MODEL_SWITCH)
-                        continue
-
-                    if (
-                        result.get("status") == "done"
-                        and result.get("files_changed")
-                        and not wrote_any_file
-                        and not no_write_nudge_given
-                    ):
-                        # Un solo empujon, mismo criterio que los demas --
-                        # si tampoco escribe nada real la segunda vez, se
-                        # acepta igual (files_changed queda trazado tal
-                        # cual, sin verificar), no se bloquea infinito. La
-                        # red de seguridad real (git status/commits_ahead en
-                        # orchestration.py) sigue siendo quien decide si
-                        # "applied" es verdad, esto solo evita desperdiciar
-                        # el turno entero en una fabricacion sin intentar
-                        # corregirla.
-                        no_write_nudge_given = True
-                        messages.append({"role": "user", "content": NO_REAL_WRITE_NUDGE_MESSAGE})
-                        continue
-
-                    if (
-                        result.get("status") == "done"
-                        and (not has_run_verification or dirty_since_verification)
-                        and not verification_nudge_given
-                    ):
-                        # Un solo empujon -- si en el turno extra tampoco
-                        # verifica, se acepta igual (self_verified queda en
-                        # false, trazado en el log), no se bloquea infinito.
-                        verification_nudge_given = True
-                        messages.append({"role": "user", "content": VERIFY_BEFORE_DONE_MESSAGE})
-                        continue
-
-                    if result.get("status") == "done" and not _has_valid_self_review(result) and not self_review_nudge_given:
-                        # Mismo criterio de un solo empujon que la verificacion:
-                        # si tampoco completa self_review la segunda vez, se
-                        # acepta igual (queda trazado como faltante en el log,
-                        # no se bloquea infinito).
-                        self_review_nudge_given = True
-                        messages.append({"role": "user", "content": SELF_REVIEW_NUDGE_MESSAGE})
-                        continue
-
-                    return _finalize(result)
-
-                if initial_plan is None:
-                    plan_text = next((b["text"] for b in content if b.get("type") == "text" and b.get("text", "").strip()), None)
+        def capture_initial_plan(callback_context, llm_response):
+            """El primer texto no vacio que acompana a un tool_use es el plan inicial."""
+            nonlocal initial_plan
+            if initial_plan is None and llm_response.content and llm_response.content.parts:
+                parts = llm_response.content.parts
+                if any(p.function_call for p in parts):
+                    plan_text = next((p.text for p in parts if p.text and p.text.strip()), None)
                     if plan_text:
                         initial_plan = plan_text
+            return None
 
-                tool_results = []
-                for block in content:
-                    if block.get("type") != "tool_use":
+        llm = AgentLoopLlm(ollama_model=ollama_model_state["active"], force_json=True)
+        agent = build_adk_agent(
+            "coding_agent", system_prompt, llm, adk_tools,
+            read_only_tool_names=_READ_ONLY_TOOL_NAMES,
+            after_tool_callback=note_mcp_tool_use, after_model_callback=capture_initial_plan,
+        )
+        conversation = AdkConversation(agent)
+
+        if resume_messages:
+            resumed_messages = list(resume_messages)
+            await conversation.seed(resumed_messages)
+            first_message = sanitized_prompt
+        else:
+            first_message = _build_user_prompt(ticket_id, sanitized_prompt, target_repo_dir)
+
+        # Presupuesto de turnos = llamadas al modelo (llm.calls), extensible en
+        # el momento: un cambio real de modelo (maybe_switch_ollama_model)
+        # extiende turn_budget -- ver MIN_TURNS_AFTER_MODEL_SWITCH arriba.
+        turn_budget = MAX_TOOL_TURNS
+
+        async def say(text: str, final_answer: bool = False) -> str:
+            """final_answer=True: sin tools en este turno y con el esquema JSON
+            del resultado (reintento de correccion: pide texto corregido, no
+            otra tool-call). Los turnos normales corren el loop de tools de
+            ADK hasta una respuesta de texto."""
+            nonlocal backend, total_input_tokens, total_output_tokens
+            llm.ollama_model = ollama_model_state["active"]
+            llm.tools_disabled = final_answer
+            llm.json_schema = CODING_AGENT_RESULT_SCHEMA if final_answer else None
+            try:
+                return await conversation.say(
+                    text, max_llm_calls=None if final_answer else max(1, turn_budget - llm.calls),
+                )
+            finally:
+                backend = llm.last_backend or backend
+                total_input_tokens, total_output_tokens = llm.total_input_tokens, llm.total_output_tokens
+
+        def extend_budget_after_switch():
+            nonlocal turn_budget
+            turn_budget = max(turn_budget, llm.calls + MIN_TURNS_AFTER_MODEL_SWITCH)
+
+        exhausted_result = {"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []}
+        next_message = first_message
+        while True:
+            if llm.calls >= turn_budget:
+                return await _finalize(dict(exhausted_result))
+            try:
+                final_text = await say(next_message)
+            except AgentTurnsExhausted:
+                return await _finalize(dict(exhausted_result))
+            except _EofAbort:
+                return await _finalize({
+                    "status": "blocked",
+                    "summary": (
+                        "No hay una terminal interactiva conectada para confirmar cambios (EOF al "
+                        "pedir confirmacion) -- correr con stdin conectado (ej. 'yes s | docker run "
+                        "-i ...' o -it) si se espera que el agente escriba archivos."
+                    ),
+                    "files_changed": [],
+                })
+
+            refusal_nudge = TOOL_CALL_NUDGE_MESSAGE if has_investigated else TOOL_CALL_NUDGE_MESSAGE_NEEDS_INVESTIGATION
+            if (
+                tool_call_nudge_given
+                and _TOOL_CALL_REFUSAL_PATTERN.search(final_text)
+                and maybe_switch_ollama_model(
+                    ollama_model_state, backend, ollama_candidates, logger,
+                    "coding agent", "se nego a llamar la tool incluso tras el nudge",
+                )
+            ):
+                extend_budget_after_switch()
+                next_message = refusal_nudge
+                continue
+
+            if not tool_call_nudge_given and _TOOL_CALL_REFUSAL_PATTERN.search(final_text):
+                # El modelo anuncio una negativa a llamar la tool en vez de
+                # llamarla -- un nudge especifico ataca la causa real (a
+                # diferencia del reintento generico de "dame JSON valido").
+                # No depende de has_investigated: el modelo puede rendirse
+                # ANTES de investigar con exito (ej. adivino mal una ruta).
+                tool_call_nudge_given = True
+                next_message = refusal_nudge
+                continue
+
+            def parse_result(text: str) -> dict:
+                parsed = _extract_json(text)
+                if parsed.get("status") not in ("done", "blocked"):
+                    # Real: ornith:9b devolvio JSON valido pero con el esquema
+                    # equivocado ({"plan": ...}) -- se trata igual que JSON
+                    # invalido (dispara el mismo reintento de correccion).
+                    raise json.JSONDecodeError("falta 'status' valido en el JSON", text, 0)
+                return parsed
+
+            try:
+                result = parse_result(final_text)
+            except json.JSONDecodeError:
+                # Un solo reintento acotado antes de degradar a blocked.
+                retry_text = await say(JSON_CORRECTION_MESSAGE, final_answer=True)
+                try:
+                    result = parse_result(retry_text)
+                except json.JSONDecodeError:
+                    if maybe_switch_ollama_model(
+                        ollama_model_state, backend, ollama_candidates, logger,
+                        "coding agent", "JSON invalido incluso tras el reintento de correccion",
+                    ):
+                        extend_budget_after_switch()
+                        next_message = JSON_CORRECTION_MESSAGE
                         continue
-                    name = block["name"]
-                    tool_input = block.get("input", {})
-                    try:
-                        if name in ("write_file", "edit_file", "run_shell_command") and not has_investigated:
-                            output = (
-                                "Todavia no investigaste el repo. Usa read_file, list_directory, o "
-                                "grep_search antes de escribir o ejecutar algo."
-                            )
-                        elif (
-                            name == "run_shell_command"
-                            and _SCAFFOLD_COMMAND_PATTERN.search(str(tool_input.get("command", "")))
-                            and _normalize_listed_dir(tool_input.get("cwd", "")) not in listed_dirs
-                        ):
-                            scaffold_dir = tool_input.get("cwd") or "."
-                            output = (
-                                f"Este comando crea estructura de proyecto NUEVA (scaffolding) en '{scaffold_dir}' -- "
-                                f"antes de correrlo, usa list_directory con path=\"{scaffold_dir}\" para confirmar si "
-                                "ya existe estructura real ahi (ej. un src/ existente) que deberias extender en vez "
-                                "de duplicar."
-                            )
-                        elif name in LOCAL_TOOLS:
-                            output = LOCAL_TOOLS[name]["fn"](target_repo_dir, **tool_input)
-                            if name in ("read_file", "list_directory", "grep_search") and not str(output).startswith("error:"):
-                                has_investigated = True
-                            if name in ("write_file", "edit_file") and not str(output).startswith("error:"):
-                                wrote_any_file = True
-                                # Una escritura NUEVA invalida cualquier
-                                # verificacion anterior -- si ya se habia
-                                # gastado el empujon de verificacion en una
-                                # vuelta previa, esta escritura merece su
-                                # propia oportunidad real, no queda tapada
-                                # por un empujon ya usado para otro archivo.
-                                dirty_since_verification = True
-                                verification_nudge_given = False
-                            if name == "list_directory":
-                                listed_dirs.add(_normalize_listed_dir(tool_input.get("path", ".")))
-                            if name == "run_shell_command" and _VERIFICATION_COMMAND_PATTERN.search(str(tool_input.get("command", ""))):
-                                has_run_verification = True
-                                dirty_since_verification = False
-                        else:
-                            if name.startswith("neo4j-cypher__"):
-                                consulted_risk_graph = True
-                            output = await _call_mcp_tool(sessions, name, tool_input)
-                    except EOFError:
-                        # Bug real confirmado en vivo (operacion de esta
-                        # noche): sin stdin conectada (corrida detached),
-                        # CADA confirmacion interactiva (_confirm) lanza
-                        # EOFError -- el catch generico de abajo lo
-                        # convertia en un tool-result mas ("error llamando a
-                        # la herramienta: EOF when reading a line"), y el
-                        # modelo interpretaba eso como un bug de la tool
-                        # (intentaba heredocs/escapes distintos durante
-                        # ~15 turnos) en vez de que el sistema reconociera
-                        # "no hay terminal interactiva" y bloqueara limpio.
-                        consecutive_eof_errors += 1
-                        if consecutive_eof_errors >= 2:
-                            return _finalize({
-                                "status": "blocked",
-                                "summary": (
-                                    "No hay una terminal interactiva conectada para confirmar cambios (EOF al "
-                                    "pedir confirmacion) -- correr con stdin conectado (ej. 'yes s | docker run "
-                                    "-i ...' o -it) si se espera que el agente escriba archivos."
-                                ),
-                                "files_changed": [],
-                            })
-                        output = "error: no se pudo leer la confirmacion (EOF) -- reintentando"
-                    except Exception as exc:
-                        output = f"error llamando a la herramienta: {exc}"
-                    tool_results.append({"type": "tool_result", "tool_use_id": block["id"], "content": str(output)})
-                messages.append({"role": "user", "content": tool_results})
-                compact_old_tool_results(messages, _READ_ONLY_TOOL_NAMES)
-                warn_if_context_large(messages, logger, "coding agent", backend=backend, system_prompt=system_prompt)
+                    return await _finalize({"status": "blocked", "summary": retry_text[:500], "files_changed": []})
 
-    return _finalize({"status": "blocked", "summary": "se agotaron los turnos de herramientas sin terminar", "files_changed": []})
+            if (
+                result.get("status") == "blocked"
+                and _JSON_CONFUSION_BLOCKED_PATTERN.search(result.get("summary", ""))
+                and maybe_switch_ollama_model(
+                    ollama_model_state, backend, ollama_candidates, logger,
+                    "coding agent",
+                    "reporto 'blocked' citando su propia confusion sobre el formato JSON, no una ambiguedad real del ticket",
+                )
+            ):
+                extend_budget_after_switch()
+                next_message = JSON_CORRECTION_MESSAGE
+                continue
+
+            if (
+                result.get("status") == "done"
+                and result.get("files_changed")
+                and not wrote_any_file
+                and not no_write_nudge_given
+            ):
+                # status="done" + files_changed sin ninguna escritura real en
+                # esta corrida (confirmado en vivo, qwen3:8b, epica KAN-4).
+                no_write_nudge_given = True
+                next_message = NO_REAL_WRITE_NUDGE_MESSAGE
+                continue
+
+            if (
+                result.get("status") == "done"
+                and (not has_run_verification or dirty_since_verification)
+                and not verification_nudge_given
+            ):
+                verification_nudge_given = True
+                next_message = VERIFY_BEFORE_DONE_MESSAGE
+                continue
+
+            if result.get("status") == "done" and not _has_valid_self_review(result) and not self_review_nudge_given:
+                self_review_nudge_given = True
+                next_message = SELF_REVIEW_NUDGE_MESSAGE
+                continue
+
+            return await _finalize(result)
 
 
 _LOCKFILE_BASENAMES = {

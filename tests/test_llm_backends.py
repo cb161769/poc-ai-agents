@@ -11,7 +11,7 @@ import llm_backends
 
 def test_get_backend_priority_default(monkeypatch):
     monkeypatch.delenv("LLM_BACKEND_PRIORITY", raising=False)
-    assert llm_backends.get_backend_priority() == ["anthropic", "ollama"]
+    assert llm_backends.get_backend_priority() == ["anthropic", "claude_cli", "ollama"]
 
 
 def test_get_backend_priority_custom(monkeypatch):

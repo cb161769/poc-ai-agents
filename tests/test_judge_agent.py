@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import adk_bridge
 import agent_loop
 import judge_agent
 from judge_agent import (
@@ -645,7 +646,7 @@ def test_judge_with_tools_dispatches_local_tool_over_mcp(monkeypatch):
         ]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
         mock_get_issues.return_value = {"issues": []}
@@ -691,10 +692,16 @@ def test_judge_with_tools_compacts_old_tool_results(monkeypatch):
         content = [{"type": "text", "text": '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "listo"}'}]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     compact_calls = []
-    monkeypatch.setattr(judge_agent, "compact_old_tool_results", lambda messages, names: compact_calls.append(names))
+    real_build_adk_agent = judge_agent.build_adk_agent
+
+    def spy_build_adk_agent(*args, **kwargs):
+        compact_calls.append(kwargs.get("read_only_tool_names"))
+        return real_build_adk_agent(*args, **kwargs)
+
+    monkeypatch.setattr(judge_agent, "build_adk_agent", spy_build_adk_agent)
 
     with patch("judge_agent.sonar_client.get_issues") as mock_get_issues:
         mock_get_issues.return_value = {"issues": []}
@@ -740,7 +747,7 @@ def test_judge_with_tools_nudges_once_on_self_contradictory_verdict_and_accepts_
             }]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 
@@ -786,7 +793,7 @@ def test_judge_with_tools_nudges_once_on_content_hallucination_and_accepts_corre
             }]
         return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
     result = asyncio.run(judge_agent.judge_with_tools(payload))
@@ -825,7 +832,7 @@ def test_judge_with_tools_flags_ungrounded_reasoning_on_flagged_verdict(monkeypa
         )
         return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload(change_description=_REAL_DIFF_TEXT)))
 
@@ -856,7 +863,7 @@ def test_judge_with_tools_does_not_check_grounding_for_ok_verdict(monkeypatch):
         text = '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida."}'
         return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload(change_description=_REAL_DIFF_TEXT)))
 
@@ -885,7 +892,7 @@ def test_judge_with_tools_accepts_verdict_if_still_contradictory_after_one_nudge
         call_count["n"] += 1
         return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 
@@ -908,14 +915,13 @@ def test_judge_with_tools_retries_when_json_valid_but_verdict_key_missing(monkey
     monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
 
     async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
-        content = [{"type": "text", "text": '{"status": "ok", "reasoning": "listo"}'}]  # sin "verdict"
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE:  # el reintento de correccion
+            text = '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "corregido"}'
+        else:
+            text = '{"status": "ok", "reasoning": "listo"}'  # sin "verdict"
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return '{"verdict": "OK", "firewall_assessment": "ok", "change_assessment": "ok", "reasoning": "corregido"}', {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 
@@ -936,18 +942,17 @@ def test_judge_with_tools_passes_real_json_schema_to_retry(monkeypatch):
 
     monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
 
-    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
-        content = [{"type": "text", "text": "esto no es json"}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
-
     captured = {}
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        captured.update(kwargs)
-        return '{"verdict": "OK", "reasoning": "listo"}', {"input_tokens": 1, "output_tokens": 1}
+    async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
+        if messages[-1]["content"] == agent_loop.JSON_CORRECTION_MESSAGE:
+            captured.update(kwargs)
+            text = '{"verdict": "OK", "reasoning": "listo"}'
+        else:
+            text = "esto no es json"
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 
@@ -971,27 +976,17 @@ def test_judge_with_tools_nudges_and_corrects_hallucinated_verdict_from_json_ret
     monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
 
     async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
-        content = [{"type": "text", "text": "esto no es JSON en absoluto"}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        last = messages[-1]["content"]
+        if last == agent_loop.JSON_CORRECTION_MESSAGE:
+            text = '{"verdict": "FLAGGED", "reasoning": "Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}'
+        elif last == judge_agent.JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE:
+            # La correccion real -- esta vez el modelo cita un archivo real del diff.
+            text = '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida, sin problemas reales."}'
+        else:
+            text = "esto no es JSON en absoluto"
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return (
-            '{"verdict": "FLAGGED", "reasoning": '
-            '"Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}',
-            {"input_tokens": 1, "output_tokens": 1},
-        )
-
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
-        # La correccion real -- esta vez el modelo cita un archivo real del diff.
-        content = [{
-            "type": "text",
-            "text": '{"verdict": "OK", "reasoning": "Agrega lazyLoader.ts para carga diferida, sin problemas reales."}',
-        }]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
-    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
     result = asyncio.run(judge_agent.judge_with_tools(payload))
@@ -1012,23 +1007,16 @@ def test_judge_with_tools_accepts_original_verdict_if_correction_also_fails(monk
     monkeypatch.setattr(judge_agent, "_connect_mcp_servers", fake_connect_mcp_servers)
 
     async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
-        content = [{"type": "text", "text": "esto no es JSON en absoluto"}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
+        last = messages[-1]["content"]
+        if last == agent_loop.JSON_CORRECTION_MESSAGE:
+            text = '{"verdict": "FLAGGED", "reasoning": "Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}'
+        elif last == judge_agent.JUDGE_CONTENT_HALLUCINATION_NUDGE_MESSAGE:
+            text = "sigo sin poder devolver JSON valido"
+        else:
+            text = "esto no es JSON en absoluto"
+        return [{"type": "text", "text": text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "anthropic"
 
-    async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
-        return (
-            '{"verdict": "FLAGGED", "reasoning": '
-            '"Adds a selectBrowser helper gated by PLAYWRIGHT_BROWSER."}',
-            {"input_tokens": 1, "output_tokens": 1},
-        )
-
-    async def fake_call_model_turn(client, backend, messages, tools, system_prompt, **kwargs):
-        content = [{"type": "text", "text": "sigo sin poder devolver JSON valido"}]
-        return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}
-
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
-    monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
-    monkeypatch.setattr(judge_agent, "_call_model_turn", fake_call_model_turn)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     payload = _base_judge_payload(change_description=_REAL_DIFF_TEXT)
     with caplog.at_level("WARNING"):
@@ -1053,7 +1041,7 @@ def test_judge_with_tools_raises_when_retry_also_lacks_valid_verdict(monkeypatch
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
 
     with pytest.raises(RuntimeError, match="verdict"):
@@ -1091,7 +1079,7 @@ def test_judge_with_tools_switches_ollama_model_when_retry_also_lacks_valid_verd
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
@@ -1121,7 +1109,7 @@ def test_judge_with_tools_raises_when_only_one_ollama_candidate_and_retry_lacks_
     async def fake_json_retry(client, backend, messages, tools, system_prompt, **kwargs):
         return '{"status": "todavia sin verdict"}', {"input_tokens": 1, "output_tokens": 1}
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
     monkeypatch.setattr(judge_agent, "_final_text_with_json_retry", fake_json_retry)
 
     with pytest.raises(RuntimeError, match="verdict"):
@@ -1154,7 +1142,7 @@ def test_judge_with_tools_switches_ollama_model_when_verdict_still_contradictory
             return content, "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
         return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 
@@ -1184,7 +1172,7 @@ def test_judge_with_tools_still_accepts_verdict_when_only_one_ollama_candidate(m
     async def fake_call_with_fallback(client, messages, tools, system_prompt, exclude=None, **kwargs):
         return [{"type": "text", "text": contradictory_text}], "end_turn", {"input_tokens": 1, "output_tokens": 1}, "ollama"
 
-    monkeypatch.setattr(judge_agent, "call_with_fallback", fake_call_with_fallback)
+    monkeypatch.setattr(adk_bridge, "call_with_fallback", fake_call_with_fallback)
 
     result = asyncio.run(judge_agent.judge_with_tools(_base_judge_payload()))
 

@@ -14,9 +14,9 @@ import logging
 import os
 import re
 
-import httpx
 
-from agent_loop import OLLAMA_MODEL, call_with_fallback, parse_ollama_model_candidates, resolve_ollama_model
+from adk_bridge import adk_generate
+from agent_loop import OLLAMA_MODEL, parse_ollama_model_candidates, resolve_ollama_model
 
 logger = logging.getLogger("tech_doc_agent")
 
@@ -171,20 +171,18 @@ def _looks_like_refusal(text: str) -> bool:
 
 
 async def _generate_async(evidence: dict, system_prompt: str, label: str) -> str | None:
-    async with httpx.AsyncClient() as client:
-        try:
-            blocks, _stop_reason, _usage, backend_used = await call_with_fallback(
-                client,
-                messages=[{"role": "user", "content": _format_evidence(evidence)}],
-                tools=[],
-                system_prompt=system_prompt,
-                ollama_model=resolve_ollama_model(TECH_DOC_OLLAMA_MODELS) or TECH_DOC_OLLAMA_MODELS[0],
-            )
-        except Exception as exc:
-            logger.warning(f"tech_doc_agent: no se pudo generar el {label}: {exc}")
-            return None
+    try:
+        text, backend_used = await adk_generate(
+            "tech_doc_agent",
+            system_prompt,
+            _format_evidence(evidence),
+            ollama_model=resolve_ollama_model(TECH_DOC_OLLAMA_MODELS) or TECH_DOC_OLLAMA_MODELS[0],
+        )
+    except Exception as exc:
+        logger.warning(f"tech_doc_agent: no se pudo generar el {label}: {exc}")
+        return None
 
-    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+    text = text.strip()
     if not text:
         return None
     if _looks_like_refusal(text):
